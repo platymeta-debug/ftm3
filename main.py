@@ -1,6 +1,7 @@
 import asyncio
 from datetime import datetime
 
+
 import discord
 from binance.client import Client
 from discord.ext import commands, tasks
@@ -11,6 +12,7 @@ from database.manager import db_manager  # noqa: F401  # Ensures initialization
 from execution.trading_engine import TradingEngine
 from analysis.confluence_engine import ConfluenceEngine
 from risk_management.position_sizer import PositionSizer
+
 
 
 intents = discord.Intents.default()
@@ -101,11 +103,13 @@ async def on_ready():
         analysis_loop.start()
 
 
+
 @bot.command(name="test_order")
 async def test_order(ctx: commands.Context) -> None:
     """Trigger a simulated order to validate the event flow."""
     await ctx.send("테스트 주문 실행을 요청합니다...")
     await trading_engine.place_order("BTCUSDT", "BUY", config.trade_quantity)
+
 
 
 if __name__ == "__main__":
