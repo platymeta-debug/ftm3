@@ -19,7 +19,7 @@ class ConfluenceEngine:
 
     def _calculate_bias_score(self, df: pd.DataFrame, timeframe: str) -> int:
         """단일 타임프레임의 지표들을 바탕으로 편향 점수를 계산합니다."""
-        if df.empty or len(df) < 200: # 데이터가 충분하지 않으면 계산하지 않음
+        if df.empty or len(df) < 200:
             print(f"[{timeframe}] 데이터 부족으로 점수 계산 건너뜀 (데이터 수: {len(df)})")
             return 0
             
@@ -37,12 +37,12 @@ class ConfluenceEngine:
         senkou_a = last_row.get('ISA_9')
         senkou_b = last_row.get('ISB_26')
 
-        # --- 디버깅 로그: 현재 지표 값들 출력 ---
+        # --- 디버깅 로그: 유효한 값만 포맷하여 출력 ---
+        def f(val): return f"{val:.2f}" if val is not None and not math.isnan(val) else "N/A"
         print(f"--- [{timeframe}] 지표 값 ---")
-        print(f"Close: {close_price:.2f}, EMA20: {ema20:.2f}, EMA50: {ema50:.2f}, EMA200: {ema200:.2f}")
-        print(f"RSI: {rsi_value:.2f}, Tenkan: {tenkan_sen:.2f}, Kijun: {kijun_sen:.2f}, SpanA: {senkou_a:.2f}, SpanB: {senkou_b:.2f}")
+        print(f"Close: {f(close_price)}, EMA20: {f(ema20)}, EMA50: {f(ema50)}, EMA200: {f(ema200)}")
+        print(f"RSI: {f(rsi_value)}, Tenkan: {f(tenkan_sen)}, Kijun: {f(kijun_sen)}, SpanA: {f(senkou_a)}, SpanB: {f(senkou_b)}")
         
-        # --- 값이 존재할 때만 점수 계산 ---
         trend_score, rsi_score, ichimoku_score = 0, 0, 0
 
         # 1. 추세 점수 (EMA 배열)
@@ -70,7 +70,7 @@ class ConfluenceEngine:
         print(f"점수 계산: Trend({trend_score}), RSI({rsi_score}), Ichimoku({ichimoku_score}) -> 합계: {score}")
         return score
 
-    def analyze(self, symbol: str) -> [Tuple, Dict]:
+    def analyze(self, symbol: str) -> Tuple, Dict, Dict]:
         tf_scores: Dict[str, int] = {}
         tf_rows: Dict = {}
 
@@ -103,7 +103,7 @@ class ConfluenceEngine:
 
     def extract_atr(self, tf_rows: Dict) -> float:
         if not config.timeframes: return 0.0
-        primary_tf = config.timeframes # 가장 상위 타임프레임의 ATR을 사용
+        primary_tf = config.timeframes
         row = tf_rows.get(primary_tf)
         if row is None: return 0.0
         
