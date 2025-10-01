@@ -46,6 +46,8 @@ async def is_owner_check(interaction: discord.Interaction) -> bool:
     return await bot.is_owner(interaction.user)
 
 # --- UI 생성 헬퍼 함수 ---
+# main.py 파일의 create_dashboard_embed 함수를 아래 내용으로 교체
+
 def create_dashboard_embed() -> discord.Embed:
     """실시간 대시보드 임베드를 생성합니다."""
     embed = discord.Embed(title="📈 실시간 트레이딩 대시보드", color=discord.Color.blue())
@@ -93,7 +95,7 @@ def create_dashboard_embed() -> discord.Embed:
     except Exception as e:
         embed.add_field(name="⚠️ 데이터 조회 오류", value=f"알 수 없는 오류가 발생했습니다: {e}", inline=False)
 
-    embed.timestamp = datetime.now(datetime.UTC)
+    embed.timestamp = datetime.now(timezone.utc)
     return embed
 
 # --- 백그라운드 작업 ---
@@ -232,7 +234,7 @@ async def analysis_loop():
         await trading_engine.place_order(best_signal['symbol'], side, quantity, analysis_context)
     else:
         print("거래 신호 없음 (임계값 미달 또는 자동매매 비활성).")
-        
+
 # --- 봇 준비 이벤트 및 슬래시 명령어 ---
 @bot.event
 async def on_ready():
