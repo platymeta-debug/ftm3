@@ -1,4 +1,4 @@
-# 파일명: analysis/confluence_engine.py (최종본)
+# 파일명: analysis/confluence_engine.py (전체 수정안)
 
 """Hierarchical confluence engine responsible for scoring market bias."""
 
@@ -60,10 +60,10 @@ class ConfluenceEngine:
             elif rsi < 30:
                 score += 1
 
-        conversion = self._first_numeric(last_row, "ITS_9", "TENKAN_SEN")
-        base_line = self._first_numeric(last_row, "IKS_26", "KIJUN_SEN")
-        span_a = self._first_numeric(last_row, "ISA_9", "ISA_26", "SENKOU_A")
-        span_b = self._first_numeric(last_row, "ISB_26", "ISB_52", "SENKOU_B")
+        conversion = self._first_numeric(last_row, "ITS_9")
+        base_line = self._first_numeric(last_row, "IKS_26")
+        span_a = self._first_numeric(last_row, "ISA_9")
+        span_b = self._first_numeric(last_row, "ISB_26")
 
         if close is not None and span_a is not None and span_b is not None:
             cloud_top = max(span_a, span_b)
@@ -77,7 +77,7 @@ class ConfluenceEngine:
 
     @staticmethod
     def _atr_from_row(row: pd.Series) -> float:
-        for key in ("ATR_14", "ATRr_14", "ATR", "ATRr"):
+        for key in ("ATR_14", "ATRr_14"):
             value = row.get(key)
             if isinstance(value, (int, float)) and not math.isnan(value):
                 return float(value)
@@ -107,10 +107,8 @@ class ConfluenceEngine:
             final_score += tf_scores.get(timeframe, 0) * weight
 
         if (
-            tf_scores.get("4h", 0) > 0
-            and tf_scores.get("1d", 0) > 0
-            or tf_scores.get("4h", 0) < 0
-            and tf_scores.get("1d", 0) < 0
+            (tf_scores.get("4h", 0) > 0 and tf_scores.get("1d", 0) > 0)
+            or (tf_scores.get("4h", 0) < 0 and tf_scores.get("1d", 0) < 0)
         ):
             final_score *= 1.2
 
