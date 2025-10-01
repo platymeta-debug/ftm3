@@ -13,6 +13,7 @@ from core.event_bus import event_bus
 from database.manager import db_manager  # noqa: F401 - ensure initialization side-effects
 from execution.trading_engine import TradingEngine
 from analysis.confluence_engine import ConfluenceEngine
+from analysis.performance_analyzer import PerformanceAnalyzer
 from risk_management.position_sizer import PositionSizer
 from ui.views import ControlPanelView
 
@@ -42,6 +43,7 @@ except Exception:
 trading_engine = TradingEngine(binance_client)
 confluence_engine = ConfluenceEngine(binance_client)
 position_sizer = PositionSizer(binance_client)
+analyzer = PerformanceAnalyzer()
 
 
 dashboard_message: Optional[discord.Message] = None
@@ -174,6 +176,36 @@ async def analysis_loop() -> None:
     await channel.send(embed=embed)
 
 
+@tasks.loop(hours=24)
+async def periodic_analysis_report() -> None:
+    """누적 거래 데이터를 기반으로 일일 성과 리포트를 전송합니다."""
+    print(f"[{datetime.utcnow().isoformat()}] 일일 성과 분석 리포트 생성 시작...")
+
+    channel = bot.get_channel(config.analysis_channel_id)
+    if not channel:
+        print(f"경고: 분석 채널 ID({config.analysis_channel_id})를 찾을 수 없습니다.")
+        return
+
+    report = analyzer.generate_report()
+    if report is None:
+        await channel.send(
+            "📈 **일일 성과 리포트**\n> 아직 분석할 만큼 충분한 데이터가 쌓이지 않았습니다."
+        )
+        return
+
+    embed = discord.Embed(title="📈 일일 성과 분석 리포트", color=discord.Color.purple())
+    embed.add_field(name="총 거래 수", value=report["total_trades"], inline=True)
+    embed.add_field(name="승률", value=report["win_rate"], inline=True)
+    embed.add_field(name="손익비", value=report["profit_factor"], inline=True)
+
+    insights = report.get("insights", [])
+    if insights:
+        embed.add_field(name="💡 주요 인사이트", value="\n".join(insights), inline=False)
+
+    embed.set_footer(text="이 리포트는 'CLOSED' 상태의 거래만을 기준으로 합니다.")
+    await channel.send(embed=embed)
+
+
 @bot.event
 async def on_ready() -> None:
     bot.add_view(ControlPanelView())
@@ -183,6 +215,7 @@ async def on_ready() -> None:
     event_listener.start()
     analysis_loop.start()
     dashboard_update_loop.start()
+    periodic_analysis_report.start()
 
 
 @tree.command(name="panel", description="시스템 제어 패널을 소환합니다.")
@@ -200,7 +233,12 @@ async def summon_panel(interaction: discord.Interaction) -> None:
 @app_commands.checks.is_owner()
 async def test_order_slash(interaction: discord.Interaction) -> None:
     await interaction.response.send_message("테스트 주문 실행을 요청합니다...", ephemeral=True)
-    await trading_engine.place_order("BTCUSDT", "BUY", 0.01)
+    await trading_engine.place_order(
+        "BTCUSDT",
+        "BUY",
+        0.01,
+        {"final_score": 0.0, "tf_scores": {}},
+    )
 
 
 
