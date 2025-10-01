@@ -49,7 +49,7 @@ async def is_owner_check(interaction: discord.Interaction) -> bool:
 def create_dashboard_embed() -> discord.Embed:
     """실시간 대시보드 임베드를 생성합니다."""
     embed = discord.Embed(title="📈 실시간 트레이딩 대시보드", color=discord.Color.blue())
-
+    
     try:
         # --- 실제 계좌 정보 조회 ---
         account_info = binance_client.futures_account()
@@ -57,24 +57,21 @@ def create_dashboard_embed() -> discord.Embed:
 
         total_balance = float(account_info.get('totalWalletBalance', 0))
         total_pnl = float(account_info.get('totalUnrealizedProfit', 0))
-
+        
         # 분모가 0이 되는 경우 방지
         effective_balance = total_balance - total_pnl
         pnl_percent = (total_pnl / effective_balance) * 100 if effective_balance!= 0 else 0
 
-
         system_status = "🟢 활성" if config.exec_active else "🔴 비활성"
-
+        
         embed.add_field(name="시스템 상태", value=system_status, inline=True)
         embed.add_field(name="총 자산", value=f"${total_balance:,.2f}", inline=True)
         embed.add_field(name="총 미실현손익", value=f"${total_pnl:,.2f} ({pnl_percent:+.2f}%)", inline=True)
 
         # --- 실제 포지션 정보 조회 ---
-        position_map = {pos['symbol']: pos for pos in positions if float(pos.get('positionAmt', 0)) != 0}
-
-
+        position_map = {pos['symbol']: pos for pos in positions if float(pos.get('positionAmt', 0))!= 0}
+        
         for symbol in config.symbols: #.env에 설정된 심볼들을 순회
-
             pos_data = position_map.get(symbol)
             if pos_data:
                 pos_amt = float(pos_data.get('positionAmt', 0))
@@ -82,12 +79,12 @@ def create_dashboard_embed() -> discord.Embed:
                 unrealized_pnl = float(pos_data.get('unrealizedProfit', 0))
                 leverage = float(pos_data.get('leverage', 1))
                 side = "LONG" if pos_amt > 0 else "SHORT"
-
+                
                 pos_value = f"**{side}** | {abs(pos_amt)} @ ${entry_price:,.2f}\n" \
                             f"> PnL: **${unrealized_pnl:,.2f}** | 레버리지: {leverage:.0f}x"
             else:
                 pos_value = "없음"
-
+            
             embed.add_field(name=f"--- {symbol} 포지션 ---", value=pos_value, inline=False)
 
     except BinanceAPIException as e:
@@ -181,17 +178,15 @@ async def periodic_analysis_report():
 @tasks.loop(minutes=5)
 async def analysis_loop():
     print(f"\n 계층적 컨플루언스 분석 시작...")
-
+    
     best_signal = None
     best_score = 0
 
-
     #.env에 설정된 모든 심볼을 순회하며 분석
-
     for symbol in config.symbols:
         print(f"\n--- {symbol} 분석 중 ---")
         final_score, tf_scores, tf_rows = confluence_engine.analyze(symbol)
-
+        
         print(f"분석 완료: {symbol} | 최종 점수: {final_score:.2f}")
         print(f"타임프레임별 점수: {tf_scores}")
 
@@ -204,7 +199,7 @@ async def analysis_loop():
                 'tf_scores': tf_scores,
                 'tf_rows': tf_rows
             }
-
+    
     print("\n--- 최종 분석 결과 ---")
     if best_signal:
         print(f"가장 강력한 신호: {best_signal['symbol']} (점수: {best_signal['score']:.2f})")
@@ -214,7 +209,7 @@ async def analysis_loop():
 
     # 진입/청산 임계값 확인
     open_threshold = config.open_threshold
-
+    
     side = None
     if best_score > open_threshold:
         side = 'BUY'
@@ -223,11 +218,11 @@ async def analysis_loop():
 
     if side and config.exec_active:
         print(f"🚀 거래 신호 발생: {best_signal['symbol']} {side} (점수: {best_score:.2f})")
-
+        
         # 리스크 관리자를 통해 주문 수량 결정
         atr = confluence_engine.extract_atr(best_signal['tf_rows'])
         quantity = position_sizer.calculate_position_size(best_signal['symbol'], 0, atr)
-
+        
         if quantity is None or quantity <= 0:
             print("계산된 주문 수량이 유효하지 않아 거래를 건너뜁니다.")
             return
@@ -237,7 +232,7 @@ async def analysis_loop():
         await trading_engine.place_order(best_signal['symbol'], side, quantity, analysis_context)
     else:
         print("거래 신호 없음 (임계값 미달 또는 자동매매 비활성).")
-
+        
 # --- 봇 준비 이벤트 및 슬래시 명령어 ---
 @bot.event
 async def on_ready():
