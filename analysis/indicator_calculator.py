@@ -1,6 +1,7 @@
+# 파일명: analysis/indicator_calculator.py (수정안)
+
 import pandas as pd
 import pandas_ta as ta
-
 
 def calculate_all_indicators(df: pd.DataFrame) -> pd.DataFrame:
     """주어진 DataFrame에 설계서에 명시된 모든 기술적 지표를 계산하여 추가합니다."""
@@ -23,12 +24,12 @@ def calculate_all_indicators(df: pd.DataFrame) -> pd.DataFrame:
             {"kind": "adx"},
         ]
     )
-
+    
     df.ta.strategy(custom_strategy)
 
     # 모든 컬럼을 숫자로 변환, 변환 불가 시 NaN으로 처리하여 오류 방지
     for col in df.columns:
         if col not in ['open', 'high', 'low', 'close', 'volume']:
-            df[col] = pd.to_numeric(df[col], errors='coerce')
+             df[col] = pd.to_numeric(df[col], errors='coerce')
 
     return df
