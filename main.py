@@ -62,6 +62,7 @@ def create_dashboard_embed() -> discord.Embed:
         effective_balance = total_balance - total_pnl
         pnl_percent = (total_pnl / effective_balance) * 100 if effective_balance!= 0 else 0
 
+
         system_status = "🟢 활성" if config.exec_active else "🔴 비활성"
 
         embed.add_field(name="시스템 상태", value=system_status, inline=True)
@@ -71,7 +72,9 @@ def create_dashboard_embed() -> discord.Embed:
         # --- 실제 포지션 정보 조회 ---
         position_map = {pos['symbol']: pos for pos in positions if float(pos.get('positionAmt', 0)) != 0}
 
+
         for symbol in config.symbols: #.env에 설정된 심볼들을 순회
+
             pos_data = position_map.get(symbol)
             if pos_data:
                 pos_amt = float(pos_data.get('positionAmt', 0))
@@ -182,7 +185,9 @@ async def analysis_loop():
     best_signal = None
     best_score = 0
 
+
     #.env에 설정된 모든 심볼을 순회하며 분석
+
     for symbol in config.symbols:
         print(f"\n--- {symbol} 분석 중 ---")
         final_score, tf_scores, tf_rows = confluence_engine.analyze(symbol)
