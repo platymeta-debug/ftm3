@@ -1,16 +1,14 @@
-from datetime import datetime
+# 파일명: database/models.py (수정안)
 
+from datetime import datetime
 from sqlalchemy import Column, DateTime, Float, ForeignKey, Integer, String
 from sqlalchemy.orm import declarative_base, relationship
 
 Base = declarative_base()
 
-
 class Signal(Base):
     """거래를 유발한 분석 컨텍스트를 저장하는 테이블 모델"""
-
     __tablename__ = "signals"
-
     id = Column(Integer, primary_key=True)
     symbol = Column(String, nullable=False)
     timestamp = Column(DateTime, default=datetime.utcnow)
@@ -21,15 +19,12 @@ class Signal(Base):
     score_15m = Column(Float)
     trade = relationship("Trade", back_populates="signal", uselist=False)
 
-
 class Trade(Base):
     """실제 거래 내역을 저장하는 테이블 모델"""
-
     __tablename__ = "trades"
-
     id = Column(Integer, primary_key=True)
     signal_id = Column(Integer, ForeignKey("signals.id"))
-    binance_order_id = Column(String)
+    binance_order_id = Column(Integer, unique=True) # 신규 추가된 컬럼
     symbol = Column(String)
     side = Column(String)
     quantity = Column(Float)
