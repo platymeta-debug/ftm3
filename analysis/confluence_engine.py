@@ -30,49 +30,51 @@ class ConfluenceEngine:
                     return float(value)
         return None
 
+    # analysis/confluence_engine.py 파일의 _calculate_bias_score 함수를 아래 내용으로 교체하세요.
+
     def _calculate_bias_score(self, df: pd.DataFrame) -> int:
+        """단일 타임프레임의 지표들을 바탕으로 편향 점수를 계산합니다."""
         if df.empty:
             return 0
-
-        last_row = df.iloc[-1]
+            
         score = 0
+        last_row = df.iloc[-1]
 
-        close = self._first_numeric(last_row, "close")
-        ema20 = self._first_numeric(last_row, "EMA_20")
-        ema50 = self._first_numeric(last_row, "EMA_50")
-        ema200 = self._first_numeric(last_row, "EMA_200")
+        # 1. 추세 점수 (EMA 배열)
+        if last_row['EMA_20'] > last_row['EMA_50'] and last_row['EMA_50'] > last_row['EMA_200']:
+            score += 2 # 강력한 정배열
+        elif last_row['EMA_20'] < last_row['EMA_50'] and last_row['EMA_50'] < last_row['EMA_200']:
+            score -= 2 # 강력한 역배열
+        elif last_row['close'] > last_row['EMA_50']:
+            score += 1 # 상승 추세
+        elif last_row['close'] < last_row['EMA_50']:
+            score -= 1 # 하락 추세
 
-        if all(value is not None for value in (ema20, ema50, ema200)):
-            if ema20 > ema50 > ema200:
-                score += 2
-            elif ema20 < ema50 < ema200:
-                score -= 2
-        if close is not None and ema50 is not None:
-            if close > ema50:
-                score += 1
-            elif close < ema50:
-                score -= 1
+        # 2. 모멘텀 점수 (RSI)
+        rsi_value = last_row.get('RSI_14') # pandas-ta 버전에 따라 컬럼명이 다를 수 있음
+        if rsi_value is not None:
+            if rsi_value > 70: score -= 1 # 과매수
+            elif rsi_value < 30: score += 1 # 과매도
 
-        rsi = self._first_numeric(last_row, "RSI_14", "RSI")
-        if rsi is not None:
-            if rsi > 70:
-                score -= 1
-            elif rsi < 30:
-                score += 1
+        # 3. 이치모쿠 클라우드 점수
+        # pandas-ta가 생성하는 컬럼명(ITS_9, IKS_26 등)을 사용
+        tenkan_sen = last_row.get('ITS_9')
+        kijun_sen = last_row.get('IKS_26')
+        senkou_a = last_row.get('ISA_9')
+        senkou_b = last_row.get('ISB_26')
 
-        conversion = self._first_numeric(last_row, "ITS_9")
-        base_line = self._first_numeric(last_row, "IKS_26")
-        span_a = self._first_numeric(last_row, "ISA_9")
-        span_b = self._first_numeric(last_row, "ISB_26")
-
-        if close is not None and span_a is not None and span_b is not None:
-            cloud_top = max(span_a, span_b)
-            cloud_bottom = min(span_a, span_b)
-            if close > cloud_top:
-                score += 2 if conversion is not None and base_line is not None and conversion > base_line else 1
-            elif close < cloud_bottom:
-                score -= 2 if conversion is not None and base_line is not None and conversion < base_line else 1
-
+        if all(v is not None for v in [tenkan_sen, kijun_sen, senkou_a, senkou_b]):
+            if last_row['close'] > senkou_a and last_row['close'] > senkou_b: # 구름대 위
+                if tenkan_sen > kijun_sen: # 전환선 > 기준선 (강세)
+                    score += 2
+                else:
+                    score += 1
+            elif last_row['close'] < senkou_a and last_row['close'] < senkou_b: # 구름대 아래
+                if tenkan_sen < kijun_sen: # 전환선 < 기준선 (약세)
+                    score -= 2
+                else:
+                    score -= 1
+        
         return score
 
     @staticmethod
