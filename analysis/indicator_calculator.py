@@ -1,54 +1,34 @@
-"""Indicator calculation helpers leveraging pandas-ta."""
-
-from __future__ import annotations
-
-from typing import List
-
 import pandas as pd
 import pandas_ta as ta
 
 
-def _collect_frames(frames: List[pd.DataFrame | pd.Series]) -> pd.DataFrame:
-    collected = [frame for frame in frames if frame is not None and not frame.empty]
-    if not collected:
-        return pd.DataFrame()
-    return pd.concat(collected, axis=1)
-
-
 def calculate_all_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    """Append technical indicators required by the confluence engine."""
-
+    """주어진 DataFrame에 설계서에 명시된 모든 기술적 지표를 계산하여 추가합니다."""
     if df is None or df.empty:
         return pd.DataFrame()
 
-    base = df.copy()
-    frames: List[pd.DataFrame | pd.Series] = [base]
+    # pandas-ta 전략을 사용하여 모든 지표를 한번에 계산 (더 효율적)
+    custom_strategy = ta.Strategy(
+        name="Confluence Strategy",
+        description="All indicators for the confluence engine",
+        ta=[
+            {"kind": "ichimoku"},
+            {"kind": "ema", "length": 20},
+            {"kind": "ema", "length": 50},
+            {"kind": "ema", "length": 200},
+            {"kind": "rsi"},
+            {"kind": "macd"},
+            {"kind": "bbands"},
+            {"kind": "atr"},
+            {"kind": "adx"},
+        ]
+    )
 
-    ichimoku_df, ichimoku_span = ta.ichimoku(base["high"], base["low"], base["close"])
-    frames.extend([ichimoku_df, ichimoku_span])
+    df.ta.strategy(custom_strategy)
 
-    frames.append(ta.ema(base["close"], length=20).rename("EMA_20"))
-    frames.append(ta.ema(base["close"], length=50).rename("EMA_50"))
-    frames.append(ta.ema(base["close"], length=200).rename("EMA_200"))
+    # 모든 컬럼을 숫자로 변환, 변환 불가 시 NaN으로 처리하여 오류 방지
+    for col in df.columns:
+        if col not in ['open', 'high', 'low', 'close', 'volume']:
+            df[col] = pd.to_numeric(df[col], errors='coerce')
 
-    rsi = ta.rsi(base["close"], length=14)
-    if rsi is not None:
-        frames.append(rsi.rename("RSI_14"))
-
-    macd = ta.macd(base["close"])
-    if macd is not None:
-        frames.append(macd)
-
-    bbands = ta.bbands(base["close"], length=20, std=2)
-    if bbands is not None:
-        frames.append(bbands)
-
-    atr = ta.atr(base["high"], base["low"], base["close"], length=14)
-    if atr is not None:
-        frames.append(atr.rename("ATR_14"))
-
-    adx = ta.adx(base["high"], base["low"], base["close"], length=14)
-    if adx is not None:
-        frames.append(adx)
-
-    return _collect_frames(frames)
+    return df
