@@ -83,7 +83,7 @@ class ConfluenceEngine:
                 return float(value)
         return 0.0
 
-    def analyze(self, symbol: str) -> Tuple, Dict]:
+    def analyze(self, symbol: str) -> Tuple:
         tf_scores: Dict[str, int] = {}
         tf_rows: Dict = {}
 
