@@ -2,6 +2,7 @@ import asyncio
 from datetime import datetime
 from typing import Optional
 
+
 import discord
 from binance.client import Client
 from discord import app_commands
@@ -14,6 +15,7 @@ from execution.trading_engine import TradingEngine
 from analysis.confluence_engine import ConfluenceEngine
 from risk_management.position_sizer import PositionSizer
 from ui.views import ControlPanelView
+
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -40,6 +42,7 @@ except Exception:
 trading_engine = TradingEngine(binance_client)
 confluence_engine = ConfluenceEngine(binance_client)
 position_sizer = PositionSizer(binance_client)
+
 
 dashboard_message: Optional[discord.Message] = None
 
@@ -85,6 +88,7 @@ async def dashboard_update_loop() -> None:
             await dashboard_message.edit(embed=embed)
         except discord.NotFound:
             dashboard_message = await channel.send(embed=embed)
+
 
 
 @tasks.loop(seconds=1)
@@ -197,6 +201,7 @@ async def summon_panel(interaction: discord.Interaction) -> None:
 async def test_order_slash(interaction: discord.Interaction) -> None:
     await interaction.response.send_message("테스트 주문 실행을 요청합니다...", ephemeral=True)
     await trading_engine.place_order("BTCUSDT", "BUY", 0.01)
+
 
 
 if __name__ == "__main__":

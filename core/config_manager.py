@@ -43,6 +43,13 @@ class ConfigManager:
         if not self.tf_vote_weights:
             self.tf_vote_weights = [1.0, 2.0, 3.0, 4.0]
 
+
+        self.symbols = self._get_list("SYMBOLS", ["BTCUSDT"])
+        self.open_threshold = self._get_float("OPEN_TH", 10.0)
+        self.trade_quantity = self._get_float("TRADE_QUANTITY", 0.001)
+
+
+
         # --- Database ---
         self.db_path = os.getenv("DB_PATH", "./runtime/trader.db")
 
