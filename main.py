@@ -1,4 +1,4 @@
-# 파일명: main.py (전체 수정안)
+# 파일명: main.py (전체 최종 수정안)
 
 import discord
 from discord import app_commands # 슬래시 명령어를 위한 임포트
@@ -39,18 +39,23 @@ analyzer = PerformanceAnalyzer()
 # --- 전역 변수 ---
 dashboard_message = None
 
+# --- 신규: 슬래시 명령어 권한 체크 함수 ---
+async def is_owner_check(interaction: discord.Interaction) -> bool:
+    """이 명령어를 사용하는 유저가 봇의 소유자인지 확인합니다."""
+    return await bot.is_owner(interaction.user)
+
 # --- UI 생성 헬퍼 함수 ---
 def create_dashboard_embed() -> discord.Embed:
     embed = discord.Embed(title="📈 실시간 트레이딩 대시보드", color=discord.Color.blue())
     system_status = "🟢 활성" if config.exec_active else "🔴 비활성"
-    pnl_today = "+$125.34 (+1.25%)" # Placeholder
-    total_equity = "$10,125.34" # Placeholder
+    pnl_today = "+$0.00 (+0.00%)" # Placeholder
+    total_equity = "$10,000.00" # Placeholder
     
     embed.add_field(name="시스템 상태", value=system_status, inline=True)
     embed.add_field(name="총 자산", value=total_equity, inline=True)
     embed.add_field(name="금일 손익", value=pnl_today, inline=True)
     
-    btc_position = "LONG | 0.1 BTC @ $65,000\n> PnL: +$50.00 (+0.7%)" # Placeholder
+    btc_position = "없음" # Placeholder
     eth_position = "없음" # Placeholder
     
     embed.add_field(name="--- BTCUSDT 포지션 ---", value=btc_position, inline=False)
@@ -63,6 +68,7 @@ def create_dashboard_embed() -> discord.Embed:
 @tasks.loop(seconds=10)
 async def dashboard_update_loop():
     global dashboard_message
+    if not config.dashboard_channel_id: return
     channel = bot.get_channel(config.dashboard_channel_id)
     if not channel:
         if dashboard_update_loop.current_loop == 0:
@@ -72,7 +78,11 @@ async def dashboard_update_loop():
     embed = create_dashboard_embed()
     
     if dashboard_message is None:
-        dashboard_message = await channel.send(embed=embed)
+        try:
+            dashboard_message = await channel.send(embed=embed)
+        except discord.Forbidden:
+            print(f"오류: 대시보드 채널({config.dashboard_channel_id})에 메시지를 보낼 권한이 없습니다.")
+            dashboard_update_loop.stop()
     else:
         try:
             await dashboard_message.edit(embed=embed)
@@ -83,6 +93,7 @@ async def dashboard_update_loop():
 async def event_listener():
     try:
         event = await asyncio.wait_for(event_bus.subscribe(), timeout=1.0)
+        if not config.alerts_channel_id: return
         channel = bot.get_channel(config.alerts_channel_id)
         if not channel: return
 
@@ -113,6 +124,7 @@ async def event_listener():
 async def periodic_analysis_report():
     print(f"[{datetime.utcnow().isoformat()}] 일일 성과 분석 리포트 생성 시작...")
     report = analyzer.generate_report()
+    if not config.analysis_channel_id: return
     channel = bot.get_channel(config.analysis_channel_id)
     if not channel:
         print(f"경고: 분석 채널 ID({config.analysis_channel_id})를 찾을 수 없습니다.")
@@ -142,14 +154,14 @@ async def analysis_loop():
         side = 'BUY'
     elif final_score < -open_threshold:
         side = 'SELL'
-    if side:
+    if side and config.exec_active:
         print(f"🚀 거래 신호 발생: {symbol} {side} (점수: {final_score:.2f})")
         atr = confluence_engine.extract_atr(tf_rows)
         quantity = position_sizer.calculate_position_size(symbol, 0, atr)
         analysis_context = {'final_score': final_score, 'tf_scores': tf_scores}
         await trading_engine.place_order(symbol, side, quantity, analysis_context)
     else:
-        print("거래 신호 없음 (임계값 미달).")
+        print("거래 신호 없음 (임계값 미달 또는 자동매매 비활성).")
 
 # --- 봇 준비 이벤트 및 슬래시 명령어 ---
 @bot.event
@@ -164,13 +176,13 @@ async def on_ready():
     periodic_analysis_report.start()
 
 @tree.command(name="panel", description="시스템 제어 패널을 소환합니다.")
-@app_commands.is_owner() # 수정된 부분
+@app_commands.check(is_owner_check) # 수정된 부분
 async def summon_panel(interaction: discord.Interaction):
     embed = discord.Embed(title="⚙️ 시스템 제어 패널", description="아래 버튼과 메뉴를 사용하여 시스템을 제어하세요.", color=discord.Color.dark_gold())
     await interaction.response.send_message(embed=embed, view=ControlPanelView())
 
 @tree.command(name="test_order", description="테스트 주문을 실행하여 이벤트 흐름을 확인합니다.")
-@app_commands.is_owner() # 수정된 부분
+@app_commands.check(is_owner_check) # 수정된 부분
 async def test_order_slash(interaction: discord.Interaction):
     await interaction.response.send_message("테스트 주문 실행을 요청합니다...", ephemeral=True)
     analysis_context = {'final_score': 99.9, 'tf_scores': {'test': 1}} # 테스트용 컨텍스트
@@ -178,7 +190,7 @@ async def test_order_slash(interaction: discord.Interaction):
 
 # --- 봇 실행 ---
 if __name__ == "__main__":
-    if not all([config.discord_bot_token, config.api_key, config.api_secret, config.alerts_channel_id]):
-        print("오류:.env 파일에 필수 설정(토큰, API키, 채널ID)이 모두 있는지 확인하세요.")
+    if not all([config.discord_bot_token, config.api_key, config.api_secret]):
+        print("오류:.env 파일에 필수 설정(DISCORD_BOT_TOKEN, BINANCE API 키)이 모두 있는지 확인하세요.")
     else:
         bot.run(config.discord_bot_token)
