@@ -97,9 +97,11 @@ class ConfluenceEngine:
 
     def extract_atr(self, tf_rows: Dict) -> float:
         if not config.timeframes: return 0.0
-        # 💡💡💡 수정된 부분 💡💡💡
+        
+        # 💡💡💡 최종 수정된 부분 💡💡💡
         # 리스트 전체가 아닌, 리스트의 첫 번째 항목(가장 상위 타임프레임)을 키로 사용합니다.
         primary_tf = config.timeframes 
+        
         row = tf_rows.get(primary_tf)
         if row is None: return 0.0
         
