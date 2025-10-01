@@ -25,7 +25,14 @@ class ConfigManager:
 
         # --- Discord ---
         self.discord_bot_token = os.getenv("DISCORD_BOT_TOKEN")
+        self.dashboard_channel_id = self._get_int("DISCORD_CHANNEL_ID_DASHBOARD")
         self.alerts_channel_id = self._get_int("DISCORD_CHANNEL_ID_ALERTS")
+        self.analysis_channel_id = self._get_int("DISCORD_CHANNEL_ID_ANALYSIS")
+        self.panel_channel_id = self._get_int("DISCORD_CHANNEL_ID_PANEL")
+
+        # --- Execution State ---
+        self.exec_active = self._get_bool("EXEC_ACTIVE", False)
+        self.aggr_level = self._get_int("AGGR_LEVEL", 1)
 
         # --- Analysis Timeframes & Weights ---
         self.timeframes = self._get_list("ANALYSIS_TIMEFRAMES")

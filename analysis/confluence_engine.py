@@ -1,3 +1,5 @@
+# 파일명: analysis/confluence_engine.py (최종본)
+
 """Hierarchical confluence engine responsible for scoring market bias."""
 
 from __future__ import annotations
@@ -9,7 +11,7 @@ import pandas as pd
 from binance.client import Client
 
 from core.config_manager import config
-from . import data_fetcher, indicator_calculator
+from. import data_fetcher, indicator_calculator
 
 
 class ConfluenceEngine:
@@ -81,9 +83,9 @@ class ConfluenceEngine:
                 return float(value)
         return 0.0
 
-    def analyze(self, symbol: str) -> Tuple[float, Dict[str, int], Dict[str, pd.Series]]:
+    def analyze(self, symbol: str) -> Tuple, Dict]:
         tf_scores: Dict[str, int] = {}
-        tf_rows: Dict[str, pd.Series] = {}
+        tf_rows: Dict = {}
 
         for timeframe in config.timeframes:
             df = data_fetcher.fetch_klines(self.client, symbol, timeframe)
@@ -114,10 +116,10 @@ class ConfluenceEngine:
 
         return final_score, tf_scores, tf_rows
 
-    def extract_atr(self, tf_rows: Dict[str, pd.Series]) -> float:
+    def extract_atr(self, tf_rows: Dict) -> float:
         if not config.timeframes:
             return 0.0
-        primary_tf = config.timeframes[0]
+        primary_tf = config.timeframes
         row = tf_rows.get(primary_tf)
         if row is None:
             return 0.0
