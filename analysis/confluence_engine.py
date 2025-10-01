@@ -38,7 +38,7 @@ class ConfluenceEngine:
         senkou_b = last_row.get('ISB_26')
 
         # --- 디버깅 로그: 유효한 값만 포맷하여 출력 ---
-        def f(val): return f"{val:.2f}" if val is not None and not math.isnan(val) else "N/A"
+        def f(val): return f"{val:.2f}" if isinstance(val, (int, float)) and not math.isnan(val) else "N/A"
         print(f"--- [{timeframe}] 지표 값 ---")
         print(f"Close: {f(close_price)}, EMA20: {f(ema20)}, EMA50: {f(ema50)}, EMA200: {f(ema200)}")
         print(f"RSI: {f(rsi_value)}, Tenkan: {f(tenkan_sen)}, Kijun: {f(kijun_sen)}, SpanA: {f(senkou_a)}, SpanB: {f(senkou_b)}")
@@ -46,19 +46,19 @@ class ConfluenceEngine:
         trend_score, rsi_score, ichimoku_score = 0, 0, 0
 
         # 1. 추세 점수 (EMA 배열)
-        if all(v is not None and not math.isnan(v) for v in [close_price, ema20, ema50, ema200]):
+        if all(isinstance(v, (int, float)) and not math.isnan(v) for v in [close_price, ema20, ema50, ema200]):
             if ema20 > ema50 > ema200: trend_score = 2
             elif ema20 < ema50 < ema200: trend_score = -2
             elif close_price > ema50: trend_score = 1
             elif close_price < ema50: trend_score = -1
 
         # 2. 모멘텀 점수 (RSI)
-        if rsi_value is not None and not math.isnan(rsi_value):
+        if isinstance(rsi_value, (int, float)) and not math.isnan(rsi_value):
             if rsi_value > 70: rsi_score = -1
             elif rsi_value < 30: rsi_score = 1
 
         # 3. 이치모쿠 클라우드 점수
-        if all(v is not None and not math.isnan(v) for v in [close_price, tenkan_sen, kijun_sen, senkou_a, senkou_b]):
+        if all(isinstance(v, (int, float)) and not math.isnan(v) for v in [close_price, tenkan_sen, kijun_sen, senkou_a, senkou_b]):
             if close_price > senkou_a and close_price > senkou_b:
                 if tenkan_sen > kijun_sen: ichimoku_score = 2
                 else: ichimoku_score = 1
