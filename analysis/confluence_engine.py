@@ -70,7 +70,7 @@ class ConfluenceEngine:
         print(f"점수 계산: Trend({trend_score}), RSI({rsi_score}), Ichimoku({ichimoku_score}) -> 합계: {score}")
         return score
 
-    def analyze(self, symbol: str) -> Tuple, Dict, Dict]:
+    def analyze(self, symbol: str) -> [Tuple, Dict, Dict]:
         tf_scores: Dict[str, int] = {}
         tf_rows: Dict = {}
 
