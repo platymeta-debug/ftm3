@@ -1,4 +1,6 @@
 import asyncio
+from datetime import datetime
+
 
 import discord
 from binance.client import Client
@@ -8,6 +10,9 @@ from core.config_manager import config
 from core.event_bus import event_bus
 from database.manager import db_manager  # noqa: F401  # Ensures initialization
 from execution.trading_engine import TradingEngine
+from analysis.confluence_engine import ConfluenceEngine
+from risk_management.position_sizer import PositionSizer
+
 
 
 intents = discord.Intents.default()
@@ -32,6 +37,35 @@ except Exception:
     exit()
 
 trading_engine = TradingEngine(binance_client)
+confluence_engine = ConfluenceEngine(binance_client)
+position_sizer = PositionSizer(binance_client)
+
+
+@tasks.loop(minutes=5)
+async def analysis_loop() -> None:
+    """Periodically evaluate confluence scores and trigger trades."""
+
+    print(f"\n[{datetime.utcnow().isoformat()}] 계층적 컨플루언스 분석 시작...")
+
+    for symbol in config.symbols:
+        final_score, tf_scores, tf_rows = confluence_engine.analyze(symbol)
+        print(f"분석 완료: {symbol} | 최종 점수: {final_score:.2f}")
+        print(f"타임프레임별 점수: {tf_scores}")
+
+        side = None
+        if final_score > config.open_threshold:
+            side = "BUY"
+        elif final_score < -config.open_threshold:
+            side = "SELL"
+
+        if not side:
+            print("거래 신호 없음 (임계값 미달).")
+            continue
+
+        print(f"🚀 거래 신호 발생: {symbol} {side} (점수: {final_score:.2f})")
+        atr_value = confluence_engine.extract_atr(tf_rows)
+        quantity = position_sizer.calculate_position_size(symbol, 0.0, atr_value)
+        await trading_engine.place_order(symbol, side, quantity)
 
 
 @tasks.loop(seconds=1)
@@ -65,13 +99,17 @@ async def on_ready():
     print(f"{bot.user.name} 봇이 준비되었습니다.")
     print("------------------------------------")
     event_listener.start()
+    if not analysis_loop.is_running():
+        analysis_loop.start()
+
 
 
 @bot.command(name="test_order")
 async def test_order(ctx: commands.Context) -> None:
     """Trigger a simulated order to validate the event flow."""
     await ctx.send("테스트 주문 실행을 요청합니다...")
-    await trading_engine.place_order("BTCUSDT", "BUY", 0.01)
+    await trading_engine.place_order("BTCUSDT", "BUY", config.trade_quantity)
+
 
 
 if __name__ == "__main__":
