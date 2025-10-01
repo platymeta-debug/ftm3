@@ -46,40 +46,44 @@ async def is_owner_check(interaction: discord.Interaction) -> bool:
 
 # --- UI 생성 헬퍼 함수 ---
 def create_dashboard_embed() -> discord.Embed:
+    """실시간 대시보드 임베드를 생성합니다."""
     embed = discord.Embed(title="📈 실시간 트레이딩 대시보드", color=discord.Color.blue())
-    
+
     try:
+        # --- 실제 계좌 정보 조회 ---
         account_info = binance_client.futures_account()
-        positions = binance_client.futures_position_risk()
+        positions = binance_client.futures_position_information()
 
         total_balance = float(account_info.get('totalWalletBalance', 0))
         total_pnl = float(account_info.get('totalUnrealizedProfit', 0))
-        
+
+        # 분모가 0이 되는 경우 방지
         effective_balance = total_balance - total_pnl
-        pnl_percent = (total_pnl / effective_balance) * 100 if effective_balance!= 0 else 0
+        pnl_percent = (total_pnl / effective_balance) * 100 if effective_balance != 0 else 0
 
         system_status = "🟢 활성" if config.exec_active else "🔴 비활성"
-        
+
         embed.add_field(name="시스템 상태", value=system_status, inline=True)
         embed.add_field(name="총 자산", value=f"${total_balance:,.2f}", inline=True)
         embed.add_field(name="총 미실현손익", value=f"${total_pnl:,.2f} ({pnl_percent:+.2f}%)", inline=True)
 
-        position_map = {pos['symbol']: pos for pos in positions if float(pos.get('positionAmt', 0))!= 0}
-        
-        for symbol in config.symbols:
+        # --- 실제 포지션 정보 조회 ---
+        position_map = {pos['symbol']: pos for pos in positions if float(pos.get('positionAmt', 0)) != 0}
+
+        for symbol in config.symbols: #.env에 설정된 심볼들을 순회
             pos_data = position_map.get(symbol)
             if pos_data:
                 pos_amt = float(pos_data.get('positionAmt', 0))
                 entry_price = float(pos_data.get('entryPrice', 0))
-                unrealized_pnl = float(pos_data.get('unrealizedProfit', 0))
+                unrealized_pnl = float(pos_data.get('unRealizedProfit', 0)) # 키 이름 변경
                 leverage = float(pos_data.get('leverage', 1))
                 side = "LONG" if pos_amt > 0 else "SHORT"
-                
+
                 pos_value = f"**{side}** | {abs(pos_amt)} @ ${entry_price:,.2f}\n" \
                             f"> PnL: **${unrealized_pnl:,.2f}** | 레버리지: {leverage:.0f}x"
             else:
                 pos_value = "없음"
-            
+
             embed.add_field(name=f"--- {symbol} 포지션 ---", value=pos_value, inline=False)
 
     except BinanceAPIException as e:
@@ -88,7 +92,7 @@ def create_dashboard_embed() -> discord.Embed:
     except Exception as e:
         embed.add_field(name="⚠️ 데이터 조회 오류", value=f"알 수 없는 오류가 발생했습니다: {e}", inline=False)
 
-    embed.timestamp = datetime.now(timezone.utc) # 수정된 부분
+    embed.timestamp = datetime.now(timezone.utc)
     return embed
 
 # --- 백그라운드 작업 ---
