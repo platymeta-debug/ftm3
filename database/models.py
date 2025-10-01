@@ -29,6 +29,7 @@ class Trade(Base):
 
     id = Column(Integer, primary_key=True)
     signal_id = Column(Integer, ForeignKey("signals.id"))
+    binance_order_id = Column(String)
     symbol = Column(String)
     side = Column(String)
     quantity = Column(Float)

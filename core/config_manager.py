@@ -48,6 +48,10 @@ class ConfigManager:
         self.open_threshold = self._get_float("OPEN_TH", 10.0)
         self.trade_quantity = self._get_float("TRADE_QUANTITY", 0.001)
 
+        # --- Risk Management ---
+        self.risk_target_pct = self._get_float("RISK_TARGET_PCT", 0.02)
+        self.sl_atr_multiplier = self._get_float("SL_ATR", 1.5)
+
 
 
         # --- Database ---
