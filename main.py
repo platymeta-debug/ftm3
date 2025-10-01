@@ -25,7 +25,20 @@ bot = commands.Bot(command_prefix='!', intents=intents)
 tree = bot.tree
 
 try:
-    binance_client = Client(config.api_key, config.api_secret, testnet=config.is_testnet)
+    # API 엔드포인트를 직접 지정하여 연결 안정성 확보
+    if config.is_testnet:
+        # 선물 테스트넷 주소 명시
+        binance_client = Client(
+            config.api_key, 
+            config.api_secret, 
+            tld='com', 
+            testnet=True
+        )
+        binance_client.API_URL = "https://testnet.binancefuture.com"
+    else:
+        # 실거래 서버 주소는 기본값 사용
+        binance_client = Client(config.api_key, config.api_secret)
+
     binance_client.ping()
     print(f"바이낸스 연결 성공. (환경: {config.trade_mode})")
 except Exception as e:
