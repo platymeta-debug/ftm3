@@ -1,8 +1,9 @@
+# 파일명: analysis/data_fetcher.py (수정안)
+
 from binance.client import Client
 import pandas as pd
 
-
-def fetch_klines(client: Client, symbol: str, timeframe: str, limit: int = 1000) -> pd.DataFrame | None:  # limit 기본값 변경
+def fetch_klines(client: Client, symbol: str, timeframe: str, limit: int = 1000) -> pd.DataFrame | None: # limit 기본값 변경
     """
     바이낸스에서 K-line(캔들) 데이터를 가져와 pandas DataFrame으로 변환합니다.
     """
@@ -21,7 +22,7 @@ def fetch_klines(client: Client, symbol: str, timeframe: str, limit: int = 1000)
 
         df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
         df.set_index('timestamp', inplace=True)
-
+        
         for col in ['open', 'high', 'low', 'close', 'volume']:
             df[col] = pd.to_numeric(df[col])
 
