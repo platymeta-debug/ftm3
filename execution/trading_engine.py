@@ -1,3 +1,6 @@
+from __future__ import annotations
+
+import time
 from binance.client import Client
 
 from core.event_bus import event_bus
@@ -15,12 +18,16 @@ class TradingEngine:
         print(f"주문 실행 요청 수신: {symbol} {side} {quantity}")
         # Placeholder for real Binance order logic (Phase 2)
 
+        mock_order_id = int(time.time() * 1000)
         await event_bus.publish(
             "ORDER_SUCCESS",
             {
-                "symbol": symbol,
-                "side": side,
-                "quantity": quantity,
-                "price": 40000.0,  # Example price placeholder
+                "source": "TradingEngine",
+                "response": {
+                    "symbol": symbol,
+                    "side": side,
+                    "origQty": quantity,
+                    "orderId": mock_order_id,
+                },
             },
         )
