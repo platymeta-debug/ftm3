@@ -2,9 +2,11 @@
 
 import discord
 from discord.ext import tasks
-from datetime import datetime, timezone
+from datetime import datetime, timezone, time
 from sqlalchemy import select
 from core.event_bus import event_bus
+from .models import AccountSnapshot
+
 import pandas as pd
 import requests
 
@@ -29,12 +31,15 @@ class BackgroundTasks:
         self.latest_analysis_results = {}
         self.decision_log = []
         self.current_aggr_level = self.config.aggr_level
+        utc_midnight = time(hour=0, minute=0, tzinfo=timezone.utc)
+        self.daily_snapshot_loop.change_interval(time=utc_midnight)
 
     def start_all_tasks(self):
         """모든 백그라운드 루프를 시작합니다."""
         self.panel_update_loop.start()
         self.data_collector_loop.start()
         self.trading_decision_loop.start()
+        self.daily_snapshot_loop.start()
 
     def on_aggr_level_change(self, new_level: int):
         """공격성 레벨 변경 콜백 함수입니다."""
@@ -248,7 +253,62 @@ class BackgroundTasks:
         return embed
 
     # --- 백그라운드 루프들 ---
+    @tasks.loop()
+    async def daily_snapshot_loop(self):
+        """매일 자정(UTC)에 현재 계좌 총자산을 DB에 기록합니다."""
+        print("📸 일일 계좌 스냅샷 기록 시간입니다...")
+        try:
+            account_info = self.binance_client.futures_account()
+            total_balance = float(account_info.get('totalWalletBalance', 0.0))
+            if total_balance > 0:
+                with db_manager.get_session() as session:
+                    snapshot = AccountSnapshot(total_balance=total_balance)
+                    session.add(snapshot)
+                    session.commit()
+                    print(f"✅ 계좌 스냅샷 저장 완료: ${total_balance:,.2f}")
+        except Exception as e:
+            print(f"🚨 일일 스냅샷 기록 중 오류 발생: {e}")
 
+    async def check_circuit_breaker(self) -> bool:
+        """
+        DB에 저장된 계좌 스냅샷을 기반으로 서킷 브레이커 발동 여부를 확인합니다.
+        :return: True이면 서킷 브레이커 발동, False이면 정상.
+        """
+        if not self.config.circuit_breaker_enabled:
+            return False
+
+        with db_manager.get_session() as session:
+            check_period = datetime.now(timezone.utc) - timedelta(days=self.config.drawdown_check_days)
+            snapshots = session.execute(
+                select(AccountSnapshot)
+                .where(AccountSnapshot.timestamp >= check_period)
+                .order_by(AccountSnapshot.timestamp.desc())
+            ).scalars().all()
+
+            if len(snapshots) < 2: # 비교할 데이터가 부족
+                return False
+
+            peak_balance = max(s.total_balance for s in snapshots)
+            current_balance = snapshots[0].total_balance
+            drawdown = (peak_balance - current_balance) / peak_balance * 100
+
+            if drawdown >= self.config.drawdown_threshold_pct:
+                print(f"🚨 서킷 브레이커 발동! 최대 손실 허용치 도달 ({drawdown:.2f}% >= {self.config.drawdown_threshold_pct}%)")
+                self.config.exec_active = False # 자동매매 강제 중지
+
+                alerts_channel = self.bot.get_channel(self.config.alerts_channel_id)
+                if alerts_channel:
+                    embed = discord.Embed(
+                        title="🛡️ 서킷 브레이커 발동 🛡️",
+                        description="계좌 보호를 위해 모든 신규 자동매매를 중단합니다.",
+                        color=0xFF0000
+                    )
+                    embed.add_field(name="감지된 손실률", value=f"`{drawdown:.2f}%`", inline=True)
+                    embed.add_field(name="설정된 임계값", value=f"`{self.config.drawdown_threshold_pct}%`", inline=True)
+                    await alerts_channel.send(embed=embed)
+                return True
+        return False
+    
     @tasks.loop(seconds=15)
     async def panel_update_loop(self):
         if self.panel_message:
@@ -306,13 +366,22 @@ class BackgroundTasks:
     @tasks.loop(minutes=5)
     async def trading_decision_loop(self):
         log_message = f"`{datetime.now().strftime('%H:%M:%S')}`: "
+
+        # ▼▼▼ [시즌 2 수정] 서킷 브레이커 확인 로직 추가 ▼▼▼
+        if await self.check_circuit_breaker():
+            log_message += "🚨 서킷 브레이커 발동 상태. 모든 매매 결정을 중단합니다."
+            self.decision_log.insert(0, log_message)
+            if len(self.decision_log) > 5: self.decision_log.pop()
+            print(log_message)
+            return # 루프의 나머지 부분을 실행하지 않고 종료
+        # ▲▲▲ [시즌 2 수정] ▲▲▲
+
         if not self.config.exec_active:
             log_message += "자동매매 OFF 상태. 의사결정을 건너뜁니다."
         else:
-            # ▼▼▼ [수정된 부분] if 문의 들여쓰기를 바로잡았습니다 ▼▼▼
+            # ... (이하 기존 의사결정 로직은 모두 동일) ...
             if self.config.adaptive_aggr_enabled:
-                self.update_adaptive_aggression_level() # if 문 안에 있도록 들여쓰기
-            # ▲▲▲ [수정된 부분] ▲▲▲
+                self.update_adaptive_aggression_level()
 
             log_message += f"[Lvl:{self.current_aggr_level}] 의사결정 사이클 시작. "
             try:
