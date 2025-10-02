@@ -283,7 +283,8 @@ def get_analysis_embed(session) -> discord.Embed:
         sparkline = generate_sparkline(recent_signals)
         
         # 현재 분석 스냅샷
-       latest_signal = latest_signal_tuple[0] if latest_signal_tuple else None
+        latest_signal_tuple = session.execute(select(Signal).where(Signal.symbol == symbol).order_by(Signal.id.desc())).first()
+        latest_signal = latest_signal_tuple[0] if latest_signal_tuple else None
         score_text = f"**{latest_signal.final_score:.2f}**" if latest_signal else "N/A"
         embed.add_field(name=f"{symbol} | {market_regime.value}", value=f"스코어 흐름: {sparkline}\n현재 점수: {score_text}", inline=False)
     embed.set_footer(text=f"최종 업데이트: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
