@@ -384,70 +384,93 @@ class BackgroundTasks:
             except Exception as e:
                 print(f"이벤트 핸들러 오류: {e}")
                 
-    async def manage_open_positions(self, session, open_trades):
-        """[복원] 분할익절, 피라미딩 등 고급 포지션 관리 기능을 수행합니다."""
-        for trade in list(open_trades):
-            try:
-                mark_price = float(self.binance_client.futures_mark_price(symbol=trade.symbol).get('markPrice', 0.0))
-                if mark_price == 0.0: continue
+   async def manage_open_positions(self, session, open_trades):
+    """[Phase 3 최종] 추적 손절매(Trailing Stop) 기능이 통합된 포지션 관리 로직입니다."""
+    for trade in list(open_trades):
+        try:
+            mark_price = float(self.binance_client.futures_mark_price(symbol=trade.symbol).get('markPrice', 0.0))
+            if mark_price == 0.0: continue
 
-                # ▼▼▼ [추가] 1. 분할 익절 (Scale-Out) 로직 ▼▼▼
-                if not trade.is_scaled_out:
-                    scale_out_target_price = trade.entry_price + (trade.take_profit_price - trade.entry_price) / self.config.risk_reward_ratio
+            # 1. 포지션의 최고(최저)가 갱신
+            if trade.side == "BUY" and mark_price > trade.highest_price_since_entry:
+                trade.highest_price_since_entry = mark_price
+            elif trade.side == "SELL" and mark_price < trade.highest_price_since_entry:
+                trade.highest_price_since_entry = mark_price
 
-                    if (trade.side == "BUY" and mark_price >= scale_out_target_price) or \
-                    (trade.side == "SELL" and mark_price <= scale_out_target_price):
-
-                        quantity_to_close = trade.quantity / 2
-                        await self.trading_engine.close_position(trade, f"자동 분할 익절", quantity_to_close=quantity_to_close)
-
-                        trade.is_scaled_out = True
-                        trade.stop_loss_price = trade.entry_price
-                        session.commit()
-                        print(f"🛡️ [무위험 포지션 전환] {trade.symbol}의 손절가를 본전(${trade.entry_price:,.2f})으로 변경.")
-                        continue # 다음 거래로 넘어감
-                # ▲▲▲ [추가] ▲▲▲
-
-                # 2. 최종 익절/손절 로직 (기존과 동일)
-                if trade.take_profit_price and ((trade.side == "BUY" and mark_price >= trade.take_profit_price) or (trade.side == "SELL" and mark_price <= trade.take_profit_price)):
-                    await self.trading_engine.close_position(trade, f"자동 최종 익절 (TP: ${trade.take_profit_price:,.2f})")
+            # 2. 분할 익절 (Scale-Out) 로직 (기존과 동일)
+            if not trade.is_scaled_out:
+                scale_out_target_price = trade.entry_price + (trade.take_profit_price - trade.entry_price) / self.config.risk_reward_ratio
+                if (trade.side == "BUY" and mark_price >= scale_out_target_price) or \
+                   (trade.side == "SELL" and mark_price <= scale_out_target_price):
+                    quantity_to_close = trade.quantity / 2
+                    await self.trading_engine.close_position(trade, "자동 분할 익절", quantity_to_close=quantity_to_close)
+                    trade.is_scaled_out = True
+                    trade.stop_loss_price = trade.entry_price # 손절가를 본전으로 이동
+                    session.commit()
+                    print(f"🛡️ [무위험 포지션 전환] {trade.symbol}의 손절가를 본전(${trade.entry_price:,.2f})으로 변경.")
                     continue
 
-                if trade.stop_loss_price and ((trade.side == "BUY" and mark_price <= trade.stop_loss_price) or (trade.side == "SELL" and mark_price >= trade.stop_loss_price)):
-                    await self.trading_engine.close_position(trade, f"자동 손절 (SL: ${trade.stop_loss_price:,.2f})")
-                    continue
+            # ▼▼▼ [Phase 3 핵심] 추적 손절매 로직 ▼▼▼
+            if trade.is_scaled_out: # 분할 익절이 완료된 포지션에만 적용
+                latest_signal = session.execute(select(Signal).where(Signal.symbol == trade.symbol).order_by(Signal.id.desc())).scalar_one_or_none()
+                if latest_signal and latest_signal.atr_4h > 0:
+                    atr = latest_signal.atr_4h
+                    new_stop_loss = 0
 
-                # ▼▼▼ [추가] 3. 피라미딩 (불타기) 로직 ▼▼▼
-                if not trade.is_scaled_out and trade.pyramid_count < 1: # 최대 1회, 분할 익절 전
-                    latest_signal = session.execute(select(Signal).where(Signal.symbol == trade.symbol).order_by(Signal.id.desc())).scalar_one_or_none()
-                    if latest_signal and abs(latest_signal.final_score) >= self.config.quality_min_avg_score:
+                    if trade.side == "BUY":
+                        # 최고가에서 ATR * N 만큼 아래에 새로운 손절가 설정
+                        new_stop_loss = trade.highest_price_since_entry - (atr * self.config.trailing_stop_atr_multiplier)
+                        # 단, 새로운 손절가가 기존 손절가보다 낮아지면 안 됨 (수익 보존)
+                        if new_stop_loss > trade.stop_loss_price:
+                            trade.stop_loss_price = new_stop_loss
+                            print(f"📈 [추적 손절] {trade.symbol} LONG 포지션 손절가 상향 조정: ${new_stop_loss:,.2f}")
 
-                        pyramid_quantity = trade.quantity # 현재 남은 물량만큼 추가
-                        print(f"🔥 [피라미딩] {trade.symbol} 추세 지속. {pyramid_quantity}만큼 추가 진입.")
+                    elif trade.side == "SELL":
+                        # 최저가에서 ATR * N 만큼 위에 새로운 손절가 설정
+                        new_stop_loss = trade.highest_price_since_entry + (atr * self.config.trailing_stop_atr_multiplier)
+                        # 단, 새로운 손절가가 기존 손절가보다 높아지면 안 됨
+                        if new_stop_loss < trade.stop_loss_price:
+                            trade.stop_loss_price = new_stop_loss
+                            print(f"📉 [추적 손절] {trade.symbol} SHORT 포지션 손절가 하향 조정: ${new_stop_loss:,.2f}")
 
-                        order = self.binance_client.futures_create_order(symbol=trade.symbol, side=trade.side, type='MARKET', quantity=pyramid_quantity)
+            # ▲▲▲ [Phase 3 핵심] ▲▲▲
 
-                        new_entry_price = float(order.get('avgPrice', mark_price))
-                        total_quantity = trade.quantity + pyramid_quantity
-                        avg_price = (trade.entry_price * trade.quantity + new_entry_price * pyramid_quantity) / total_quantity
+            # 3. 최종 익절/손절 로직 (수정된 SL 가격 포함하여 실행)
+            if trade.take_profit_price and ((trade.side == "BUY" and mark_price >= trade.take_profit_price) or (trade.side == "SELL" and mark_price <= trade.take_profit_price)):
+                await self.trading_engine.close_position(trade, f"자동 최종 익절 (TP: ${trade.take_profit_price:,.2f})")
+                continue
 
-                        trade.entry_price = avg_price
-                        trade.quantity = total_quantity
-                        trade.pyramid_count += 1
+            if trade.stop_loss_price and ((trade.side == "BUY" and mark_price <= trade.stop_loss_price) or (trade.side == "SELL" and mark_price >= trade.stop_loss_price)):
+                await self.trading_engine.close_position(trade, f"자동 손절 (SL: ${trade.stop_loss_price:,.2f})")
+                continue
 
-                        # 새로운 평균 단가에 맞춰 SL 재조정
-                        new_atr = latest_signal.atr_4h
-                        if new_atr > 0:
-                            stop_loss_distance = new_atr * self.config.sl_atr_multiplier
-                            trade.stop_loss_price = avg_price - stop_loss_distance if trade.side == "BUY" else avg_price + stop_loss_distance
+            # 피라미딩 로직은 Phase 1, 2와 동일하게 유지
+            if not trade.is_scaled_out and trade.pyramid_count < 1:
+                latest_signal = session.execute(select(Signal).where(Signal.symbol == trade.symbol).order_by(Signal.id.desc())).scalar_one_or_none()
+                if latest_signal and abs(latest_signal.final_score) >= self.config.quality_min_avg_score:
+                    pyramid_quantity = trade.quantity
+                    print(f"🔥 [피라미딩] {trade.symbol} 추세 지속. {pyramid_quantity}만큼 추가 진입.")
+                    # ... (이하 피라미딩 주문 및 DB 업데이트 로직은 기존과 동일) ...
+                    order = self.binance_client.futures_create_order(symbol=trade.symbol, side=trade.side, type='MARKET', quantity=pyramid_quantity)
+                    new_entry_price = float(order.get('avgPrice', mark_price))
+                    total_quantity = trade.quantity + pyramid_quantity
+                    avg_price = (trade.entry_price * trade.quantity + new_entry_price * pyramid_quantity) / total_quantity
+                    trade.entry_price = avg_price
+                    trade.quantity = total_quantity
+                    trade.pyramid_count += 1
+                    new_atr = latest_signal.atr_4h
+                    if new_atr > 0:
+                        stop_loss_distance = new_atr * self.config.sl_atr_multiplier
+                        trade.stop_loss_price = avg_price - stop_loss_distance if trade.side == "BUY" else avg_price + stop_loss_distance
+                    session.commit()
+                    print(f"   ㄴ 추가 진입 성공. 새 평단: ${avg_price:,.2f}, 총 수량: {total_quantity}, 새 SL: ${trade.stop_loss_price:,.2f}")
 
-                        session.commit()
-                        print(f"   ㄴ 추가 진입 성공. 새 평단: ${avg_price:,.2f}, 총 수량: {total_quantity}, 새 SL: ${trade.stop_loss_price:,.2f}")
-                # ▲▲▲ [추가] ▲▲▲
+            # 모든 변경사항 최종 커밋
+            session.commit()
 
-            except Exception as e:
-                print(f"포지션 관리 중 오류 ({trade.symbol}): {e}")
-                session.rollback()
+        except Exception as e:
+            print(f"포지션 관리 중 오류 ({trade.symbol}): {e}")
+            session.rollback()
 
     async def find_new_entry_opportunities(self, session, open_positions_count, symbols_in_trade):
         """신규 진입 기회를 탐색하고, 조건 충족 시 주문을 실행합니다."""
