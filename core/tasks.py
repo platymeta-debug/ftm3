@@ -4,6 +4,7 @@ import discord
 from discord.ext import tasks
 from datetime import datetime, timezone
 from sqlalchemy import select
+from core.event_bus import event_bus
 import pandas as pd
 import requests
 
@@ -60,6 +61,37 @@ class BackgroundTasks:
         except Exception:
             price_str += "📉 **업비트**: `N/A`"
         return price_str
+    
+    def update_adaptive_aggression_level(self):
+        """[지능형 로직] 시장 변동성을 분석하여 현재 공격성 레벨을 동적으로 조절합니다."""
+        base_aggr_level = self.config.aggr_level
+        try:
+            # (main - 복사본.py의 로직을 그대로 가져오되, self를 사용하도록 수정)
+            with db_manager.get_session() as session:
+                latest_signal = session.execute(select(Signal).where(Signal.symbol == "BTCUSDT").order_by(Signal.id.desc())).first()
+
+                if not latest_signal or not latest_signal[0].atr_1d:
+                    if self.current_aggr_level != base_aggr_level:
+                        print(f"[Adaptive] 데이터 부족. 공격성 레벨 복귀: {self.current_aggr_level} -> {base_aggr_level}")
+                        self.current_aggr_level = base_aggr_level
+                    return
+
+                btc_signal = latest_signal[0]
+                mark_price_info = self.binance_client.futures_mark_price(symbol="BTCUSDT")
+                current_price = float(mark_price_info['markPrice'])
+                volatility = btc_signal.atr_1d / current_price
+                if volatility > self.config.adaptive_volatility_threshold:
+                    new_level = max(1, base_aggr_level - 2)
+                    if new_level != self.current_aggr_level:
+                        print(f"[Adaptive] 변동성 증가 감지({volatility:.2%})! 공격성 레벨 하향 조정: {self.current_aggr_level} -> {new_level}")
+                        self.current_aggr_level = new_level
+                else:
+                    if self.current_aggr_level != base_aggr_level:
+                        print(f"[Adaptive] 시장 안정. 공격성 레벨 복귀: {self.current_aggr_level} -> {base_aggr_level}")
+                        self.current_aggr_level = base_aggr_level
+        except Exception as e:
+            print(f"🚨 적응형 레벨 조정 중 오류: {e}")
+            self.current_aggr_level = base_aggr_level
 
     def get_panel_embed(self) -> discord.Embed:
         embed = discord.Embed(title="⚙️ 통합 관제 시스템", description="봇의 모든 상태를 확인하고 제어합니다.", color=0x2E3136)
@@ -201,18 +233,23 @@ class BackgroundTasks:
         if not self.config.exec_active:
             log_message += "자동매매 OFF 상태. 의사결정을 건너뜁니다."
         else:
+            # ▼▼▼ [수정된 부분] if 문의 들여쓰기를 바로잡았습니다 ▼▼▼
+            if self.config.adaptive_aggr_enabled:
+                self.update_adaptive_aggression_level() # if 문 안에 있도록 들여쓰기
+            # ▲▲▲ [수정된 부분] ▲▲▲
+
             log_message += f"[Lvl:{self.current_aggr_level}] 의사결정 사이클 시작. "
             try:
                 with db_manager.get_session() as session:
                     open_trades = session.execute(select(Trade).where(Trade.status == "OPEN")).scalars().all()
-                    
+
                     if open_trades:
                         log_message += f"{len(open_trades)}개 포지션 관리 실행. "
                         await self.manage_open_positions(session, open_trades)
-                    
+
                     open_positions_count = session.query(Trade).filter(Trade.status == "OPEN").count()
                     symbols_in_trade = {t.symbol for t in open_trades}
-                    
+
                     decision_reason = await self.find_new_entry_opportunities(session, open_positions_count, symbols_in_trade)
                     log_message += decision_reason
             except Exception as e:
@@ -220,20 +257,82 @@ class BackgroundTasks:
                 print(f"🚨 의사결정 루프 중 심각한 오류 발생: {e}")
 
         self.decision_log.insert(0, log_message)
-        if len(self.decision_log) > 5: # 로그 보관 개수 증가
+        if len(self.decision_log) > 5:
             self.decision_log.pop()
         print(log_message)
 
     # --- 트레이딩 로직 헬퍼 함수들 ---
+    async def event_handler_loop(self):
+        """이벤트 버스에서 이벤트를 구독하고, 디스코드로 실시간 알림을 보냅니다."""
+        print("이벤트 핸들러 루프가 시작되었습니다. 알림 대기 중...")
+        while True:
+            try:
+                event = await event_bus.subscribe()
+                event_type = event.get("type")
+                data = event.get("data", {})
 
+                alerts_channel = self.bot.get_channel(self.config.alerts_channel_id)
+                if not alerts_channel:
+                    print("⚠️ 알림 채널 ID를 찾을 수 없습니다. .env 파일을 확인하세요.")
+                    continue
+
+                if event_type == "ORDER_SUCCESS":
+                    trade = data.get("trade")
+                    embed = discord.Embed(title="🚀 신규 포지션 진입", color=0x00FF00 if trade.side == "BUY" else 0xFF0000)
+                    embed.add_field(name="코인", value=trade.symbol, inline=True)
+                    embed.add_field(name="방향", value=trade.side, inline=True)
+                    embed.add_field(name="수량", value=f"{trade.quantity}", inline=True)
+                    embed.add_field(name="진입 가격", value=f"${trade.entry_price:,.4f}", inline=False)
+                    embed.add_field(name="손절 (SL)", value=f"${trade.stop_loss_price:,.4f}", inline=True)
+                    embed.add_field(name="익절 (TP)", value=f"${trade.take_profit_price:,.4f}", inline=True)
+                    embed.set_footer(text=f"주문 ID: {trade.binance_order_id}")
+                    await alerts_channel.send(embed=embed)
+
+                elif event_type == "ORDER_CLOSE_SUCCESS":
+                    trade = data.get("trade")
+                    reason = data.get("reason")
+                    # PnL 계산을 위한 안전장치 추가
+                    initial_investment = trade.entry_price * trade.quantity
+                    pnl_percent = (trade.pnl / initial_investment * 100) if initial_investment > 0 else 0
+
+                    embed = discord.Embed(title="✅ 포지션 종료", description=f"사유: {reason}", color=0x3498DB)
+                    embed.add_field(name="코인", value=trade.symbol, inline=True)
+                    embed.add_field(name="수익 (PnL)", value=f"${trade.pnl:,.2f} ({pnl_percent:+.2f}%)", inline=True)
+                    await alerts_channel.send(embed=embed)
+
+                elif event_type == "ORDER_FAILURE":
+                    embed = discord.Embed(title="🚨 주문 실패", description=data.get("error"), color=0xFF0000)
+                    embed.add_field(name="코인", value=data.get("symbol"), inline=True)
+                    await alerts_channel.send(embed=embed)
+
+            except Exception as e:
+                print(f"이벤트 핸들러 오류: {e}")
+                
     async def manage_open_positions(self, session, open_trades):
-        """현재 오픈된 포지션들을 시나리오에 따라 관리합니다."""
+        """[복원] 분할익절, 피라미딩 등 고급 포지션 관리 기능을 수행합니다."""
         for trade in list(open_trades):
             try:
                 mark_price = float(self.binance_client.futures_mark_price(symbol=trade.symbol).get('markPrice', 0.0))
                 if mark_price == 0.0: continue
 
-                # 최종 익절/손절 로직
+                # ▼▼▼ [추가] 1. 분할 익절 (Scale-Out) 로직 ▼▼▼
+                if not trade.is_scaled_out:
+                    scale_out_target_price = trade.entry_price + (trade.take_profit_price - trade.entry_price) / self.config.risk_reward_ratio
+
+                    if (trade.side == "BUY" and mark_price >= scale_out_target_price) or \
+                    (trade.side == "SELL" and mark_price <= scale_out_target_price):
+
+                        quantity_to_close = trade.quantity / 2
+                        await self.trading_engine.close_position(trade, f"자동 분할 익절", quantity_to_close=quantity_to_close)
+
+                        trade.is_scaled_out = True
+                        trade.stop_loss_price = trade.entry_price
+                        session.commit()
+                        print(f"🛡️ [무위험 포지션 전환] {trade.symbol}의 손절가를 본전(${trade.entry_price:,.2f})으로 변경.")
+                        continue # 다음 거래로 넘어감
+                # ▲▲▲ [추가] ▲▲▲
+
+                # 2. 최종 익절/손절 로직 (기존과 동일)
                 if trade.take_profit_price and ((trade.side == "BUY" and mark_price >= trade.take_profit_price) or (trade.side == "SELL" and mark_price <= trade.take_profit_price)):
                     await self.trading_engine.close_position(trade, f"자동 최종 익절 (TP: ${trade.take_profit_price:,.2f})")
                     continue
@@ -241,8 +340,38 @@ class BackgroundTasks:
                 if trade.stop_loss_price and ((trade.side == "BUY" and mark_price <= trade.stop_loss_price) or (trade.side == "SELL" and mark_price >= trade.stop_loss_price)):
                     await self.trading_engine.close_position(trade, f"자동 손절 (SL: ${trade.stop_loss_price:,.2f})")
                     continue
+
+                # ▼▼▼ [추가] 3. 피라미딩 (불타기) 로직 ▼▼▼
+                if not trade.is_scaled_out and trade.pyramid_count < 1: # 최대 1회, 분할 익절 전
+                    latest_signal = session.execute(select(Signal).where(Signal.symbol == trade.symbol).order_by(Signal.id.desc())).scalar_one_or_none()
+                    if latest_signal and abs(latest_signal.final_score) >= self.config.quality_min_avg_score:
+
+                        pyramid_quantity = trade.quantity # 현재 남은 물량만큼 추가
+                        print(f"🔥 [피라미딩] {trade.symbol} 추세 지속. {pyramid_quantity}만큼 추가 진입.")
+
+                        order = self.binance_client.futures_create_order(symbol=trade.symbol, side=trade.side, type='MARKET', quantity=pyramid_quantity)
+
+                        new_entry_price = float(order.get('avgPrice', mark_price))
+                        total_quantity = trade.quantity + pyramid_quantity
+                        avg_price = (trade.entry_price * trade.quantity + new_entry_price * pyramid_quantity) / total_quantity
+
+                        trade.entry_price = avg_price
+                        trade.quantity = total_quantity
+                        trade.pyramid_count += 1
+
+                        # 새로운 평균 단가에 맞춰 SL 재조정
+                        new_atr = latest_signal.atr_4h
+                        if new_atr > 0:
+                            stop_loss_distance = new_atr * self.config.sl_atr_multiplier
+                            trade.stop_loss_price = avg_price - stop_loss_distance if trade.side == "BUY" else avg_price + stop_loss_distance
+
+                        session.commit()
+                        print(f"   ㄴ 추가 진입 성공. 새 평단: ${avg_price:,.2f}, 총 수량: {total_quantity}, 새 SL: ${trade.stop_loss_price:,.2f}")
+                # ▲▲▲ [추가] ▲▲▲
+
             except Exception as e:
                 print(f"포지션 관리 중 오류 ({trade.symbol}): {e}")
+                session.rollback()
 
     async def find_new_entry_opportunities(self, session, open_positions_count, symbols_in_trade):
         """신규 진입 기회를 탐색하고, 조건 충족 시 주문을 실행합니다."""
