@@ -181,11 +181,15 @@ def diagnose_market_regime(session, symbol: str) -> MarketRegime:
         return MarketRegime.SIDEWAYS
     
 def update_adaptive_aggression_level():
+    """[지능형 로직] 시장 변동성을 분석하여 현재 공격성 레벨을 동적으로 조절합니다."""
     global current_aggr_level
     base_aggr_level = config.aggr_level
     with db_manager.get_session() as session:
         try:
+            # --- ▼▼▼ [오류 1 해결] .scalar_one_or_none()을 .first()로 변경 ▼▼▼ ---
             latest_signal_tuple = session.execute(select(Signal).where(Signal.symbol == "BTCUSDT").order_by(Signal.id.desc())).first()
+            # --- ▲▲▲ [오류 1 해결] ▲▲▲ ---
+
             if not latest_signal_tuple or not latest_signal_tuple[0].atr_1d:
                 if current_aggr_level != base_aggr_level:
                     print(f"[Adaptive] 데이터 부족. 공격성 레벨 복귀: {current_aggr_level} -> {base_aggr_level}")
@@ -208,8 +212,6 @@ def update_adaptive_aggression_level():
         except Exception as e:
             print(f"🚨 적응형 레벨 조정 중 오류: {e}")
             current_aggr_level = base_aggr_level
-        finally:
-            session.close()
 
 # --- V3 백그라운드 작업 ---
 
@@ -250,7 +252,7 @@ def get_analysis_embed(session) -> discord.Embed:
         market_regime = diagnose_market_regime(session, symbol)
         
         # 스코어 흐름 (최근 10분)
-        lookback_time = datetime.utcnow() - timedelta(minutes=10)
+        lookback_time = datetime.now(timezone.utc) - timedelta(minutes=10)
         recent_signals = session.execute(
             select(Signal.final_score)
             .where(Signal.symbol == symbol, Signal.timestamp >= lookback_time)
@@ -326,15 +328,11 @@ async def trading_decision_loop():
         update_adaptive_aggression_level()
 
     print(f"\n--- [Trading Decision (Lvl:{current_aggr_level})] 매매 결정 시작 ---")
-    
-    # --- ▼▼▼ [오류 수정] try...except 블록 구조 수정 ▼▼▼ ---
     with db_manager.get_session() as session:
         try:
-            # --- 1. 현재 포트폴리오 상태 확인 ---
             open_trades = session.execute(select(Trade).where(Trade.status == "OPEN")).scalars().all()
             open_positions_count = len(open_trades)
 
-            # --- 2. 기존 포지션 관리 ---
             if open_positions_count > 0:
                 print(f"총 {open_positions_count}개의 포지션 관리 중...")
                 for trade in list(open_trades):
@@ -355,8 +353,6 @@ async def trading_decision_loop():
                     except Exception as e:
                         print(f"포지션 관리 중 오류 ({trade.symbol}): {e}")
 
-            # --- 3. 신규 진입 결정 (포트폴리오에 여유가 있을 때만) ---
-            # DB 세션이 만료되었을 수 있으므로, 최신 포지션 개수를 다시 확인
             open_positions_count = session.query(Trade).filter(Trade.status == "OPEN").count()
             
             if open_positions_count < config.max_open_positions:
@@ -365,9 +361,8 @@ async def trading_decision_loop():
                 
                 for symbol in config.symbols:
                     if symbol in symbols_in_trade: continue
-
                     market_regime = diagnose_market_regime(session, symbol)
-
+                    
                     if market_regime in [MarketRegime.BULL_TREND, MarketRegime.BEAR_TREND]:
                         recent_signals = session.execute(select(Signal).where(Signal.symbol == symbol).order_by(Signal.id.desc()).limit(config.trend_entry_confirm_count)).scalars().all()
                         if len(recent_signals) < config.trend_entry_confirm_count: continue
@@ -375,28 +370,39 @@ async def trading_decision_loop():
                         scores = [s.final_score for s in recent_signals]
                         avg_score = statistics.mean(scores)
                         std_dev = statistics.pstdev(scores) if len(scores) > 1 else 0
-                        
+
+                        # --- ▼▼▼ [오류 2 해결] 'Momentum' 조건 완화 ▼▼▼ ---
+                        print(f"[{symbol}] 추세장 신호 품질 평가: Avg={avg_score:.2f}, StdDev={std_dev:.2f}")
+
                         side = None
                         if market_regime == MarketRegime.BULL_TREND and avg_score >= config.quality_min_avg_score and std_dev <= config.quality_max_std_dev:
                             side = "BUY"
                         elif market_regime == MarketRegime.BEAR_TREND and abs(avg_score) >= config.quality_min_avg_score and std_dev <= config.quality_max_std_dev:
                             side = "SELL"
+                        # --- ▲▲▲ [오류 2 해결] ▲▲▲ ---
                         
                         if side:
                             print(f"🚀 고품질 추세 신호 포착!: {symbol} {side} (Avg: {avg_score:.2f})")
+                            
+                            # --- ▼▼▼ [오류 2 해결] ATR 조회 로직 강화 ▼▼▼ ---
                             entry_atr = recent_signals[0].atr_1d
                             if not entry_atr or entry_atr <= 0:
-                                print(f"ATR 값이 유효하지 않아({entry_atr}) 진입을 건너뜁니다.")
-                                continue
-                                
+                                print(f"경고: 1일봉 ATR({entry_atr})이 유효하지 않습니다. 4시간봉 ATR로 대체합니다.")
+                                # 4시간봉 ATR을 조회하기 위해 Confluence Engine 재활용
+                                _, _, tf_rows = confluence_engine.analyze(symbol)
+                                entry_atr = _extract_float_from_row(tf_rows.get("4h"), "ATR_14")
+                                if not entry_atr or entry_atr <= 0:
+                                    print(f"오류: 4시간봉 ATR도 유효하지 않아({entry_atr}) 진입을 건너뜁니다.")
+                                    continue
+                            # --- ▲▲▲ [오류 2 해결] ▲▲▲ ---
+
                             quantity = position_sizer.calculate_position_size(symbol, entry_atr, current_aggr_level, open_positions_count, avg_score)
                             if not quantity or quantity <= 0: continue
                             
                             leverage = position_sizer.get_leverage_for_symbol(symbol, current_aggr_level)
                             analysis_context = {"signal_id": recent_signals[0].id}
                             await trading_engine.place_order_with_bracket(symbol, side, quantity, leverage, entry_atr, analysis_context)
-                            return # 한 번에 하나의 포지션만 진입
-        
+                            return
         except Exception as e:
             print(f"🚨 매매 결정 루프 중 심각한 오류 발생: {e}")
 
@@ -464,13 +470,16 @@ async def close_position_kr(interaction: discord.Interaction, 코인: str):
     await interaction.response.send_message(f"**⚠️ 경고: 수동 청산**\n`{symbol}` 포지션을 즉시 시장가로 종료하시겠습니까?", view=view, ephemeral=True)
     await view.wait()
     if view.value is True:
-        with db_manager.get_session() as session:
-            trade_to_close = session.execute(select(Trade).where(Trade.symbol == symbol, Trade.status == "OPEN")).scalar_one_or_none()
-        if trade_to_close:
-            await trading_engine.close_position(trade_to_close, "사용자 수동 청산")
-            await interaction.followup.send(f"✅ **수동 청산 주문 성공**\n`{symbol}` 포지션이 종료되었습니다.", ephemeral=True)
-        else:
-            await interaction.followup.send(f"❌ **수동 청산 주문 실패**\n`{symbol}`에 대한 오픈된 포지션이 없습니다.", ephemeral=True)
+        try:
+            with db_manager.get_session() as session:
+                trade_to_close = session.execute(select(Trade).where(Trade.symbol == symbol, Trade.status == "OPEN")).scalar_one_or_none()
+            if trade_to_close:
+                await trading_engine.close_position(trade_to_close, "사용자 수동 청산")
+                await interaction.followup.send(f"✅ **수동 청산 주문 성공**\n`{symbol}` 포지션이 종료되었습니다.", ephemeral=True)
+            else:
+                await interaction.followup.send(f"❌ **수동 청산 주문 실패**\n`{symbol}`에 대한 오픈된 포지션이 없습니다.", ephemeral=True)
+        except Exception as e:
+            await interaction.followup.send(f"❌ **수동 청산 주문 실패**\n`{e}`", ephemeral=True)
 
 # --- 봇 준비 이벤트 ---
 @bot.event
