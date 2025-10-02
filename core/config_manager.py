@@ -50,7 +50,13 @@ class ConfigManager:
 
         # --- Risk Management ---
         self.risk_target_pct = self._get_float("RISK_TARGET_PCT", 0.02)
-        self.sl_atr_multiplier = self._get_float("SL_ATR", 1.5)
+        self.sl_atr_multiplier = self._get_float("SL_ATR_MULTIPLIER", 1.5)
+
+        # --- New Trading Logic Rules (V2) ---
+        self.entry_confirm_count = self._get_int("ENTRY_CONFIRM_COUNT", 3)
+        self.reversal_confirm_count = self._get_int("REVERSAL_CONFIRM_COUNT", 2)
+        self.take_profit_pct = self._get_float("TAKE_PROFIT_PCT", 0.05)
+        self.stop_loss_pct = self._get_float("STOP_LOSS_PCT", 0.02)
 
 
 
