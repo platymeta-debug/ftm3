@@ -1,0 +1,9 @@
+python-binance
+pandas
+pandas-ta
+sqlalchemy
+python-dotenv
+discord.py
+requests
+backtesting.py
+bokeh
