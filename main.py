@@ -389,6 +389,29 @@ async def close_position_kr(interaction: discord.Interaction, 코인: str):
     # ... (DB에서 해당 심볼의 open_trade를 찾아 trading_engine.close_position 호출하는 로직)
     await interaction.response.send_message(f"`{symbol}` 포지션 청산 기능은 구현 예정입니다.", ephemeral=True)
 
+# --- 봇 준비 이벤트 ---
+@bot.event
+async def on_ready():
+    """봇이 준비되었을 때 한 번 실행되는 함수"""
+    await tree.sync()
+    print(f'{bot.user.name} 봇이 준비되었습니다. 슬래시 명령어가 동기화되었습니다.')
+    print('------------------------------------')
 
-# ... (on_ready, 봇 실행 코드는 기존과 동일하게 유지)
-# on_ready에서 data_collector_loop, trading_decision_loop를 start() 해야 합니다.
+    # 백그라운드 루프를 시작합니다.
+    if not data_collector_loop.is_running():
+        data_collector_loop.start()
+    
+    # data_collector가 데이터를 먼저 쌓을 수 있도록 잠시 기다립니다.
+    await asyncio.sleep(5) 
+    
+    if not trading_decision_loop.is_running():
+        trading_decision_loop.start()
+
+    print("모든 준비 완료. `/패널` 명령어를 사용하여 제어실을 소환하세요.")
+
+# --- 봇 실행 ---
+if __name__ == "__main__":
+    if not config.discord_bot_token:
+        print("오류: .env 파일에 DISCORD_BOT_TOKEN이 설정되지 않았습니다.")
+    else:
+        bot.run(config.discord_bot_token)
