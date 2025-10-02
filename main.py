@@ -135,11 +135,44 @@ def get_panel_embed() -> discord.Embed:
     try:
         with db_manager.get_session() as session:
             open_positions_count = session.query(Trade).filter(Trade.status == "OPEN").count()
-        embed.add_field(name="[포트폴리오]", value=f"**{open_positions_count} / {config.max_open_positions}** 포지션 운영 중", inline=False)
-    except Exception as e:
-        print(f"DB 조회 오류 (get_panel_embed): {e}")
-        embed.add_field(name="[포트폴리오]", value="DB 조회 오류", inline=False)
+        embed.add_field(
+            name="[포트폴리오]",
+            value=f"**{open_positions_count} / {config.max_open_positions}** 포지션 운영 중",
+            inline=False
+        )
 
+        # 바이낸스에서 직접 실시간 포지션 정보 조회
+        positions = binance_client.futures_position_information()
+        open_positions = [p for p in positions if float(p.get('positionAmt', 0)) != 0]
+
+        if not open_positions:
+            embed.add_field(name="[오픈된 포지션]", value="현재 오픈된 포지션이 없습니다.", inline=False)
+        else:
+            for pos in open_positions:
+                symbol = pos['symbol']
+                side = "LONG" if float(pos['positionAmt']) > 0 else "SHORT"
+                quantity = abs(float(pos['positionAmt']))
+                entry_price = float(pos['entryPrice'])
+                unrealized_pnl = float(pos['unRealizedProfit'])
+                pnl_color = "📈" if unrealized_pnl >= 0 else "📉"
+
+                # 레버리지 정보 추가
+                leverage = int(pos.get('leverage', 1))
+
+                # PNL 퍼센티지 계산 (격리 모드 기준)
+                margin = float(pos.get('isolatedWallet', 0))
+                pnl_percent = (unrealized_pnl / margin * 100) if margin > 0 else 0.0
+
+                pos_value = (
+                    f"**{side}** | `{quantity}` @ `${entry_price:,.2f}` | **{leverage}x**\n"
+                    f"> PnL: `${unrealized_pnl:,.2f}` ({pnl_percent:+.2f}%) {pnl_color}"
+                )
+                embed.add_field(name=f"--- {symbol} ---", value=pos_value, inline=True)
+
+    except Exception as e:
+        print(f"패널 포지션 정보 업데이트 중 오류: {e}")
+        embed.add_field(name="[오픈된 포지션]", value="⚠️ 정보를 가져오는 중 오류가 발생했습니다.", inline=False)
+    # --- ▲▲▲ [오류 3 해결] 포지션 상세 정보 표시 로직 추가 ▲▲▲ ---
 
     embed.set_footer(text=f"최종 업데이트: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     return embed
@@ -148,7 +181,7 @@ def diagnose_market_regime(session, symbol: str) -> MarketRegime:
     """[시장 진단] DB 데이터를 기반으로 현재 시장 체제를 진단합니다."""
     latest_signal = session.execute(
         select(Signal).where(Signal.symbol == symbol).order_by(Signal.id.desc())
-    ).scalar_one_or_none()
+    ).first()
 
     if not latest_signal or latest_signal.adx_4h is None or getattr(latest_signal, 'is_above_ema200_1d', None) is None:
         return MarketRegime.SIDEWAYS
@@ -250,15 +283,9 @@ def get_analysis_embed(session) -> discord.Embed:
         sparkline = generate_sparkline(recent_signals)
         
         # 현재 분석 스냅샷
-        latest_signal = session.execute(select(Signal).where(Signal.symbol == symbol).order_by(Signal.id.desc())).scalar_one_or_none()
+       latest_signal = latest_signal_tuple[0] if latest_signal_tuple else None
         score_text = f"**{latest_signal.final_score:.2f}**" if latest_signal else "N/A"
-        
-        embed.add_field(
-            name=f"{symbol} | {market_regime.value}",
-            value=f"스코어 흐름: `{sparkline}`\n현재 점수: {score_text}",
-            inline=False
-        )
-    
+        embed.add_field(name=f"{symbol} | {market_regime.value}", value=f"스코어 흐름: {sparkline}\n현재 점수: {score_text}", inline=False)
     embed.set_footer(text=f"최종 업데이트: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     return embed
 
