@@ -8,6 +8,7 @@ from sqlalchemy import select
 import pandas as pd
 from enum import Enum
 import statistics
+import requests
 
 # 1. 모듈 임포트
 from core.config_manager import config
@@ -45,6 +46,7 @@ position_sizer = PositionSizer(binance_client)
 current_aggr_level = config.aggr_level
 panel_message: discord.Message = None
 analysis_message: discord.Message = None # 분석 메시지 객체
+latest_analysis_results = {}
 
 # --- 시장 체제 정의 ---
 class MarketRegime(Enum):
@@ -115,13 +117,44 @@ def on_aggr_level_change(new_level: int):
     global current_aggr_level
     current_aggr_level = new_level
 
+def get_external_prices(symbol: str) -> str:
+    """바이낸스 선물과 업비트 현물 가격을 조회하여 문자열로 반환합니다."""
+    # 심볼 변환 (e.g., BTCUSDT -> KRW-BTC)
+    upbit_symbol = f"KRW-{symbol.replace('USDT', '')}"
+    
+    # 바이낸스 가격 조회
+    try:
+        futures_price_info = binance_client.futures_mark_price(symbol=symbol)
+        futures_price = float(futures_price_info['markPrice'])
+        price_str = f"📈 **바이낸스**: `${futures_price:,.2f}`"
+    except Exception:
+        price_str = "📈 **바이낸스**: `N/A`"
+
+    # 업비트 가격 조회
+    try:
+        response = requests.get(f"https://api.upbit.com/v1/ticker?markets={upbit_symbol}", timeout=2)
+        response.raise_for_status()
+        upbit_price = response.json()[0]['trade_price']
+        price_str += f"\n📉 **업비트**: `₩{upbit_price:,.0f}`"
+    except Exception:
+        price_str += "\n📉 **업비트**: `N/A`"
+        
+    return price_str
+
 def get_panel_embed() -> discord.Embed:
-    """[V4 최종] 실시간 포지션 정보를 포함한 제어 패널 Embed를 생성합니다."""
+    """
+    [V5.4 최종] API Key 이름 오류('unrealizedProfit')를 수정한 최종 버전입니다.
+    API를 기준으로 포지션을 정확히 탐지하고, DB 정보와 결합하여
+    SL/TP, 청산가 등 모든 상세 정보를 표시합니다.
+    """
     embed = discord.Embed(title="⚙️ 통합 관제 시스템", description="봇의 모든 상태를 확인하고 제어합니다.", color=0x2E3136)
+    
+    # --- 1. 상단 정보 (핵심 상태, 현재 전략) ---
     trade_mode_text = "🔴 **실시간 매매**" if not config.is_testnet else "🟢 **테스트넷**"
     auto_trade_text = "✅ **자동매매 ON**" if config.exec_active else "❌ **자동매매 OFF**"
     adaptive_text = "🧠 **자동 조절 ON**" if config.adaptive_aggr_enabled else "👤 **수동 설정**"
     embed.add_field(name="[핵심 상태]", value=f"{trade_mode_text}\n{auto_trade_text}\n{adaptive_text}", inline=True)
+    
     symbols_text = f"**{', '.join(config.symbols)}**"
     base_aggr_text = f"**Level {config.aggr_level}**"
     current_aggr_text = f"**Level {current_aggr_level}**"
@@ -129,61 +162,71 @@ def get_panel_embed() -> discord.Embed:
         status = " (⚠️위험)" if current_aggr_level < config.aggr_level else " (📈안정)"
         current_aggr_text += status
     embed.add_field(name="[현재 전략]", value=f"분석 대상: {symbols_text}\n기본 공격성: {base_aggr_text}\n현재 공격성: {current_aggr_text}", inline=True)
-    try:
-        # --- ▼▼▼ [V4.1] 자산 정보 및 총 PnL 계산 ▼▼▼ ---
+
+    # --- 2. 포트폴리오 및 포지션 상세 정보 ---
+     try:
         account_info = binance_client.futures_account()
+        positions_from_api = [p for p in account_info.get('positions', []) if float(p.get('positionAmt', 0)) != 0]
+        
         total_balance = float(account_info.get('totalWalletBalance', 0.0))
         total_pnl = float(account_info.get('totalUnrealizedProfit', 0.0))
         pnl_color = "📈" if total_pnl >= 0 else "📉"
         
-        db_session = db_manager.get_session()
-        open_trades_from_db = db_session.query(Trade).filter(Trade.status == "OPEN").all()
-        open_positions_count = len(open_trades_from_db)
-        
         embed.add_field(
             name="[포트폴리오]",
             value=f"💰 **총 자산**: `${total_balance:,.2f}`\n"
-                  f"{pnl_color} **총 PnL**: `${total_pnl:,.2f}`\n"
-                  f"📊 **운영 포지션**: **{open_positions_count} / {config.max_open_positions}** 개",
+                  f"{pnl_color} **총 미실현 PnL**: `${total_pnl:,.2f}`\n"
+                  f"📊 **운영 포지션**: **{len(positions_from_api)} / {config.max_open_positions}** 개",
             inline=False
         )
-        # --- ▲▲▲ [V4.1] ▲▲▲ ---
 
-        if not open_trades_from_db:
+        if not positions_from_api:
             embed.add_field(name="[오픈된 포지션]", value="현재 오픈된 포지션이 없습니다.", inline=False)
         else:
-            # API에서 가져온 실시간 정보와 DB 정보를 매칭
-            positions_from_api = {p['symbol']: p for p in binance_client.futures_position_information() if float(p.get('positionAmt', 0)) != 0}
-            
-            for trade in open_trades_from_db:
-                pos_api_data = positions_from_api.get(trade.symbol)
-                if not pos_api_data: continue
+            db_session = db_manager.get_session()
+            for pos in positions_from_api:
+                symbol = pos.get('symbol')
+                if not symbol: continue
 
-                side = "LONG" if float(pos_api_data['positionAmt']) > 0 else "SHORT"
-                quantity = abs(float(pos_api_data['positionAmt']))
-                entry_price = float(pos_api_data['entryPrice'])
-                pnl = float(pos_api_data['unRealizedProfit'])
-                notional_value = quantity * entry_price # 포지션 가치
-                
-                # --- ▼▼▼ [V4.1] DB에서 레버리지 조회 ▼▼▼ ---
-                leverage = trade.leverage if trade.leverage else int(pos_api_data.get('leverage', 1))
-                # --- ▲▲▲ [V4.1] ▲▲▲ ---
-
-                margin = notional_value / leverage if leverage > 0 else 0
+                pnl = float(pos.get('unrealizedProfit', 0.0))
+                side = "LONG" if float(pos.get('positionAmt', 0.0)) > 0 else "SHORT"
+                quantity = abs(float(pos.get('positionAmt', 0.0)))
+                entry_price = float(pos.get('entryPrice', 0.0))
+                leverage = int(pos.get('leverage', 1))
+                liq_price = float(pos.get('liquidationPrice', 0.0))
+                margin = float(pos.get('initialMargin', 0.0))
                 pnl_percent = (pnl / margin * 100) if margin > 0 else 0.0
-                pnl_color = "📈" if pnl >= 0 else "📉"
+                
+                trade_db = db_session.query(Trade).filter(Trade.symbol == symbol, Trade.status == "OPEN").first()
+                
+                pnl_text = f"📈 **PnL**: `${pnl:,.2f}` (`{pnl_percent:+.2f} %`)" if pnl >= 0 else f"📉 **PnL**: `${pnl:,.2f}` (`{pnl_percent:+.2f} %`)"
+                
+                details_text = f"> **진입가**: `${entry_price:,.2f}` | **수량**: `{quantity}`\n> {pnl_text}\n"
+                
+                if trade_db and trade_db.stop_loss_price:
+                    # DB에 기록된 SL/TP가 있는 경우
+                    sl_price = trade_db.stop_loss_price
+                    tp_price = trade_db.take_profit_price
+                    mark_price = float(binance_client.futures_mark_price(symbol=symbol).get('markPrice', 0.0))
+                    
+                    if mark_price > 0:
+                        sl_dist_pct = (abs(mark_price - sl_price) / mark_price) * 100
+                        tp_dist_pct = (abs(tp_price - mark_price) / mark_price) * 100
+                        details_text += f"> **SL**: `${sl_price:,.2f}` (`{sl_dist_pct:.2f}%`)\n> **TP**: `${tp_price:,.2f}` (`{tp_dist_pct:.2f}%`)\n"
+                    else:
+                        details_text += f"> **SL**: `${sl_price:,.2f}`\n> **TP**: `${tp_price:,.2f}`\n"
+                else:
+                    details_text += "> **SL/TP**: `(봇 관리 아님)`\n"
 
-                pos_value = (
-                    f"**{side}** | `{quantity}` @ `${entry_price:,.2f}` | **{leverage}x**\n"
-                    f"> **가치**: `${notional_value:,.2f}`\n"
-                    f"> **PnL**: `${pnl:,.2f}` ({pnl_percent:+.2f}%) {pnl_color}"
-                )
-                embed.add_field(name=f"--- {trade.symbol} ---", value=pos_value, inline=True)
-        db_session.close()
+                details_text += f"> **청산가**: " + (f"`${liq_price:,.2f}`" if liq_price > 0 else "`N/A`")
+
+                embed.add_field(name=f"--- {symbol} ({side} x{leverage}) ---", value=details_text, inline=False)
+                
+            db_session.close()
 
     except Exception as e:
-        print(f"패널 포지션 정보 업데이트 중 오류: {e}")
-        embed.add_field(name="[오픈된 포지션]", value="⚠️ 정보를 가져오는 중 오류가 발생했습니다.", inline=False)
+        print(f"패널 정보 업데이트 중 오류: {e}")
+        embed.add_field(name="[포트폴리오]", value="⚠️ 정보를 가져오는 중 오류가 발생했습니다.", inline=False)
     
     embed.set_footer(text=f"최종 업데이트: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S %Z')}")
     return embed
@@ -263,39 +306,87 @@ def generate_sparkline(scores: list) -> str:
     return f"`{''.join(sparkline)}` **{scores[-1]:.1f}** {trend_emoji}"
 
 
+# main.py의 get_analysis_embed 함수를 아래 내용으로 전체 교체해주세요.
+
 def get_analysis_embed(session) -> discord.Embed:
-    """[V4 최종] '라이브 종합 상황판' Embed를 생성합니다."""
-    embed = discord.Embed(title="📊 라이브 종합 상황판", color=0x4A90E2)
-    btc_market_regime = diagnose_market_regime(session, "BTCUSDT")
-    embed.description = f"현재 BTC 시장을 **{btc_market_regime.value}** (으)로 판단하고 있습니다."
+    """
+    [V5.6 최종] 각 코인별 시장 체제를 개별적으로 표시하고, 전체적인 시장 상황을
+    요약하여 보여주는 최종 버전의 상황판입니다.
+    """
+    embed = discord.Embed(title="📊 라이브. 종합 상황판", color=0x4A90E2)
     
-    for symbol in config.symbols:
-        lookback_time = datetime.now(timezone.utc) - timedelta(minutes=10)
-        recent_scores = session.execute(select(Signal.final_score).where(Signal.symbol == symbol, Signal.timestamp >= lookback_time).order_by(Signal.timestamp.asc())).scalars().all()
-        sparkline = generate_sparkline(recent_scores)
-        latest_signal_tuple = session.execute(select(Signal).where(Signal.symbol == symbol).order_by(Signal.id.desc())).first()
-        latest_signal = latest_signal_tuple[0] if latest_signal_tuple else None
+    if not latest_analysis_results:
+        embed.description = "분석 데이터를 수집하고 있습니다..."
+        return embed
+
+    # --- ▼▼▼ [V5.6] 상단 설명을 더 중립적이고 전체적으로 수정 ▼▼▼ ---
+    # 여러 코인의 시장 체제를 종합하여 보여줍니다.
+    regime_counts = {}
+    for data in latest_analysis_results.values():
+        regime = data.get("market_regime")
+        if regime:
+            regime_counts[regime.value] = regime_counts.get(regime.value, 0) + 1
+    
+    if regime_counts:
+        summary = ", ".join([f"**{k}**({v}개)" for k, v in regime_counts.items()])
+        embed.description = f"현재 분석 대상 코인들의 시장은 {summary} 상태입니다."
+    else:
+        embed.description = "시장 체제를 분석하고 있습니다."
+    # --- ▲▲▲ [V5.6] 수정 완료 ▲▲▲ ---
+    
+    for symbol, data in latest_analysis_results.items():
+        # --- 실시간 가격 조회 ---
+        price_text = get_external_prices(symbol)
+        embed.add_field(name=f"--- {symbol} 실시간 시세 ---", value=price_text, inline=False)
         
-        value_text = f"**스코어 흐름 (15분):** {sparkline}\n"
-        if latest_signal:
-            score_color = "🟢" if latest_signal.final_score > 0 else "🔴" if latest_signal.final_score < 0 else "⚪"
-            value_text += f"**현재 점수:** {score_color} **{latest_signal.final_score:.2f}**"
-        else:
-            value_text += "**현재 점수:** 데이터 없음"
-            
-        embed.add_field(name=f"--- {symbol} ---", value=value_text, inline=False)
+        # --- 분석 정보 ---
+        final_score = data.get("final_score", 0)
+        
+        # --- ▼▼▼ [V5.6] 각 코인별 시장 체제 표시 추가 ▼▼▼ ---
+        market_regime = data.get("market_regime")
+        regime_text = f"`{market_regime.value}`" if market_regime else "`분석 중...`"
+        # --- ▲▲▲ [V5.6] 수정 완료 ▲▲▲ ---
+
+        # 다중 타임프레임 점수 요약
+        tf_scores = {tf: data.get("tf_breakdowns", {}).get(tf, {}) for tf in config.analysis_timeframes}
+        tf_summary = " ".join([f"`{tf}:{sum(scores.values())}`" for tf, scores in tf_scores.items()])
+
+        # 4h 주요 지표
+        rows_4h = data.get("tf_rows", {}).get("4h")
+        indicators_text = "N/A"
+        if rows_4h is not None:
+            rsi = rows_4h.get('RSI_14', 0)
+            adx = rows_4h.get('ADX_14', 0)
+            mfi = rows_4h.get('MFI_14', 0)
+            indicators_text = f"**RSI**: `{rsi:.1f}` | **ADX**: `{adx:.1f}` | **MFI**: `{mfi:.1f}`"
+        
+        score_color = "🟢" if final_score > 0 else "🔴" if final_score < 0 else "⚪"
+        
+        field_value = (
+            f"**현재 시장 체제:** {regime_text}\n" # <-- 여기에 개별 시장 체제 표시
+            f"**종합 점수:** {score_color} **{final_score:.2f}**\n"
+            f"**TF별 점수:** {tf_summary}\n"
+            f"**4h 주요지표:** {indicators_text}"
+        )
+        embed.add_field(name="--- 분석 요약 ---", value=field_value, inline=False)
+        
     embed.set_footer(text=f"최종 업데이트: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S %Z')}")
     return embed
 
 @tasks.loop(minutes=1)
 async def data_collector_loop():
-    global analysis_message
+    global analysis_message, latest_analysis_results
     print(f"\n--- [Data Collector] 분석 시작 ---")
     session = db_manager.get_session()
     try:
         for symbol in config.symbols:
-            final_score, tf_scores, tf_rows = confluence_engine.analyze(symbol)
-
+            final_score, tf_scores, tf_rows, tf_breakdowns = confluence_engine.analyze(symbol)
+            latest_analysis_results[symbol] = {
+                "final_score": final_score,
+                "tf_rows": tf_rows,
+                "tf_breakdowns": tf_breakdowns,
+                "market_regime": diagnose_market_regime(session, symbol) # 시장 체제 진단 결과도 함께 저장
+            }
             atr_1d_val = confluence_engine.extract_atr(tf_rows, primary_tf='1d')
             atr_4h_val = confluence_engine.extract_atr(tf_rows, primary_tf='4h')
 
