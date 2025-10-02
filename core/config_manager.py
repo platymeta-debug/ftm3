@@ -22,9 +22,13 @@ class ConfigManager:
             self.api_secret = os.getenv("BINANCE_LIVE_API_SECRET")
 
         # Analysis Engine
-        self.analysis_timeframes = self._get_list("ANALYSIS_TIMEFRAMES", ["1d", "4h", "1h", "15m"])
-        self.tf_vote_weights = self._get_list_float("TF_VOTE_WEIGHTS", [4.0, 3.0, 2.0, 1.0])
-        self.open_th = self._get_float("OPEN_TH", 12.0)
+        self.timeframes = self._get_list("ANALYSIS_TIMEFRAMES", ["15m", "1h", "4h", "1d"])
+        self.tf_vote_weights = self._get_list_float("TF_VOTE_WEIGHTS", [1.0, 2.0, 3.0, 4.0])
+        self.open_threshold = self._get_float("OPEN_TH", 10.0)
+
+        # Signal Quality Rules
+        self.quality_min_avg_score = self._get_float("QUALITY_MIN_AVG_SCORE", 15.0)
+        self.quality_max_std_dev = self._get_float("QUALITY_MAX_STD_DEV", 3.0)
 
         # Trading Logic Rules
         self.entry_confirm_count = self._get_int("ENTRY_CONFIRM_COUNT", 3)
@@ -35,6 +39,7 @@ class ConfigManager:
         self.risk_target_pct = self._get_float("RISK_TARGET_PCT", 0.02)
         self.sl_atr_multiplier = self._get_float("SL_ATR_MULTIPLIER", 1.5)
         self.take_profit_pct = self._get_float("TAKE_PROFIT_PCT", 0.05)
+        self.trailing_stop_enabled = self._get_bool("TRAILING_STOP_ENABLED", True)
 
         # Leverage Map
         self.leverage_map = {
