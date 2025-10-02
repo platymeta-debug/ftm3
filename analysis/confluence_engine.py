@@ -150,44 +150,43 @@ class ConfluenceEngine:
     # ==================================
     # 🚀 3단계: 최종 판단 - Confluence Layer
     # ==================================
-    def analyze(self, symbol: str) -> Tuple[float, Dict[str, int], Dict[str, pd.Series], Dict[str, Dict[str, int]]]:
+    def analyze(self, symbol: str) -> Tuple[float, Dict[str, int], Dict[str, pd.Series], Dict[str, Dict[str, int]], int, str]:
         """[V4] 시장의 모든 요소를 종합하여 최종 컨플루언스 점수를 계산합니다."""
         # 1. 거시 심리 분석 (API 호출)
         self._fetch_fear_and_greed_index()
         
         tf_scores: Dict[str, int] = {}
         tf_rows: Dict[str, pd.Series] = {}
-        tf_score_breakdowns: Dict[str, Dict[str, int]] = {} # 상세 내역 저장용 딕셔너리
+        tf_score_breakdowns: Dict[str, Dict[str, int]] = {}
         timeframes = config.analysis_timeframes
+        confluence_signal = "" # 추세 동조 신호
 
         for timeframe in timeframes:
-            df = data_fetcher.fetch_klines(self.client, symbol, timeframe, limit=200) # 다이버전스 계산 위해 데이터 증가
-            if df is None or df.empty:
-                tf_scores[timeframe] = 0
-                continue
-            
-            indicators = indicator_calculator.calculate_all_indicators(df)
-            print(f"--- [confluence_engine] '{timeframe}' 분석 직전, 수신된 컬럼 목록 ---")
-            if indicators is not None and not indicators.empty:
-                print(indicators.columns.to_list())
-            else:
-                print("수신된 데이터가 비어있습니다.")
-            print("--------------------------------------------------------------")
+                df = data_fetcher.fetch_klines(self.client, symbol, timeframe, limit=200)
+                if df is None or df.empty:
+                    tf_scores[timeframe], tf_score_breakdowns[timeframe] = 0, {}
+                    continue
+                
+                indicators = indicator_calculator.calculate_all_indicators(df)
+                if indicators is None or indicators.empty:
+                    tf_scores[timeframe], tf_score_breakdowns[timeframe] = 0, {}
+                    continue
 
-            if indicators is None or indicators.empty:
-                tf_scores[timeframe] = 0
-                continue
-            
-            score, breakdown = self._calculate_tactical_score(indicators, timeframe)
-            tf_scores[timeframe] = score
-            tf_score_breakdowns[timeframe] = breakdown
-            tf_rows[timeframe] = indicators.iloc[-1]
+                score, breakdown = self._calculate_tactical_score(indicators, timeframe)
+                tf_scores[timeframe] = score
+                tf_score_breakdowns[timeframe] = breakdown
+                tf_rows[timeframe] = indicators.iloc[-1]
+                final_score = 0.0
 
-        # 2. 최종 점수 집계 (가중 투표 + 심리 지수 반영)
-        final_score = 0.0
-        for idx, timeframe in enumerate(timeframes):
-            weight = config.tf_vote_weights[idx] if idx < len(config.tf_vote_weights) else 1.0
-            final_score += tf_scores.get(timeframe, 0) * float(weight)
+                for idx, timeframe in enumerate(timeframes):
+                    weight = config.tf_vote_weights[idx] if idx < len(config.tf_vote_weights) else 1.0
+                    final_score += tf_scores.get(timeframe, 0) * float(weight)
+
+                if (tf_scores.get("4h", 0) > 0 and tf_scores.get("1d", 0) > 0) or \
+                (tf_scores.get("4h", 0) < 0 and tf_scores.get("1d", 0) < 0):
+                    final_score *= 1.2
+                    confluence_signal = "📈 4h-1d 추세 동조!"
+                    print(confluence_signal)
 
         # 3. 거시-미시 동조화 가중
         # 4h와 1d의 방향성이 같으면 신뢰도 상승
@@ -208,7 +207,7 @@ class ConfluenceEngine:
         # V3 호환성을 위한 추가 데이터 추출 (main.py에서 사용)
         self._extract_legacy_data(tf_rows)
 
-        return final_score, tf_scores, tf_rows, tf_score_breakdowns
+        return final_score, tf_scores, tf_rows, tf_score_breakdowns, self.fear_and_greed_index, confluence_signal
     
     # --- 유틸리티 및 하위 호환성 함수들 (기존과 거의 동일) ---
     
