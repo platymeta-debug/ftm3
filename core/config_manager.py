@@ -103,6 +103,9 @@ class ConfigManager:
         self.adaptive_aggr_enabled = self._get_bool("ADAPTIVE_AGGR_ENABLED", True)
         self.adaptive_volatility_threshold = self._get_float("ADAPTIVE_VOLATILITY_THRESHOLD", 0.04)
         self.max_open_positions = self._get_int("MAX_OPEN_POSITIONS", 2)
+        self.circuit_breaker_enabled = self._get_bool("CIRCUIT_BREAKER_ENABLED", True)
+        self.drawdown_threshold_pct = self._get_float("DRAWDOWN_THRESHOLD_PCT", 10.0) # 최대 손실 허용률 (%)
+        self.drawdown_check_days = self._get_int("DRAWDOWN_CHECK_DAYS", 7) # 자산 하락을 확인할 기간 (일)
 
         # Infrastructure
         self.db_path = os.getenv("DB_PATH", "./runtime/trader.db")
