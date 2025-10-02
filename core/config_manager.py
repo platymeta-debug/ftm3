@@ -74,6 +74,11 @@ class ConfigManager:
         # Infrastructure
         self.db_path = os.getenv("DB_PATH", "./runtime/trader.db")
         self.discord_bot_token = os.getenv("DISCORD_BOT_TOKEN") # Discord 토큰 추가
+        # Discord Channel IDs
+        self.dashboard_channel_id = self._get_int("DISCORD_CHANNEL_ID_DASHBOARD")
+        self.alerts_channel_id = self._get_int("DISCORD_CHANNEL_ID_ALERTS")
+        self.analysis_channel_id = self._get_int("DISCORD_CHANNEL_ID_ANALYSIS")
+        self.panel_channel_id = self._get_int("DISCORD_CHANNEL_ID_PANEL")
 
     def _get_bool(self, key: str, default: bool = False) -> bool:
         val = os.getenv(key)
