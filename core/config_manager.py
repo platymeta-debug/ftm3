@@ -13,7 +13,7 @@ class ConfigManager:
         self.exec_active = self._get_bool("EXEC_ACTIVE", False)
         self.symbols = self._get_list("SYMBOLS", ["BTCUSDT"])
 
-        # Binance Keys (기존과 동일)
+        # Binance Keys
         if self.is_testnet:
             self.api_key = os.getenv("BINANCE_TEST_API_KEY")
             self.api_secret = os.getenv("BINANCE_TEST_API_SECRET")
@@ -26,9 +26,6 @@ class ConfigManager:
         self.tf_vote_weights = self._get_list_float("TF_VOTE_WEIGHTS", [4.0, 3.0, 2.0, 1.0])
         self.open_th = self._get_float("OPEN_TH", 12.0)
         self.market_regime_adx_th = self._get_float("MARKET_REGIME_ADX_TH", 23.0)
-        # 하위 호환성 유지
-        self.timeframes = self.analysis_timeframes
-        self.open_threshold = self.open_th
 
         # Signal Quality Rules
         self.quality_min_avg_score = self._get_float("QUALITY_MIN_AVG_SCORE", 15.0)
@@ -40,15 +37,19 @@ class ConfigManager:
         self.sideways_rsi_oversold = self._get_float("SIDEWAYS_RSI_OVERSOLD", 35.0)
         self.sideways_rsi_overbought = self._get_float("SIDEWAYS_RSI_OVERBOUGHT", 65.0)
         self.reversal_confirm_count = self._get_int("REVERSAL_CONFIRM_COUNT", 2)
-        # 하위 호환성 유지
-        self.entry_confirm_count = self.trend_entry_confirm_count
-        
+
+        # --- ▼▼▼ V4 수정 사항 ▼▼▼ ---
         # Risk Management
         self.aggr_level = self._get_int("AGGR_LEVEL", 3)
         self.risk_target_pct = self._get_float("RISK_TARGET_PCT", 0.02)
         self.sl_atr_multiplier = self._get_float("SL_ATR_MULTIPLIER", 1.5)
-        self.take_profit_pct = self._get_float("TAKE_PROFIT_PCT", 0.05)
-        self.trailing_stop_enabled = self._get_bool("TRAILING_STOP_ENABLED", True)
+        self.risk_reward_ratio = self._get_float("RISK_REWARD_RATIO", 2.0) # take_profit_pct 대체
+
+        # Risk Scales
+        self.risk_scale_high = self._get_float("RISK_SCALE_HIGH_CONFIDENCE", 1.5)
+        self.risk_scale_medium = self._get_float("RISK_SCALE_MEDIUM_CONFIDENCE", 1.0)
+        self.risk_scale_low = self._get_float("RISK_SCALE_LOW_CONFIDENCE", 0.5)
+        # --- ▲▲▲ V4 수정 사항 ▲▲▲ ---
 
         # Leverage Map
         self.leverage_map = {
@@ -64,16 +65,17 @@ class ConfigManager:
             },
         }
 
-        # Adaptive Logic
+        # Adaptive Logic & Portfolio
         self.adaptive_aggr_enabled = self._get_bool("ADAPTIVE_AGGR_ENABLED", True)
         self.adaptive_volatility_threshold = self._get_float("ADAPTIVE_VOLATILITY_THRESHOLD", 0.04)
-
-        # Portfolio Management
-        self.max_open_positions = self._get_int("MAX_OPEN_POSITIONS", 1)
+        self.max_open_positions = self._get_int("MAX_OPEN_POSITIONS", 2)
 
         # Infrastructure
         self.db_path = os.getenv("DB_PATH", "./runtime/trader.db")
-        self.discord_bot_token = os.getenv("DISCORD_BOT_TOKEN") # Discord 토큰 추가
+        self.discord_bot_token = os.getenv("DISCORD_BOT_TOKEN")
+        self.panel_channel_id = self._get_int("DISCORD_PANEL_CHANNEL_ID")
+        self.analysis_channel_id = self._get_int("DISCORD_ANALYSIS_CHANNEL_ID")
+        self.alerts_channel_id = self._get_int("DISCORD_ALERTS_CHANNEL_ID")
         # Discord Channel IDs
         self.dashboard_channel_id = self._get_int("DISCORD_CHANNEL_ID_DASHBOARD")
         self.alerts_channel_id = self._get_int("DISCORD_CHANNEL_ID_ALERTS")
