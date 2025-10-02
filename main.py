@@ -269,11 +269,12 @@ async def data_collector_loop():
             is_above_ema200 = _extract_bool_from_row(daily_row, "is_above_ema200")
 
             new_signal = Signal(
-                symbol=symbol, final_score=final_score,
-                score_1d=tf_scores.get("1d"), score_4h=tf_scores.get("4h"),
-                score_1h=tf_scores.get("1h"), score_15m=tf_scores.get("15m"),
-                atr_1d=_extract_float_from_row(daily_row, "ATR_14"),
-                adx_4h=adx_4h_val, is_above_ema200_1d=is_above_ema200
+                    symbol=symbol, final_score=final_score,
+                    score_1d=tf_scores.get("1d"), score_4h=tf_scores.get("4h"),
+                    score_1h=tf_scores.get("1h"), score_15m=tf_scores.get("15m"),
+                    atr_1d=atr_1d_val,
+                    atr_4h=atr_4h_val, # 4시간봉 ATR도 함께 저장
+                    adx_4h=adx_4h_val, is_above_ema200_1d=is_above_ema200
             )
             session.add(new_signal)
         session.commit()
