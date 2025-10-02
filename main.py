@@ -160,6 +160,47 @@ def diagnose_market_regime(session, symbol: str) -> MarketRegime:
         return MarketRegime.BULL_TREND if is_above_ema else MarketRegime.BEAR_TREND
     else:
         return MarketRegime.SIDEWAYS
+    
+def update_adaptive_aggression_level():
+    """[지능형 로직] 시장 변동성을 분석하여 현재 공격성 레벨을 동적으로 조절합니다."""
+    global current_aggr_level
+    base_aggr_level = config.aggr_level
+    session = db_manager.get_session()
+    try:
+        # BTC의 최신 1일봉 ATR 데이터로 변동성 판단
+        latest_signal = session.execute(
+            select(Signal).where(Signal.symbol == "BTCUSDT").order_by(Signal.id.desc())
+        ).scalar_one_or_none()
+        
+        if not latest_signal or not latest_signal.atr_1d:
+            # 데이터 없으면 기본값으로 복귀 시도
+            if current_aggr_level != base_aggr_level:
+                print(f"[Adaptive] 데이터 부족. 공격성 레벨 복귀: {current_aggr_level} -> {base_aggr_level}")
+                current_aggr_level = base_aggr_level
+            return
+
+        mark_price_info = binance_client.futures_mark_price(symbol="BTCUSDT")
+        current_price = float(mark_price_info['markPrice'])
+        volatility = latest_signal.atr_1d / current_price # 변동성 = (1일 ATR / 현재가)
+
+        # 변동성이 설정된 임계값을 넘으면 '위험'으로 판단하여 레벨 하향
+        if volatility > config.adaptive_volatility_threshold:
+            new_level = max(1, base_aggr_level - 2)
+            if new_level != current_aggr_level:
+                print(f"[Adaptive] 변동성 증가 감지({volatility:.2%})! 공격성 레벨 하향 조정: {current_aggr_level} -> {new_level}")
+                current_aggr_level = new_level
+        # 변동성이 낮으면 '안정'으로 판단하여 기본 레벨로 복귀
+        else:
+            if current_aggr_level != base_aggr_level:
+                print(f"[Adaptive] 시장 안정. 공격성 레벨 복귀: {current_aggr_level} -> {base_aggr_level}")
+                current_aggr_level = base_aggr_level
+    except Exception as e:
+        print(f"🚨 적응형 레벨 조정 중 오류: {e}")
+        # 오류 발생 시 안전하게 기본 레벨로 복귀
+        current_aggr_level = base_aggr_level
+    finally:
+        session.close()
+
 # --- V3 백그라운드 작업 ---
 
 @tasks.loop(seconds=15)
