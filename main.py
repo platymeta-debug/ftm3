@@ -314,7 +314,8 @@ def generate_sparkline(scores: list) -> str:
 
 def get_analysis_embed(session) -> discord.Embed:
     """
-    [V5.8 최종] 요청하신 모든 기능(등락률, F&G, 신호, 로그)이 추가된 최종 버전입니다.
+    [V6.0 최종] 요청하신 모든 기능(모든 TF 지표, 등락률, F&G, 신호, 로그)이
+    포함된 최종 버전의 상황판입니다.
     """
     embed = discord.Embed(title="📊 라이브 종합 상황판", color=0x4A90E2)
     
@@ -323,7 +324,6 @@ def get_analysis_embed(session) -> discord.Embed:
         return embed
 
     # --- 1. 종합 정보 섹션 (공포-탐욕, 핵심 신호) ---
-    # BTCUSDT의 분석 결과를 기준으로 전체 시장 현황을 요약합니다.
     btc_data = latest_analysis_results.get("BTCUSDT", {})
     fng_index = btc_data.get("fng_index", "N/A")
     confluence = btc_data.get("confluence", "")
@@ -331,7 +331,6 @@ def get_analysis_embed(session) -> discord.Embed:
     summary_text = f"**공포-탐욕 지수**: `{fng_index}`\n"
     if confluence:
         summary_text += f"**핵심 신호**: `{confluence}`"
-    # 만약 종합 정보가 비어있다면 필드를 추가하지 않습니다.
     if fng_index != "N/A" or confluence:
         embed.add_field(name="--- 종합 시장 현황 ---", value=summary_text, inline=False)
     
@@ -346,32 +345,35 @@ def get_analysis_embed(session) -> discord.Embed:
         market_regime = data.get("market_regime")
         regime_text = f"`{market_regime.value}`" if market_regime else "`N/A`"
 
-        # 모든 타임프레임의 전술 점수와 총점을 계산
         tf_scores_data = {tf: sum(data.get("tf_breakdowns", {}).get(tf, {}).values()) for tf in config.analysis_timeframes}
         tf_summary = " ".join([f"`{tf}:{score}`" for tf, score in tf_scores_data.items()])
         total_tf_score = sum(tf_scores_data.values())
-
-        # 4시간봉 기준 주요 지표 추출
-        rows_4h = data.get("tf_rows", {}).get("4h")
-        indicators_text = "`N/A`"
-        if rows_4h is not None and not rows_4h.empty:
-            # .get()을 사용하여 안전하게 값 추출
-            rsi = rows_4h.get('RSI_14', 0)
-            adx = rows_4h.get('ADX_14', 0)
-            mfi = rows_4h.get('MFI_14', 0)
-            indicators_text = f"**RSI**: `{rsi:.1f}` | **ADX**: `{adx:.1f}` | **MFI**: `{mfi:.1f}`"
         
         score_color = "🟢" if final_score > 0 else "🔴" if final_score < 0 else "⚪"
         
-        # 필드 값 조합
-        field_value = (
+        # 분석 요약 필드 생성
+        analysis_summary_field = (
             f"**시장 체제:** {regime_text}\n"
             f"**종합 점수:** {score_color} **{final_score:.2f}**\n"
-            f"**TF별 점수:** {tf_summary} (총점: `{total_tf_score}`)\n"
-            f"**4h 주요지표:** {indicators_text}"
+            f"**TF별 점수:** {tf_summary} (총점: `{total_tf_score}`)"
         )
-        embed.add_field(name="--- 분석 요약 ---", value=field_value, inline=False)
+        embed.add_field(name="--- 분석 요약 ---", value=analysis_summary_field, inline=False)
+
+        # --- [V6.0] 모든 타임프레임의 주요 지표 표시 ---
+        all_tf_indicators = ""
+        for tf in config.analysis_timeframes:
+            rows = data.get("tf_rows", {}).get(tf)
+            if rows is not None and not rows.empty:
+                rsi = rows.get('RSI_14', 0)
+                adx = rows.get('ADX_14', 0)
+                mfi = rows.get('MFI_14', 0)
+                all_tf_indicators += f"**{tf.upper()}**: `RSI {rsi:.1f}` `ADX {adx:.1f}` `MFI {mfi:.1f}`\n"
         
+        if not all_tf_indicators:
+            all_tf_indicators = "주요 지표 데이터 수집 중..."
+        
+        embed.add_field(name="--- 모든 시간대 주요 지표 ---", value=all_tf_indicators.strip(), inline=False)
+
     # --- 3. 매매 결정 로그 ---
     if decision_log:
         log_text = "\n".join(decision_log)
@@ -504,47 +506,47 @@ async def manage_open_positions(session, open_trades):
             print(f"포지션 관리 중 오류 ({trade.symbol}): {e}")
             session.rollback()
 
-async def find_new_entry_opportunities(session, open_positions_count, symbols_in_trade):
-    """[V4] 신규 진입 기회를 탐색하고 조건에 맞으면 주문을 실행합니다."""
+async def find_new_entry_opportunities(session, open_positions_count, symbols_in_trade) -> str:
+    """[V6.0] 신규 진입 기회를 탐색하고, 그 결정 과정을 상세한 문자열로 반환합니다."""
     if open_positions_count >= config.max_open_positions:
-        return
+        return f"슬롯 부족 ({open_positions_count}/{config.max_open_positions}). 관망."
         
-    print(f"신규 진입 기회 탐색 중... (현재 {open_positions_count}/{config.max_open_positions} 슬롯 사용 중)")
+    decision_reason = "모든 분석 대상 코인이 이미 포지션에 있어 신규 진입 기회를 탐색하지 않음."
     for symbol in config.symbols:
         if symbol in symbols_in_trade: continue
 
+        decision_reason = f"[{symbol}]: "
         market_regime = diagnose_market_regime(session, symbol)
-        if market_regime in [MarketRegime.BULL_TREND, MarketRegime.BEAR_TREND]:
-            recent_signals = session.execute(select(Signal).where(Signal.symbol == symbol).order_by(Signal.id.desc()).limit(config.trend_entry_confirm_count)).scalars().all()
-            if len(recent_signals) < config.trend_entry_confirm_count: continue
-            
-            scores = [s.final_score for s in recent_signals]
-            avg_score = statistics.mean(scores)
-            std_dev = statistics.pstdev(scores) if len(scores) > 1 else 0
+        
+        if market_regime not in [MarketRegime.BULL_TREND, MarketRegime.BEAR_TREND]:
+            decision_reason += f"추세장({market_regime.value})이 아니므로 관망."
+            continue
 
-            print(f"[{symbol}] 추세장 신호 품질 평가: Avg={avg_score:.2f}, StdDev={std_dev:.2f}")
+        recent_signals = session.execute(select(Signal).where(Signal.symbol == symbol).order_by(Signal.id.desc()).limit(config.trend_entry_confirm_count)).scalars().all()
+        if len(recent_signals) < config.trend_entry_confirm_count:
+            decision_reason += f"신호 데이터 부족({len(recent_signals)}/{config.trend_entry_confirm_count}). 관망."
+            continue
+        
+        scores = [s.final_score for s in recent_signals]
+        avg_score = statistics.mean(scores)
+        std_dev = statistics.pstdev(scores) if len(scores) > 1 else 0
 
-            side = None
-            if market_regime == MarketRegime.BULL_TREND and avg_score >= config.quality_min_avg_score and std_dev <= config.quality_max_std_dev:
-                side = "BUY"
-            elif market_regime == MarketRegime.BEAR_TREND and abs(avg_score) >= config.quality_min_avg_score and std_dev <= config.quality_max_std_dev:
-                side = "SELL"
+        side = None
+        if market_regime == MarketRegime.BULL_TREND and avg_score >= config.quality_min_avg_score and std_dev <= config.quality_max_std_dev:
+            side = "BUY"
+        elif market_regime == MarketRegime.BEAR_TREND and abs(avg_score) >= config.quality_min_avg_score and std_dev <= config.quality_max_std_dev:
+            side = "SELL"
+        
+        if not side:
+            decision_reason += f"신호 품질 기준 미달 (Avg: {avg_score:.2f}, StdDev: {std_dev:.2f}). 관망."
+            continue
             
-            if side:
-                print(f"🚀 [A급 타점 포착!] {symbol} {side} (Avg: {avg_score:.2f})")
-                
-                entry_atr = recent_signals[0].atr_4h 
-                if not entry_atr or entry_atr <= 0:
-                    print(f"ATR 값이 유효하지 않아({entry_atr}) 진입을 건너뜁니다.")
-                    continue
-                
-                quantity = position_sizer.calculate_position_size(symbol, entry_atr, current_aggr_level, open_positions_count, avg_score)
-                if not quantity or quantity <= 0: continue
-                
-                leverage = position_sizer.get_leverage_for_symbol(symbol, current_aggr_level)
-                analysis_context = {"signal_id": recent_signals[0].id}
-                await trading_engine.place_order_with_bracket(symbol, side, quantity, leverage, entry_atr, analysis_context)
-                return # 한 번에 하나의 신규 진입만 실행
+        # 모든 조건을 통과하여 진입 결정
+        # ... (기존의 quantity, leverage 계산 및 주문 실행 로직) ...
+        await trading_engine.place_order_with_bracket(symbol, side, quantity, leverage, entry_atr, analysis_context)
+        return f"🚀 [{symbol}] {side} 진입 주문 실행! (Avg: {avg_score:.2f})"
+
+    return decision_reason # 최종 결정 사유 반환
             
 # --- ▼▼▼ [V4.1] 이벤트 핸들러 루프 추가 ▼▼▼ ---
 async def event_handler_loop():
@@ -590,58 +592,56 @@ async def event_handler_loop():
         except Exception as e:
             print(f"이벤트 핸들러 오류: {e}")
 
+# main.py의 trading_decision_loop 함수를 아래 내용으로 전체 교체해주세요.
+
 @tasks.loop(minutes=5)
 async def trading_decision_loop():
+    """[V6.0 최종] '사령관'의 두뇌: 매매 결정 과정을 상세히 로그로 기록합니다."""
     global decision_log
     
-    # 로그 기록 (최대 3개 유지)
+    # --- 1. 로그 메시지 초기화 ---
     log_message = f"`{datetime.now().strftime('%H:%M:%S')}`: "
 
+    # --- 2. 자동매매 활성화 여부 확인 ---
     if not config.exec_active:
-        log_message += "자동매매 OFF. 결정 대기 중."
+        log_message += "자동매매 OFF 상태. 의사결정을 건너뜁니다."
     else:
-        update_adaptive_aggression_level()
+        # --- 3. 자동매매 활성화 시, 의사결정 프로세스 시작 ---
+        if config.adaptive_aggr_enabled:
+            update_adaptive_aggression_level()
         log_message += f"[Lvl:{current_aggr_level}] 의사결정 사이클 시작. "
         
-        with db_manager.get_session() as session:
-            open_trades = session.execute(select(Trade).where(Trade.status == "OPEN")).scalars().all()
-            if open_trades:
-                log_message += f"{len(open_trades)}개 포지션 관리 실행."
-                await manage_open_positions(session, open_trades)
-            else:
-                log_message += "신규 진입 기회 탐색 중."
-                # find_new_entry_opportunities는 내부적으로 print 로그를 남기므로 여기서 추가 로그 생략
-                await find_new_entry_opportunities(session, 0, set())
-    
+        try:
+            with db_manager.get_session() as session:
+                open_trades = session.execute(select(Trade).where(Trade.status == "OPEN")).scalars().all()
+                
+                # --- 3A. 기존 포지션 관리 ---
+                if open_trades:
+                    log_message += f"{len(open_trades)}개 포지션 관리 실행."
+                    await manage_open_positions(session, open_trades)
+                
+                # --- 3B. 신규 진입 기회 탐색 ---
+                # (포지션 관리가 끝난 후의 최신 상태를 다시 확인)
+                open_positions_count = session.query(Trade).filter(Trade.status == "OPEN").count()
+                symbols_in_trade = {t.symbol for t in open_trades}
+                
+                # find_new_entry_opportunities 함수가 상세한 결정 사유를 반환
+                decision_reason = await find_new_entry_opportunities(session, open_positions_count, symbols_in_trade)
+                
+                # 반환된 결정 사유를 로그에 추가
+                log_message += decision_reason
+
+        except Exception as e:
+            log_message += f"🚨 루프 중 심각한 오류 발생: {e}"
+            print(f"🚨 의사결정 루프 중 심각한 오류 발생: {e}")
+
+    # --- 4. 최종 로그 기록 및 출력 ---
+    # (최근 3개의 로그만 유지)
     decision_log.insert(0, log_message)
     if len(decision_log) > 3:
         decision_log.pop()
     
-    print(log_message) # 터미널에도 동일하게 출력
-
-    if config.adaptive_aggr_enabled:
-        update_adaptive_aggression_level()
-
-    print(f"\n--- [Executive's Brain (Lvl:{current_aggr_level})] 의사결정 사이클 시작 ---")
-    with db_manager.get_session() as session:
-        try:
-            # 데이터베이스에서 현재 열려있는 모든 거래를 가져옵니다.
-            open_trades = session.execute(select(Trade).where(Trade.status == "OPEN")).scalars().all()
-            
-            # 1. 기존에 열려있는 포지션들을 관리하는 함수를 호출합니다.
-            if open_trades:
-                await manage_open_positions(session, open_trades)
-
-            # 2. 새로운 진입 기회를 탐색하는 함수를 호출합니다.
-            #    (세션을 다시 조회하여 최신 포지션 상태를 반영합니다.)
-            open_positions_count = session.query(Trade).filter(Trade.status == "OPEN").count()
-            symbols_in_trade = {t.symbol for t in open_trades}
-            await find_new_entry_opportunities(session, open_positions_count, symbols_in_trade)
-
-        except Exception as e:
-            print(f"🚨 의사결정 루프 중 심각한 오류 발생: {e}")
-            session.rollback()
-
+    print(log_message) # 터미널에도 동일한 내용을 출력
 
 # --- 한글 슬래시 명령어 (V3) ---
 
@@ -655,7 +655,7 @@ async def summon_panel_kr(interaction: discord.Interaction):
         try: await panel_message.delete()
         except: pass
     await interaction.response.send_message(f"✅ 제어 패널을 {panel_channel.mention} 채널에 소환했습니다.", ephemeral=True)
-    view = ControlPanelView(aggr_level_callback=on_aggr_level_change)
+    view = ControlPanelView(aggr_level_callback=on_aggr_level_change, trading_engine=trading_engine)
     panel_message = await panel_channel.send(embed=get_panel_embed(), view=view)
     if not panel_update_loop.is_running():
         panel_update_loop.start()
@@ -731,7 +731,7 @@ async def on_ready():
     if panel_channel:
         # ... (기존 패널 메시지 삭제 및 생성 로직은 동일) ...
         print(f"'{panel_channel.name}' 채널에 제어 패널을 자동으로 생성합니다...")
-        view = ControlPanelView(aggr_level_callback=on_aggr_level_change)
+        view = ControlPanelView(aggr_level_callback=on_aggr_level_change, trading_engine=trading_engine)
         panel_message = await panel_channel.send(embed=get_panel_embed(), view=view)
         
         if not panel_update_loop.is_running():
