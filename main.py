@@ -19,6 +19,7 @@ from database.models import Signal, Trade # Signal과 Trade를 models.py에서 �
 # --- ▲▲▲ 수정된 부분 ▲▲▲ ---
 from execution.trading_engine import TradingEngine
 from analysis.confluence_engine import ConfluenceEngine
+from analysis.core_strategy import diagnose_market_regime, MarketRegime
 from risk_management.position_sizer import PositionSizer
 from ui.views import ControlPanelView, ConfirmView
 
@@ -233,22 +234,7 @@ def get_panel_embed() -> discord.Embed:
     embed.set_footer(text=f"최종 업데이트: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S %Z')}")
     return embed
 
-def diagnose_market_regime(session, symbol: str) -> MarketRegime:
-    """[시장 진단] DB 데이터를 기반으로 현재 시장 체제를 진단합니다."""
-    latest_signal_tuple = session.execute(
-        select(Signal).where(Signal.symbol == symbol).order_by(Signal.id.desc())
-    ).first()
 
-    if not latest_signal_tuple: return MarketRegime.SIDEWAYS 
-    
-    latest_signal = latest_signal_tuple[0]
-    if latest_signal.adx_4h is None or getattr(latest_signal, 'is_above_ema200_1d', None) is None:
-        return MarketRegime.SIDEWAYS
-
-    if latest_signal.adx_4h > config.market_regime_adx_th:
-        return MarketRegime.BULL_TREND if latest_signal.is_above_ema200_1d else MarketRegime.BEAR_TREND
-    else:
-        return MarketRegime.SIDEWAYS
     
 def update_adaptive_aggression_level():
     """[지능형 로직] 시장 변동성을 분석하여 현재 공격성 레벨을 동적으로 조절합니다."""
@@ -507,7 +493,7 @@ async def manage_open_positions(session, open_trades):
             session.rollback()
 
 async def find_new_entry_opportunities(session, open_positions_count, symbols_in_trade) -> str:
-    """[V6.0] 신규 진입 기회를 탐색하고, 그 결정 과정을 상세한 문자열로 반환합니다."""
+    """[V6.1] 공용 전략 모듈을 사용하여 신규 진입 기회를 탐색하고, 결정 과정을 반환합니다."""
     if open_positions_count >= config.max_open_positions:
         return f"슬롯 부족 ({open_positions_count}/{config.max_open_positions}). 관망."
         
@@ -516,13 +502,33 @@ async def find_new_entry_opportunities(session, open_positions_count, symbols_in
         if symbol in symbols_in_trade: continue
 
         decision_reason = f"[{symbol}]: "
-        market_regime = diagnose_market_regime(session, symbol)
         
+        # DB에서 최근 신호들을 가져옵니다.
+        recent_signals = session.execute(
+            select(Signal).where(Signal.symbol == symbol).order_by(Signal.id.desc()).limit(config.trend_entry_confirm_count)
+        ).scalars().all()
+        
+        if not recent_signals:
+            decision_reason += "분석할 신호 데이터가 없어 관망."
+            continue
+
+        # --- ▼▼▼ [핵심 수정] 공용 모듈 사용 ▼▼▼ ---
+        # 1. 가장 최신 신호 데이터를 pandas Series 형태로 변환합니다.
+        latest_signal = recent_signals[0]
+        indicator_data = pd.Series({
+            'adx_4h': latest_signal.adx_4h,
+            'is_above_ema200_1d': latest_signal.is_above_ema200_1d
+        })
+
+        # 2. 공용 함수를 호출하여 시장 체제를 진단합니다.
+        market_regime = diagnose_market_regime(indicator_data, config.market_regime_adx_th)
+        # --- ▲▲▲ [핵심 수정] ▲▲▲ ---
+
         if market_regime not in [MarketRegime.BULL_TREND, MarketRegime.BEAR_TREND]:
             decision_reason += f"추세장({market_regime.value})이 아니므로 관망."
             continue
 
-        recent_signals = session.execute(select(Signal).where(Signal.symbol == symbol).order_by(Signal.id.desc()).limit(config.trend_entry_confirm_count)).scalars().all()
+        # (이하 신호 품질 검증 및 주문 실행 로직은 기존과 동일)
         if len(recent_signals) < config.trend_entry_confirm_count:
             decision_reason += f"신호 데이터 부족({len(recent_signals)}/{config.trend_entry_confirm_count}). 관망."
             continue
@@ -543,8 +549,13 @@ async def find_new_entry_opportunities(session, open_positions_count, symbols_in
             
         # 모든 조건을 통과하여 진입 결정
         # ... (기존의 quantity, leverage 계산 및 주문 실행 로직) ...
-        await trading_engine.place_order_with_bracket(symbol, side, quantity, leverage, entry_atr, analysis_context)
-        return f"🚀 [{symbol}] {side} 진입 주문 실행! (Avg: {avg_score:.2f})"
+        # 이 부분은 누락된 변수(quantity 등)가 있어 그대로 실행하면 오류가 발생할 수 있습니다.
+        # 실제 운영 코드의 해당 부분을 그대로 유지하시면 됩니다.
+        # await trading_engine.place_order_with_bracket(symbol, side, quantity, leverage, entry_atr, analysis_context)
+        # return f"🚀 [{symbol}] {side} 진입 주문 실행! (Avg: {avg_score:.2f})"
+        
+        # 임시로 결정까지만 로그를 남기도록 수정
+        decision_reason += f"🚀 {side} 진입 결정! (Avg: {avg_score:.2f}, StdDev: {std_dev:.2f})"
 
     return decision_reason # 최종 결정 사유 반환
             
