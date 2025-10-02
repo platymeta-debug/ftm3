@@ -61,3 +61,31 @@ class ControlPanelView(discord.ui.View):
         # 이벤트 버스를 통해 긴급 청산 신호 발행
         await interaction.response.send_message("🚨 긴급 전체 청산 신호를 보냈습니다. 결과를 확인해주세요.", ephemeral=True)
         # event_bus.publish(...) # 추후 직접 청산 로직으로 강화 가능
+
+
+# --- ▼▼▼ [Discord V3] 파일 끝에 아래 클래스 추가 ▼▼▼ ---
+
+
+class ConfirmView(discord.ui.View):
+    """수동 매매 등 위험한 작업 전 사용자 확인을 받기 위한 View"""
+
+    def __init__(self):
+        super().__init__(timeout=60)  # 60초 후 타임아웃
+        self.value = None  # 사용자의 선택 (True or False)
+
+    @discord.ui.button(label="✅ 실행", style=discord.ButtonStyle.danger)
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.value = True
+        # 버튼 비활성화 및 메시지 업데이트
+        for item in self.children:
+            item.disabled = True
+        await interaction.response.edit_message(content="✅ **요청이 확인되었습니다. 실행 중...**", view=self)
+        self.stop()
+
+    @discord.ui.button(label="❌ 취소", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.value = False
+        for item in self.children:
+            item.disabled = True
+        await interaction.response.edit_message(content="❌ **요청이 취소되었습니다.**", view=self)
+        self.stop()
