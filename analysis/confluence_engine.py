@@ -64,7 +64,7 @@ class ConfluenceEngine:
 
         return 0
 
-    def _calculate_tactical_score(self, df: pd.DataFrame, timeframe: str) -> int:
+    def _calculate_tactical_score(self, df: pd.DataFrame, timeframe: str) -> Tuple[int, Dict[str, int]]:
         
         if df is None or df.empty or len(df) < 50:
             print(f"[{timeframe}] 데이터 부족으로 전술 분석 건너뜀")
@@ -136,20 +136,28 @@ class ConfluenceEngine:
                 elif close > ema50: trend_score = 1
                 elif close < ema50: trend_score = -1
 
-        score = trend_score + money_flow_score + oscillator_score + divergence_score + bb_squeeze_score
-        print(f"[{timeframe}] 전술 점수: 추세({trend_score}) + 자금({money_flow_score}) + 오실({oscillator_score}) + 다이버({divergence_score}) + BB({bb_squeeze_score}) -> 합계: {score}")
-        return score
+        # --- 최종 점수 계산 ---
+        total_score = trend_score + money_flow_score + oscillator_score + divergence_score + bb_squeeze_score
+        
+        score_breakdown = {
+            "추세": trend_score, "자금": money_flow_score, "오실": oscillator_score,
+            "다이버": divergence_score, "BB": bb_squeeze_score
+        }
+        
+        print(f"[{timeframe}] 전술 점수: ... 합계: {total_score}") # 기존 print문은 유지
+        return total_score, score_breakdown
 
     # ==================================
     # 🚀 3단계: 최종 판단 - Confluence Layer
     # ==================================
-    def analyze(self, symbol: str) -> Tuple[float, Dict[str, int], Dict[str, pd.Series]]:
+    def analyze(self, symbol: str) -> Tuple[float, Dict[str, int], Dict[str, pd.Series], Dict[str, Dict[str, int]]]:
         """[V4] 시장의 모든 요소를 종합하여 최종 컨플루언스 점수를 계산합니다."""
         # 1. 거시 심리 분석 (API 호출)
         self._fetch_fear_and_greed_index()
         
         tf_scores: Dict[str, int] = {}
         tf_rows: Dict[str, pd.Series] = {}
+        tf_score_breakdowns: Dict[str, Dict[str, int]] = {} # 상세 내역 저장용 딕셔너리
         timeframes = config.analysis_timeframes
 
         for timeframe in timeframes:
@@ -170,7 +178,9 @@ class ConfluenceEngine:
                 tf_scores[timeframe] = 0
                 continue
             
-            tf_scores[timeframe] = self._calculate_tactical_score(indicators, timeframe)
+            score, breakdown = self._calculate_tactical_score(indicators, timeframe)
+            tf_scores[timeframe] = score
+            tf_score_breakdowns[timeframe] = breakdown
             tf_rows[timeframe] = indicators.iloc[-1]
 
         # 2. 최종 점수 집계 (가중 투표 + 심리 지수 반영)
@@ -198,7 +208,7 @@ class ConfluenceEngine:
         # V3 호환성을 위한 추가 데이터 추출 (main.py에서 사용)
         self._extract_legacy_data(tf_rows)
 
-        return final_score, tf_scores, tf_rows
+        return final_score, tf_scores, tf_rows, tf_score_breakdowns
     
     # --- 유틸리티 및 하위 호환성 함수들 (기존과 거의 동일) ---
     
