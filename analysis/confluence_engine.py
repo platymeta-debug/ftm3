@@ -163,7 +163,8 @@ class ConfluenceEngine:
         # --- [Milestone 3] 추가 분석 데이터 추출 ---
         four_hour_row = tf_rows.get("4h")
         if isinstance(four_hour_row, pd.Series):
-            adx_value = four_hour_row.get(f"ADX_{ta.ADX_LENGTH}")
+            # ta.ADX_LENGTH 대신 기본값 '14'를 직접 사용
+            adx_value = four_hour_row.get(f"ADX_14") 
             sanitized_adx = self._safe_number(adx_value)
             updated = four_hour_row.copy()
             updated["adx_value"] = sanitized_adx
