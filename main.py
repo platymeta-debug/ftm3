@@ -141,15 +141,16 @@ def get_external_prices(symbol: str) -> str:
         
     return price_str
 
+# main.py의 get_panel_embed 함수를 아래 내용으로 전체 교체해주세요.
+
 def get_panel_embed() -> discord.Embed:
     """
-    [V5.4 최종] API Key 이름 오류('unrealizedProfit')를 수정한 최종 버전입니다.
-    API를 기준으로 포지션을 정확히 탐지하고, DB 정보와 결합하여
-    SL/TP, 청산가 등 모든 상세 정보를 표시합니다.
+    [V5.7 최종] 오류 발생 시에도 패널의 기본 구조가 유지되도록 안정성을 극대화한
+    최종 버전의 제어 패널입니다.
     """
     embed = discord.Embed(title="⚙️ 통합 관제 시스템", description="봇의 모든 상태를 확인하고 제어합니다.", color=0x2E3136)
     
-    # --- 1. 상단 정보 (핵심 상태, 현재 전략) ---
+    # --- 1. 항상 표시되어야 하는 '정적' 정보 먼저 구성 ---
     trade_mode_text = "🔴 **실시간 매매**" if not config.is_testnet else "🟢 **테스트넷**"
     auto_trade_text = "✅ **자동매매 ON**" if config.exec_active else "❌ **자동매매 OFF**"
     adaptive_text = "🧠 **자동 조절 ON**" if config.adaptive_aggr_enabled else "👤 **수동 설정**"
@@ -163,8 +164,8 @@ def get_panel_embed() -> discord.Embed:
         current_aggr_text += status
     embed.add_field(name="[현재 전략]", value=f"분석 대상: {symbols_text}\n기본 공격성: {base_aggr_text}\n현재 공격성: {current_aggr_text}", inline=True)
 
-    # --- 2. 포트폴리오 및 포지션 상세 정보 ---
-     try:
+    # --- 2. API 호출이 필요한 '동적' 정보는 try-except 블록 안에서 안전하게 처리 ---
+    try:
         account_info = binance_client.futures_account()
         positions_from_api = [p for p in account_info.get('positions', []) if float(p.get('positionAmt', 0)) != 0]
         
@@ -172,6 +173,7 @@ def get_panel_embed() -> discord.Embed:
         total_pnl = float(account_info.get('totalUnrealizedProfit', 0.0))
         pnl_color = "📈" if total_pnl >= 0 else "📉"
         
+        # 포트폴리오 섹션 추가
         embed.add_field(
             name="[포트폴리오]",
             value=f"💰 **총 자산**: `${total_balance:,.2f}`\n"
@@ -180,6 +182,7 @@ def get_panel_embed() -> discord.Embed:
             inline=False
         )
 
+        # 포지션 상세 정보 추가
         if not positions_from_api:
             embed.add_field(name="[오픈된 포지션]", value="현재 오픈된 포지션이 없습니다.", inline=False)
         else:
@@ -188,6 +191,7 @@ def get_panel_embed() -> discord.Embed:
                 symbol = pos.get('symbol')
                 if not symbol: continue
 
+                # .get() 메소드를 사용하여 키가 없더라도 오류 대신 0.0을 반환하도록 처리
                 pnl = float(pos.get('unrealizedProfit', 0.0))
                 side = "LONG" if float(pos.get('positionAmt', 0.0)) > 0 else "SHORT"
                 quantity = abs(float(pos.get('positionAmt', 0.0)))
@@ -198,15 +202,11 @@ def get_panel_embed() -> discord.Embed:
                 pnl_percent = (pnl / margin * 100) if margin > 0 else 0.0
                 
                 trade_db = db_session.query(Trade).filter(Trade.symbol == symbol, Trade.status == "OPEN").first()
-                
                 pnl_text = f"📈 **PnL**: `${pnl:,.2f}` (`{pnl_percent:+.2f} %`)" if pnl >= 0 else f"📉 **PnL**: `${pnl:,.2f}` (`{pnl_percent:+.2f} %`)"
-                
                 details_text = f"> **진입가**: `${entry_price:,.2f}` | **수량**: `{quantity}`\n> {pnl_text}\n"
                 
                 if trade_db and trade_db.stop_loss_price:
-                    # DB에 기록된 SL/TP가 있는 경우
-                    sl_price = trade_db.stop_loss_price
-                    tp_price = trade_db.take_profit_price
+                    sl_price, tp_price = trade_db.stop_loss_price, trade_db.take_profit_price
                     mark_price = float(binance_client.futures_mark_price(symbol=symbol).get('markPrice', 0.0))
                     
                     if mark_price > 0:
@@ -219,15 +219,20 @@ def get_panel_embed() -> discord.Embed:
                     details_text += "> **SL/TP**: `(봇 관리 아님)`\n"
 
                 details_text += f"> **청산가**: " + (f"`${liq_price:,.2f}`" if liq_price > 0 else "`N/A`")
-
                 embed.add_field(name=f"--- {symbol} ({side} x{leverage}) ---", value=details_text, inline=False)
-                
             db_session.close()
 
     except Exception as e:
-        print(f"패널 정보 업데이트 중 오류: {e}")
-        embed.add_field(name="[포트폴리오]", value="⚠️ 정보를 가져오는 중 오류가 발생했습니다.", inline=False)
+        # 오류 발생 시, 이미 완성된 상단 정보는 그대로 두고 에러 필드만 추가
+        print(f"패널 정보 업데이트 중 오류 발생: {e}")
+        embed.add_field(
+            name="[포트폴리오 및 포지션]",
+            value="⚠️ **API 오류:** 실시간 정보를 가져오는 데 실패했습니다.\n"
+                  f"`오류 내용: {e}`",
+            inline=False
+        )
     
+    # --- 3. 항상 표시되어야 하는 '푸터' 정보 구성 ---
     embed.set_footer(text=f"최종 업데이트: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S %Z')}")
     return embed
 
