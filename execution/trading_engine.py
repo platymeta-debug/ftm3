@@ -1,7 +1,9 @@
+from datetime import datetime
 from typing import Optional
 
 from binance.client import Client
 from binance.exceptions import BinanceAPIException
+from sqlalchemy import select
 
 from core.event_bus import event_bus
 from database.manager import db_manager
@@ -107,5 +109,64 @@ class TradingEngine:
             await event_bus.publish(
                 "ORDER_FAILURE", {"error": str(exc), "source": "TradingEngine"}
             )
+        finally:
+            session.close()
+
+    async def close_position(self, trade_to_close: Trade, reason: str) -> None:
+        """
+        지정된 거래(포지션)를 시장가로 청산하고 데이터베이스를 업데이트합니다.
+        """
+        print(f"포지션 종료 요청 수신: {trade_to_close.symbol} | 사유: {reason}")
+        session = db_manager.get_session()
+        try:
+            # 1. 현재 포지션과 반대되는 주문 생성
+            close_side = "BUY" if trade_to_close.side == "SELL" else "SELL"
+            quantity = trade_to_close.quantity
+
+            order_params = {
+                "symbol": trade_to_close.symbol,
+                "side": close_side,
+                "type": "MARKET",
+                "quantity": quantity,
+                "newOrderRespType": "RESULT",
+            }
+            close_order = self.client.futures_create_order(**order_params)
+
+            # 2. DB의 거래 정보 업데이트
+            exit_price = float(close_order.get("avgPrice", 0.0))
+            pnl = (
+                (exit_price - trade_to_close.entry_price) * quantity
+                if trade_to_close.side == "BUY"
+                else (trade_to_close.entry_price - exit_price) * quantity
+            )
+
+            trade_to_close.status = "CLOSED"
+            trade_to_close.exit_price = exit_price
+            trade_to_close.exit_time = datetime.utcnow()
+            trade_to_close.pnl = pnl
+            session.add(trade_to_close)
+            session.commit()
+
+            print(f"✅ 포지션 종료 완료: {trade_to_close.symbol} | PnL: ${pnl:.2f}")
+
+            # 3. 성공 이벤트 발행
+            await event_bus.publish(
+                "ORDER_CLOSE_SUCCESS",
+                {
+                    "symbol": trade_to_close.symbol,
+                    "side": close_side,
+                    "quantity": quantity,
+                    "price": exit_price,
+                    "pnl": pnl,
+                    "reason": reason,
+                },
+            )
+
+        except BinanceAPIException as exc:
+            session.rollback()
+            print(f"🚨 포지션 종료 실패 (API 오류): {exc}")
+        except Exception as exc:
+            session.rollback()
+            print(f"🚨 포지션 종료 처리 중 오류 발생: {exc}")
         finally:
             session.close()
