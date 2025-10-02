@@ -8,3 +8,4 @@ requests
 Backtesting
 bokeh
 matplotlib
+pytest
