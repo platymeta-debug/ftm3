@@ -1,11 +1,10 @@
 import discord
-from discord import app_commands
 from discord.ext import commands, tasks
 from binance.client import Client
-from binance.exceptions import BinanceAPIException
 import asyncio
-from datetime import datetime, timezone, timedelta
+from datetime import datetime
 from enum import Enum
+from typing import Optional
 from sqlalchemy import select
 import pandas as pd
 
@@ -48,6 +47,109 @@ class MarketRegime(Enum):
     SIDEWAYS = "횡보"
 
 current_aggr_level = config.aggr_level
+panel_message: Optional[discord.Message] = None  # 패널 메시지 객체를 저장
+
+
+def on_aggr_level_change(new_level: int):
+    global current_aggr_level
+    current_aggr_level = new_level
+
+
+def get_panel_embed() -> discord.Embed:
+    """실시간 데이터를 담은 제어 패널 Embed를 생성합니다."""
+    embed = discord.Embed(
+        title="⚙️ 통합 관제 시스템",
+        description="봇의 모든 상태를 확인하고 제어합니다.",
+        color=0x2E3136,
+    )
+
+    trade_mode_text = "🔴 **실시간 매매**" if not config.is_testnet else "🟢 **테스트넷**"
+    auto_trade_text = "✅ **자동매매 ON**" if config.exec_active else "❌ **자동매매 OFF**"
+    adaptive_text = "🧠 **자동 조절 ON**" if config.adaptive_aggr_enabled else "👤 **수동 설정**"
+    embed.add_field(
+        name="[핵심 상태]",
+        value=f"{trade_mode_text}\n{auto_trade_text}\n{adaptive_text}",
+        inline=True,
+    )
+
+    symbols_text = f"**{', '.join(config.symbols)}**" if config.symbols else "**N/A**"
+    base_aggr_text = f"**Level {config.aggr_level}**"
+    current_aggr_text = f"**Level {current_aggr_level}**"
+    if config.adaptive_aggr_enabled and config.aggr_level != current_aggr_level:
+        status = " (⚠️위험)" if current_aggr_level < config.aggr_level else " (📈안정)"
+        current_aggr_text += status
+    embed.add_field(
+        name="[현재 전략]",
+        value=(
+            f"분석 대상: {symbols_text}\n"
+            f"기본 공격성: {base_aggr_text}\n"
+            f"현재 공격성: {current_aggr_text}"
+        ),
+        inline=True,
+    )
+
+    embed.set_footer(
+        text=f"최종 업데이트: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+    )
+    return embed
+
+
+@tasks.loop(seconds=10)
+async def panel_update_loop():
+    """10초마다 패널 메시지를 최신 정보로 업데이트합니다."""
+    global panel_message
+    if panel_message:
+        try:
+            await panel_message.edit(embed=get_panel_embed())
+        except discord.NotFound:
+            print("패널 메시지를 찾을 수 없어 업데이트 루프를 중지합니다.")
+            panel_message = None
+            panel_update_loop.stop()
+        except Exception as e:
+            print(f"패널 업데이트 중 오류 발생: {e}")
+
+
+@tree.command(name="패널", description="인터랙티브 제어실을 소환합니다.")
+async def summon_panel_kr(interaction: discord.Interaction):
+    global panel_message
+
+    if not config.panel_channel_id:
+        await interaction.response.send_message(
+            "⚠️ `.env`에 `DISCORD_CHANNEL_ID_PANEL` 값이 설정되지 않았습니다.",
+            ephemeral=True,
+        )
+        return
+
+    panel_channel = bot.get_channel(config.panel_channel_id)
+    if panel_channel is None:
+        try:
+            panel_channel = await bot.fetch_channel(config.panel_channel_id)
+        except Exception:
+            panel_channel = None
+
+    if panel_channel is None:
+        await interaction.response.send_message(
+            "⚠️ `.env`에 설정된 `DISCORD_CHANNEL_ID_PANEL`로 채널을 찾을 수 없습니다.",
+            ephemeral=True,
+        )
+        return
+
+    if panel_message:
+        try:
+            await panel_message.delete()
+        except Exception:
+            pass
+
+    await interaction.response.send_message(
+        f"✅ 제어 패널을 {panel_channel.mention} 채널에 소환했습니다.",
+        ephemeral=True,
+    )
+
+    view = ControlPanelView(aggr_level_callback=on_aggr_level_change)
+    panel_message = await panel_channel.send(embed=get_panel_embed(), view=view)
+
+    if not panel_update_loop.is_running():
+        panel_update_loop.start()
 
 # --- 백그라운드 작업 (V3) ---
 
@@ -388,10 +490,22 @@ async def trading_decision_loop():
 # --- 봇 준비 및 실행 ---
 @bot.event
 async def on_ready():
-    print(f'{bot.user.name} 봇이 준비되었습니다.')
-    data_collector_loop.start()
-    await asyncio.sleep(5)
-    trading_decision_loop.start()
+    await tree.sync()
+    print(f'{bot.user.name} 봇이 준비되었습니다. 슬래시 명령어가 동기화되었습니다.')
 
-# ... (Discord 명령어 관련 코드는 기존과 동일)
-# ... (봇 실행 코드는 기존과 동일)
+    if not data_collector_loop.is_running():
+        data_collector_loop.start()
+
+    if not trading_decision_loop.is_running():
+        await asyncio.sleep(5)
+        trading_decision_loop.start()
+
+    print('------------------------------------')
+    print("모든 준비 완료. `/패널` 명령어를 사용하여 제어실을 소환하세요.")
+
+
+if __name__ == "__main__":
+    if not config.discord_bot_token:
+        print("오류: .env 파일에 DISCORD_BOT_TOKEN이 설정되지 않았습니다.")
+    else:
+        bot.run(config.discord_bot_token)
