@@ -99,6 +99,7 @@ async def on_ready():
     # 4. 모든 백그라운드 작업 시작
     bot.background_tasks.start_all_tasks()
     print("✅ 모든 백그라운드 작업이 시작되었습니다.")
+    asyncio.create_task(bot.background_tasks.event_handler_loop())
     print("--- 모든 준비 완료 ---")
 
 
