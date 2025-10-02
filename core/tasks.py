@@ -94,13 +94,15 @@ class BackgroundTasks:
             self.current_aggr_level = base_aggr_level
 
     def get_panel_embed(self) -> discord.Embed:
+        """[복원] SL/TP, 청산가 등 모든 상세 정보를 포함한 제어 패널을 생성합니다."""
         embed = discord.Embed(title="⚙️ 통합 관제 시스템", description="봇의 모든 상태를 확인하고 제어합니다.", color=0x2E3136)
-        
+
+        # --- 1. 핵심 상태 (기존과 동일) ---
         trade_mode_text = "🔴 **실시간 매매**" if not self.config.is_testnet else "🟢 **테스트넷**"
         auto_trade_text = "✅ **자동매매 ON**" if self.config.exec_active else "❌ **자동매매 OFF**"
         adaptive_text = "🧠 **자동 조절 ON**" if self.config.adaptive_aggr_enabled else "👤 **수동 설정**"
         embed.add_field(name="[핵심 상태]", value=f"{trade_mode_text}\n{auto_trade_text}\n{adaptive_text}", inline=True)
-        
+
         symbols_text = f"**{', '.join(self.config.symbols)}**"
         base_aggr_text = f"**Level {self.config.aggr_level}**"
         current_aggr_text = f"**Level {self.current_aggr_level}**"
@@ -109,14 +111,22 @@ class BackgroundTasks:
             current_aggr_text += status
         embed.add_field(name="[현재 전략]", value=f"분석 대상: {symbols_text}\n기본 공격성: {base_aggr_text}\n현재 공격성: {current_aggr_text}", inline=True)
 
+        # --- 2. API 기반 동적 정보 (상세 정보 포함하여 복원) ---
         try:
             account_info = self.binance_client.futures_account()
             positions_from_api = [p for p in account_info.get('positions', []) if float(p.get('positionAmt', 0)) != 0]
+
             total_balance = float(account_info.get('totalWalletBalance', 0.0))
             total_pnl = float(account_info.get('totalUnrealizedProfit', 0.0))
             pnl_color = "📈" if total_pnl >= 0 else "📉"
-            
-            embed.add_field(name="[포트폴리오]", value=f"💰 **총 자산**: `${total_balance:,.2f}`\n{pnl_color} **총 미실현 PnL**: `${total_pnl:,.2f}`\n📊 **운영 포지션**: **{len(positions_from_api)} / {self.config.max_open_positions}** 개", inline=False)
+
+            embed.add_field(
+                name="[포트폴리오]",
+                value=f"💰 **총 자산**: `${total_balance:,.2f}`\n"
+                    f"{pnl_color} **총 미실현 PnL**: `${total_pnl:,.2f}`\n"
+                    f"📊 **운영 포지션**: **{len(positions_from_api)} / {self.config.max_open_positions}** 개",
+                inline=False
+            )
 
             if not positions_from_api:
                 embed.add_field(name="[오픈된 포지션]", value="현재 오픈된 포지션이 없습니다.", inline=False)
@@ -130,44 +140,110 @@ class BackgroundTasks:
                         side = "LONG" if float(pos.get('positionAmt', 0.0)) > 0 else "SHORT"
                         quantity = abs(float(pos.get('positionAmt', 0.0)))
                         entry_price = float(pos.get('entryPrice', 0.0))
+                        leverage = int(pos.get('leverage', 1))
+                        liq_price = float(pos.get('liquidationPrice', 0.0))
                         margin = float(pos.get('initialMargin', 0.0))
                         pnl_percent = (pnl / margin * 100) if margin > 0 else 0.0
-                        
+
+                        trade_db = db_session.query(Trade).filter(Trade.symbol == symbol, Trade.status == "OPEN").first()
                         pnl_text = f"📈 **PnL**: `${pnl:,.2f}` (`{pnl_percent:+.2f} %`)" if pnl >= 0 else f"📉 **PnL**: `${pnl:,.2f}` (`{pnl_percent:+.2f} %`)"
-                        details_text = f"> **진입가**: `${entry_price:,.2f}` | **수량**: `{quantity}`\n> {pnl_text}"
-                        embed.add_field(name=f"--- {symbol} ({side}) ---", value=details_text, inline=False)
+                        details_text = f"> **진입가**: `${entry_price:,.2f}` | **수량**: `{quantity}`\n> {pnl_text}\n"
+
+                        # ▼▼▼ [복원] SL/TP 및 청산가 정보 표시 로직 ▼▼▼
+                        if trade_db and trade_db.stop_loss_price:
+                            sl_price, tp_price = trade_db.stop_loss_price, trade_db.take_profit_price
+                            mark_price = float(self.binance_client.futures_mark_price(symbol=symbol).get('markPrice', 0.0))
+
+                            if mark_price > 0:
+                                sl_dist_pct = (abs(mark_price - sl_price) / mark_price) * 100
+                                tp_dist_pct = (abs(tp_price - mark_price) / mark_price) * 100
+                                details_text += f"> **SL**: `${sl_price:,.2f}` (`{sl_dist_pct:.2f}%`)\n> **TP**: `${tp_price:,.2f}` (`{tp_dist_pct:.2f}%`)\n"
+                            else:
+                                details_text += f"> **SL**: `${sl_price:,.2f}`\n> **TP**: `${tp_price:,.2f}`\n"
+                        else:
+                            details_text += "> **SL/TP**: `(봇 관리 아님)`\n"
+
+                        details_text += f"> **청산가**: " + (f"`${liq_price:,.2f}`" if liq_price > 0 else "`N/A`")
+                        # ▲▲▲ [복원] ▲▲▲
+
+                        embed.add_field(name=f"--- {symbol} ({side} x{leverage}) ---", value=details_text, inline=False)
+
         except Exception as e:
-            embed.add_field(name="[포트폴리오 및 포지션]", value=f"⚠️ **API 오류:** 실시간 정보를 가져오는 데 실패했습니다.\n`오류 내용: {e}`", inline=False)
-        
+            embed.add_field(
+                name="[포트폴리오 및 포지션]",
+                value=f"⚠️ **API 오류:** 실시간 정보를 가져오는 데 실패했습니다.\n"
+                    f"`오류 내용: {e}`",
+                inline=False
+            )
+
         embed.set_footer(text=f"최종 업데이트: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S %Z')}")
         return embed
 
     def get_analysis_embed(self) -> discord.Embed:
+        """[복원] 모든 TF별 지표, 핵심 신호 등 상세 정보를 포함한 분석 상황판을 생성합니다."""
         embed = discord.Embed(title="📊 라이브 종합 상황판", color=0x4A90E2)
         if not self.latest_analysis_results:
             embed.description = "분석 데이터를 수집하고 있습니다..."
             return embed
 
+        # --- 1. 종합 정보 섹션 (공포-탐욕, 핵심 신호) ---
         btc_data = self.latest_analysis_results.get("BTCUSDT", {})
         fng_index = btc_data.get("fng_index", "N/A")
-        summary_text = f"**공포-탐욕 지수**: `{fng_index}`"
+        confluence = btc_data.get("confluence", "") # [복원] 핵심 신호 데이터 가져오기
+
+        summary_text = f"**공포-탐욕 지수**: `{fng_index}`\n"
+        if confluence: # [복원] 핵심 신호가 있을 경우에만 표시
+            summary_text += f"**핵심 신호**: `{confluence}`"
+
         embed.add_field(name="--- 종합 시장 현황 ---", value=summary_text, inline=False)
-        
+
+        # --- 2. 코인별 상세 분석 ---
         for symbol, data in self.latest_analysis_results.items():
+            # 실시간 시세
             price_text = self.get_external_prices(symbol)
             embed.add_field(name=f"--- {symbol} 실시간 시세 ---", value=price_text, inline=False)
-            
+
+            # 분석 정보 추출
             final_score = data.get("final_score", 0)
             market_regime = data.get("market_regime")
             regime_text = f"`{market_regime.value}`" if market_regime else "`N/A`"
             score_color = "🟢" if final_score > 0 else "🔴" if final_score < 0 else "⚪"
-            
-            analysis_summary = f"**시장 체제:** {regime_text}\n**종합 점수:** {score_color} **{final_score:.2f}**"
-            embed.add_field(name="--- 분석 요약 ---", value=analysis_summary, inline=False)
 
+            # ▼▼▼ [복원] TF별 세부 점수 표시 로직 ▼▼▼
+            tf_scores_data = {tf: sum(data.get("tf_breakdowns", {}).get(tf, {}).values()) for tf in self.config.analysis_timeframes}
+            tf_summary = " ".join([f"`{tf}:{score}`" for tf, score in tf_scores_data.items()])
+            total_tf_score = sum(tf_scores_data.values())
+            # ▲▲▲ [복원] ▲▲▲
+
+            # 분석 요약 필드 생성
+            analysis_summary_field = (
+                f"**시장 체제:** {regime_text}\n"
+                f"**종합 점수:** {score_color} **{final_score:.2f}**\n"
+                f"**TF별 점수:** {tf_summary} (총점: `{total_tf_score}`)" # [복원] TF별 점수 필드 추가
+            )
+            embed.add_field(name="--- 분석 요약 ---", value=analysis_summary_field, inline=False)
+
+            # ▼▼▼ [복원] 모든 타임프레임의 주요 지표 표시 로직 ▼▼▼
+            all_tf_indicators = ""
+            for tf in self.config.analysis_timeframes:
+                rows = data.get("tf_rows", {}).get(tf)
+                if rows is not None and not rows.empty:
+                    rsi = rows.get('RSI_14', 0)
+                    adx = rows.get('ADX_14', 0)
+                    mfi = rows.get('MFI_14', 0)
+                    all_tf_indicators += f"**{tf.upper()}**: `RSI {rsi:.1f}` `ADX {adx:.1f}` `MFI {mfi:.1f}`\n"
+
+            if not all_tf_indicators:
+                all_tf_indicators = "주요 지표 데이터 수집 중..."
+
+            embed.add_field(name="--- 모든 시간대 주요 지표 ---", value=all_tf_indicators.strip(), inline=False)
+            # ▲▲▲ [복원] ▲▲▲
+
+        # --- 3. 매매 결정 로그 ---
         if self.decision_log:
-            embed.add_field(name="--- 최근 매매 결정 로그 ---", value="\n".join(self.decision_log), inline=False)
-            
+            log_text = "\n".join(self.decision_log)
+            embed.add_field(name="--- 최근 매매 결정 로그 ---", value=log_text, inline=False)
+
         embed.set_footer(text=f"최종 업데이트: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S %Z')}")
         return embed
 
