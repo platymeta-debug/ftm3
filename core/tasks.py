@@ -543,27 +543,63 @@ class BackgroundTasks:
                 session.rollback()
 
     async def find_new_entry_opportunities(self, session, open_positions_count, symbols_in_trade):
-        """신규 진입 기회를 탐색하고, 조건 충족 시 주문을 실행합니다."""
+        """[시즌 4] 모든 분석 대상의 신호를 수집한 뒤, 가장 점수가 높은 단 하나의 기회에만 진입합니다."""
         if open_positions_count >= self.config.max_open_positions:
             return f"슬롯 부족 ({open_positions_count}/{self.config.max_open_positions}). 관망."
-        
-        for symbol in self.config.symbols:
-            if symbol in symbols_in_trade: continue
 
-            recent_signals = session.execute(select(Signal).where(Signal.symbol == symbol).order_by(Signal.id.desc()).limit(self.config.trend_entry_confirm_count)).scalars().all()
+        # ▼▼▼ [시즌 4 수정] 모든 유효 신호를 저장할 리스트 생성 ▼▼▼
+        valid_opportunities = []
+        # ▲▲▲ [시즌 4 수정] ▲▲▲
+
+        for symbol in self.config.symbols:
+            if symbol in symbols_in_trade:
+                continue
+
+            recent_signals = session.execute(
+                select(Signal).where(Signal.symbol == symbol).order_by(Signal.id.desc()).limit(self.config.trend_entry_confirm_count)
+            ).scalars().all()
             if len(recent_signals) < self.config.trend_entry_confirm_count:
                 continue
 
             recent_scores = [s.final_score for s in recent_signals]
             side, reason, context = self.confluence_engine.analyze_and_decide(symbol, recent_scores)
-            
+
+            # ▼▼▼ [시즌 4 수정] 신호가 유효하면 바로 주문하지 않고 리스트에 추가 ▼▼▼
             if side and context:
-                leverage = self.position_sizer.get_leverage_for_symbol(symbol, self.current_aggr_level)
-                quantity = self.position_sizer.calculate_position_size(
-                    symbol, context['entry_atr'], self.current_aggr_level, open_positions_count, context['avg_score']
-                )
-                if quantity:
-                    context['signal_id'] = recent_signals[0].id
-                    await self.trading_engine.place_order_with_bracket(symbol, side, quantity, leverage, context['entry_atr'], context)
-                    return reason # 성공 시 루프 종료 및 리턴
-        return "탐색 완료, 신규 진입 기회 없음."
+                opportunity = {
+                    "symbol": symbol,
+                    "side": side,
+                    "reason": reason,
+                    "context": context,
+                    "avg_score": context.get("avg_score", 0),
+                    "signal_id": recent_signals[0].id
+                }
+                valid_opportunities.append(opportunity)
+        # ▲▲▲ [시즌 4 수정] ▲▲▲
+
+
+        # ▼▼▼ [시즌 4 수정] 수집된 모든 기회 중에서 최고의 기회를 선택하여 진입 ▼▼▼
+        if not valid_opportunities:
+            return "탐색 완료, 신규 진입 기회 없음."
+
+        # 'avg_score'의 절대값을 기준으로 가장 점수가 높은 순으로 정렬
+        best_opportunity = sorted(valid_opportunities, key=lambda x: abs(x["avg_score"]), reverse=True)[0]
+
+        symbol = best_opportunity["symbol"]
+        side = best_opportunity["side"]
+        context = best_opportunity["context"]
+        avg_score = best_opportunity["avg_score"]
+
+        leverage = self.position_sizer.get_leverage_for_symbol(symbol, self.current_aggr_level)
+        quantity = self.position_sizer.calculate_position_size(
+            symbol, context['entry_atr'], self.current_aggr_level, open_positions_count, avg_score
+        )
+
+        if quantity:
+            context['signal_id'] = best_opportunity["signal_id"]
+            await self.trading_engine.place_order_with_bracket(symbol, side, quantity, leverage, context['entry_atr'], context)
+            # 다른 기회들을 포기하고 최고의 기회에 진입했다는 로그를 반환
+            return f"🏆 최고 점수 신호 선택: {best_opportunity['reason']} (다른 {len(valid_opportunities) - 1}개 기회는 보류)"
+        else:
+            return f"[{symbol}]: 포지션 규모 계산 실패로 진입 보류."
+        # ▲▲▲ [시즌 4 수정] ▲▲▲
