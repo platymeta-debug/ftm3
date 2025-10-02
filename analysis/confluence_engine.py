@@ -1,167 +1,100 @@
-# 파일명: analysis/confluence_engine.py (V4 업그레이드)
-# 'Executive's Brain' 업그레이드의 핵심. 시장의 거시/미시 환경과 심리를 복합적으로 분석.
+# analysis/confluence_engine.py (V5 - 완전한 두뇌로 업그레이드)
 
 from __future__ import annotations
 import math
-from typing import Dict, Tuple, Mapping, Optional
+from typing import Dict, Tuple, Optional, List
 import pandas as pd
 from binance.client import Client
-import requests # V4: 공포-탐욕 지수 API 연동을 위해 추가
+import requests
+import statistics
 
 from core.config_manager import config
 from . import data_fetcher, indicator_calculator
+# 공용 전략 모듈에서 시장 체제 진단 로직을 가져옵니다.
+from .core_strategy import diagnose_market_regime, MarketRegime
+# Signal 타입을 사용하기 위해 import 합니다.
+from database.models import Signal
 
 class ConfluenceEngine:
     """
-    [V4] Macro-Tactical Confluence Engine.
-    시장의 거시 환경(날씨), 참여자 심리(온도), 그리고 미시적 타점(전술)을 계층적으로 분석하여
-    'A급 타점'을 식별하고 점수화합니다.
+    [V5] '두뇌' 업그레이드 버전.
+    모든 분석(거시, 미시, 심리)과 최종 매매 결정 로직을 통합하여 관리합니다.
     """
     def __init__(self, client: Client):
         self.client = client
         self.fear_and_greed_index = 50 # 기본값: 중립
-        print("📈 [V4] Macro-Tactical 컨플루언스 엔진이 초기화되었습니다.")
+        print("📈 [V5] Confluence Engine이 완전한 '두뇌'로 업그레이드되었습니다.")
 
     # ==================================
-    # 🚀 1단계: 시장의 '날씨'와 '심리' 분석 - Macro Analysis Layer
+    # 🚀 최종 판단: 모든 분석을 종합하여 매매 결정을 내립니다.
     # ==================================
-    def _fetch_fear_and_greed_index(self) -> None:
-        """외부 API를 통해 공포-탐욕 지수를 가져와 업데이트합니다."""
-        try:
-            # 하루에 한 번만 호출해도 충분하지만, 데모를 위해 매 분석 시 호출
-            response = requests.get("https://api.alternative.me/fng/?limit=1", timeout=5)
-            response.raise_for_status()
-            data = response.json()['data'][0]
-            self.fear_and_greed_index = int(data['value'])
-            print(f"🧠 공포-탐욕 지수 업데이트: {self.fear_and_greed_index} ({data['value_classification']})")
-        except requests.RequestException as e:
-            print(f"⚠️ 공포-탐욕 지수 API 호출 실패: {e}. 이전 값({self.fear_and_greed_index})을 사용합니다.")
+    def analyze_and_decide(self, symbol: str, recent_scores: List[float]) -> Tuple[Optional[str], str, Optional[dict]]:
+        """
+        [V5] 모든 분석을 종합하고, main.py의 최종 결정 로직까지 수행하여
+        매매 방향('BUY', 'SELL', None), 결정 사유, 그리고 주문에 필요한 컨텍스트를 반환합니다.
+        """
+        # --- 1. 거시 및 미시 데이터/점수 분석 ---
+        analysis_result = self.analyze_symbol(symbol)
+        if not analysis_result:
+            return None, f"[{symbol}]: 데이터 분석에 실패하여 관망.", None
 
-    # ==================================
-    # 🚀 2단계: 'A급 타점' 식별 - Tactical Entry Layer
-    # ==================================
-    def _find_rsi_divergence(self, df: pd.DataFrame, lookback: int = 14) -> int:
-        """RSI 다이버전스를 탐지하여 강력한 추세 전환 신호에 높은 점수를 부여합니다."""
-        if len(df) < lookback + 5: return 0
+        final_score, tf_scores, tf_rows, tf_score_breakdowns, fng_index, confluence_signal = analysis_result
+
+        # --- 2. 시장 체제 진단 (main.py 로직 이전) ---
+        daily_row = tf_rows.get("1d")
+        four_hour_row = tf_rows.get("4h")
+        if daily_row is None or four_hour_row is None:
+            return None, f"[{symbol}]: 일봉/4시간봉 데이터 부족으로 시장 진단 불가.", None
+
+        market_data_for_diag = pd.Series({
+            'adx_4h': four_hour_row.get('ADX_14'),
+            'is_above_ema200_1d': daily_row.get('close') > daily_row.get('EMA_200')
+        })
+        market_regime = diagnose_market_regime(market_data_for_diag, config.market_regime_adx_th)
+
+        if market_regime not in [MarketRegime.BULL_TREND, MarketRegime.BEAR_TREND]:
+            return None, f"[{symbol}]: 추세장({market_regime.value})이 아니므로 관망.", None
+
+        # --- 3. 신호 품질 검증 (main.py 로직 이전) ---
+        if len(recent_signals) < config.trend_entry_confirm_count:
+            return None, f"[{symbol}]: 신호 데이터 부족({len(recent_signals)}/{config.trend_entry_confirm_count})으로 관망.", None
         
-        recent_df = df.tail(lookback)
-        lows = recent_df['low']
-        highs = recent_df['high']
-        rsi = recent_df['RSI_14']
+        #scores = [s.final_score for s in recent_signals]
+        avg_score = statistics.mean(recent_scores)
+        std_dev = statistics.pstdev(recent_scores) if len(recent_scores) > 1 else 0
 
-        # 강세 다이버전스: 가격은 저점을 낮추는데, RSI는 저점을 높임
-        if lows.iloc[-1] < lows.iloc[0] and rsi.iloc[-1] > rsi.iloc[0]:
-            # 더 명확한 신호를 위해, 최근 5개 봉 중 가장 낮은 저점과 비교
-            if lows.idxmin() == lows.index[-1]:
-                print(f"💎 강세 다이버전스 발견!")
-                return 5 # 매우 높은 가산점
-
-        # 약세 다이버전스: 가격은 고점을 높이는데, RSI는 고점을 낮춤
-        if highs.iloc[-1] > highs.iloc[0] and rsi.iloc[-1] < rsi.iloc[0]:
-            if highs.idxmax() == highs.index[-1]:
-                print(f" Alerts  약세 다이버전스 발견!")
-                return -5 # 매우 높은 감점
-
-        return 0
-
-    def _calculate_tactical_score(self, df: pd.DataFrame, timeframe: str) -> Tuple[int, Dict[str, int]]:
+        side = None
+        if market_regime == MarketRegime.BULL_TREND and avg_score >= config.quality_min_avg_score and std_dev <= config.quality_max_std_dev:
+            side = "BUY"
+        elif market_regime == MarketRegime.BEAR_TREND and abs(avg_score) >= config.quality_min_avg_score and std_dev <= config.quality_max_std_dev:
+            side = "SELL"
         
-        if df is None or df.empty or len(df) < 50:
-            print(f"[{timeframe}] 데이터 부족으로 전술 분석 건너뜀")
-            return 0
-
-        score = 0
-        last = df.iloc[-1]
+        if not side:
+            return None, f"[{symbol}]: 신호 품질 기준 미달 (Avg: {avg_score:.2f}, StdDev: {std_dev:.2f}). 관망.", None
         
-        trend_score, money_flow_score, oscillator_score, divergence_score, bb_squeeze_score = 0, 0, 0, 0, 0
-
-        # --- 1, 2, 3번 로직은 안정적으로 작동하므로 그대로 유지 ---
-        # ... (자금 흐름, 오실레이터, 다이버전스 분석 로직) ...
-        if all(k in df.columns for k in ["MFI_14", "OBV"]):
-            mfi = self._safe_number(last.get("MFI_14"))
-            obv = self._safe_number(last.get("OBV"))
-            obv_ema = self._safe_number(df['OBV'].ewm(span=20, adjust=False).mean().iloc[-1])
-            if mfi is not None and obv is not None and obv_ema is not None:
-                if mfi > 80: money_flow_score -= 1
-                if mfi < 20: money_flow_score += 1
-                if obv > obv_ema: money_flow_score += 1
-                if obv < obv_ema: money_flow_score -= 1
-
-        if all(k in df.columns for k in ["RSI_14", "STOCHk_14_3_3"]):
-            rsi = self._safe_number(last.get("RSI_14"))
-            stoch_k = self._safe_number(last.get("STOCHk_14_3_3"))
-            if rsi is not None and stoch_k is not None:
-                if rsi < 30 and stoch_k < 20: oscillator_score = 2
-                elif rsi > 70 and stoch_k > 80: oscillator_score = -2
-                elif rsi < 40: oscillator_score = 1
-                elif rsi > 60: oscillator_score = -1
-
-        if "RSI_14" in df.columns:
-            divergence_score = self._find_rsi_divergence(df)
-
-
-        # --- 4. 볼린저 밴드 스퀴즈 (최종 수정된 부분) ---
-        try:
-            # 컬럼 이름의 시작 부분만으로 유연하게 검색
-            bbu_col = next((col for col in df.columns if col.startswith('BBU_20_2.0')), None)
-            bbl_col = next((col for col in df.columns if col.startswith('BBL_20_2.0')), None)
-            bbb_col = next((col for col in df.columns if col.startswith('BBB_20_2.0')), None)
-
-            if all([bbu_col, bbl_col, bbb_col]):
-                bbw = df[bbb_col]
-                is_squeeze = last[bbb_col] < bbw.rolling(90).quantile(0.05).iloc[-1]
-                is_breakout_up = last['close'] > last[bbu_col]
-                is_breakout_down = last['close'] < last[bbl_col]
-                
-                if is_squeeze and is_breakout_up:
-                    bb_squeeze_score = 3
-                    print("🔥 볼린저 밴드 상방 돌파!")
-                elif is_squeeze and is_breakout_down:
-                    bb_squeeze_score = -3
-                    print("🧊 볼린저 밴드 하방 돌파!")
-            else:
-                # 이 메시지가 보인다면, 여전히 컬럼이 생성되지 않은 것
-                print(f"⚠️ [{timeframe}] 볼린저 밴드 지표 컬럼을 찾을 수 없어 분석을 건너뜁니다.")
-        except Exception as e:
-            print(f"🚨 볼린저 밴드 분석 중 예외 발생: {e}")
-
-        # --- 5. 추세 분석 (EMA 기반) ---
-        if all(k in df.columns for k in ["EMA_20", "EMA_50"]):
-            ema20 = self._safe_number(last.get("EMA_20"))
-            ema50 = self._safe_number(last.get("EMA_50"))
-            close = self._safe_number(last.get("close"))
-            if all(v is not None for v in [close, ema20, ema50]):
-                if close > ema20 > ema50: trend_score = 2
-                elif close < ema20 < ema50: trend_score = -2
-                elif close > ema50: trend_score = 1
-                elif close < ema50: trend_score = -1
-
-        # --- 최종 점수 계산 ---
-        total_score = trend_score + money_flow_score + oscillator_score + divergence_score + bb_squeeze_score
-        
-        score_breakdown = {
-            "추세": trend_score, "자금": money_flow_score, "오실": oscillator_score,
-            "다이버": divergence_score, "BB": bb_squeeze_score
+        # --- 4. 최종 결정 및 주문 컨텍스트 반환 ---
+        # 모든 필터를 통과했으므로, 매매 결정과 주문에 필요한 데이터를 함께 반환합니다.
+        decision_reason = f"🚀 [{symbol}] {side} 진입 결정! (Avg: {avg_score:.2f})"
+        entry_context = {
+            "avg_score": avg_score,
+            "entry_atr": self.extract_atr(tf_rows),
+            "signal_id": None # 백테스팅에서는 signal_id를 추적하지 않음
         }
-        
-        print(f"[{timeframe}] 전술 점수: ... 합계: {total_score}") # 기존 print문은 유지
-        return total_score, score_breakdown
+        return side, decision_reason, entry_context
 
-    # ==================================
-    # 🚀 3단계: 최종 판단 - Confluence Layer
-    # ==================================
-    def analyze(self, symbol: str) -> Tuple[float, Dict[str, int], Dict[str, pd.Series], Dict[str, Dict[str, int]], int, str]:
-        """[V4] 시장의 모든 요소를 종합하여 최종 컨플루언스 점수를 계산합니다."""
-        # 1. 거시 심리 분석 (API 호출)
-        self._fetch_fear_and_greed_index()
-        
-        tf_scores: Dict[str, int] = {}
-        tf_rows: Dict[str, pd.Series] = {}
-        tf_score_breakdowns: Dict[str, Dict[str, int]] = {}
-        timeframes = config.analysis_timeframes
-        confluence_signal = "" # 추세 동조 신호
 
-        for timeframe in timeframes:
+    def analyze_symbol(self, symbol: str) -> Optional[Tuple[float, Dict, Dict, Dict, int, str]]:
+        """[V5] 한 심볼에 대한 전체 분석을 수행하고 점수와 데이터를 반환합니다. (기존 analyze 메소드 역할)"""
+        try:
+            self._fetch_fear_and_greed_index()
+            
+            tf_scores: Dict[str, int] = {}
+            tf_rows: Dict[str, pd.Series] = {}
+            tf_score_breakdowns: Dict[str, Dict[str, int]] = {}
+            timeframes = config.analysis_timeframes
+            confluence_signal = ""
+
+            for timeframe in timeframes:
                 df = data_fetcher.fetch_klines(self.client, symbol, timeframe, limit=200)
                 if df is None or df.empty:
                     tf_scores[timeframe], tf_score_breakdowns[timeframe] = 0, {}
@@ -176,78 +109,116 @@ class ConfluenceEngine:
                 tf_scores[timeframe] = score
                 tf_score_breakdowns[timeframe] = breakdown
                 tf_rows[timeframe] = indicators.iloc[-1]
-                final_score = 0.0
+            
+            final_score = 0.0
+            for idx, tf in enumerate(timeframes):
+                weight = config.tf_vote_weights[idx] if idx < len(config.tf_vote_weights) else 1.0
+                final_score += tf_scores.get(tf, 0) * float(weight)
 
-                for idx, timeframe in enumerate(timeframes):
-                    weight = config.tf_vote_weights[idx] if idx < len(config.tf_vote_weights) else 1.0
-                    final_score += tf_scores.get(timeframe, 0) * float(weight)
+            if (tf_scores.get("4h", 0) > 0 and tf_scores.get("1d", 0) > 0) or \
+               (tf_scores.get("4h", 0) < 0 and tf_scores.get("1d", 0) < 0):
+                final_score *= 1.2
+                confluence_signal = "📈 4h-1d 추세 동조!"
+                print(confluence_signal)
 
-                if (tf_scores.get("4h", 0) > 0 and tf_scores.get("1d", 0) > 0) or \
-                (tf_scores.get("4h", 0) < 0 and tf_scores.get("1d", 0) < 0):
-                    final_score *= 1.2
-                    confluence_signal = "📈 4h-1d 추세 동조!"
-                    print(confluence_signal)
+            if self.fear_and_greed_index <= 25 and final_score > 0:
+                final_score *= 1.2
+                print("🥶 극심한 공포! 역추세 매수 기회 가중치 적용.")
+            if self.fear_and_greed_index >= 75 and final_score < 0:
+                final_score *= 1.2
+                print("🤑 극심한 탐욕! 시장 과열 매도 신호 가중치 적용.")
 
-        # 3. 거시-미시 동조화 가중
-        # 4h와 1d의 방향성이 같으면 신뢰도 상승
-        if (tf_scores.get("4h", 0) > 0 and tf_scores.get("1d", 0) > 0) or \
-           (tf_scores.get("4h", 0) < 0 and tf_scores.get("1d", 0) < 0):
-            final_score *= 1.2
-            print("📈 4h-1d 추세 동조! 신뢰도 가중치 적용.")
+            self._extract_legacy_data(tf_rows)
 
-        # 4. 시장 심리 반영
-        # 극단적 공포 상태에서 매수 신호가 나오면 가산점, 탐욕 상태에서 매도 신호가 나오면 가산점
-        if self.fear_and_greed_index <= 25 and final_score > 0:
-            final_score *= 1.2
-            print("🥶 극심한 공포! 역추세 매수 기회일 수 있습니다. 가중치 적용.")
-        if self.fear_and_greed_index >= 75 and final_score < 0:
-            final_score *= 1.2
-            print("🤑 극심한 탐욕! 시장 과열 가능성. 매도 신호에 가중치 적용.")
+            return final_score, tf_scores, tf_rows, tf_score_breakdowns, self.fear_and_greed_index, confluence_signal
+        
+        except Exception as e:
+            print(f"🚨 {symbol} 분석 중 심각한 오류 발생: {e}")
+            return None
 
-        # V3 호환성을 위한 추가 데이터 추출 (main.py에서 사용)
-        self._extract_legacy_data(tf_rows)
+    # ==================================
+    # 기존 헬퍼 함수들 (수정 없음)
+    # ==================================
+    def _fetch_fear_and_greed_index(self) -> None:
+        try:
+            response = requests.get("https://api.alternative.me/fng/?limit=1", timeout=5)
+            response.raise_for_status()
+            data = response.json()['data'][0]
+            self.fear_and_greed_index = int(data['value'])
+        except requests.RequestException:
+            # 실패 시 조용히 이전 값을 사용
+            pass
 
-        return final_score, tf_scores, tf_rows, tf_score_breakdowns, self.fear_and_greed_index, confluence_signal
-    
-    # --- 유틸리티 및 하위 호환성 함수들 (기존과 거의 동일) ---
-    
+    def _find_rsi_divergence(self, df: pd.DataFrame, lookback: int = 14) -> int:
+        if len(df) < lookback + 5: return 0
+        recent_df = df.tail(lookback)
+        lows, highs, rsi = recent_df['low'], recent_df['high'], recent_df['RSI_14']
+        if lows.iloc[-1] < lows.iloc[0] and rsi.iloc[-1] > rsi.iloc[0]:
+            if lows.idxmin() == lows.index[-1]: return 5
+        if highs.iloc[-1] > highs.iloc[0] and rsi.iloc[-1] < rsi.iloc[0]:
+            if highs.idxmax() == highs.index[-1]: return -5
+        return 0
+
+    def _calculate_tactical_score(self, df: pd.DataFrame, timeframe: str) -> Tuple[int, Dict[str, int]]:
+        if df is None or df.empty or len(df) < 50: return 0, {}
+        last = df.iloc[-1]
+        scores = {"추세": 0, "자금": 0, "오실": 0, "다이버": 0, "BB": 0}
+        
+        # 추세 분석 (EMA)
+        if all(k in df.columns for k in ["EMA_20", "EMA_50", "close"]):
+            if last["close"] > last["EMA_20"] > last["EMA_50"]: scores["추세"] = 2
+            elif last["close"] < last["EMA_20"] < last["EMA_50"]: scores["추세"] = -2
+            elif last["close"] > last["EMA_50"]: scores["추세"] = 1
+            elif last["close"] < last["EMA_50"]: scores["추세"] = -1
+        
+        # 자금 흐름 (MFI, OBV)
+        if all(k in df.columns for k in ["MFI_14", "OBV"]):
+            obv_ema = df['OBV'].ewm(span=20, adjust=False).mean().iloc[-1]
+            if last["MFI_14"] > 80: scores["자금"] -= 1
+            if last["MFI_14"] < 20: scores["자금"] += 1
+            if last["OBV"] > obv_ema: scores["자금"] += 1
+            if last["OBV"] < obv_ema: scores["자금"] -= 1
+            
+        # 오실레이터 (RSI, Stoch)
+        if all(k in df.columns for k in ["RSI_14", "STOCHk_14_3_3"]):
+            if last["RSI_14"] < 30 and last["STOCHk_14_3_3"] < 20: scores["오실"] = 2
+            elif last["RSI_14"] > 70 and last["STOCHk_14_3_3"] > 80: scores["오실"] = -2
+            elif last["RSI_14"] < 40: scores["오실"] = 1
+            elif last["RSI_14"] > 60: scores["오실"] = -1
+
+        # 다이버전스
+        if "RSI_14" in df.columns: scores["다이버"] = self._find_rsi_divergence(df)
+
+        # 볼린저 밴드 스퀴즈
+        bbu_col = next((c for c in df.columns if c.startswith('BBU_')), None)
+        bbl_col = next((c for c in df.columns if c.startswith('BBL_')), None)
+        bbb_col = next((c for c in df.columns if c.startswith('BBB_')), None)
+        if all([bbu_col, bbl_col, bbb_col]):
+            is_squeeze = last[bbb_col] < df[bbb_col].rolling(90).quantile(0.05).iloc[-1]
+            if is_squeeze and last['close'] > last[bbu_col]: scores["BB"] = 3
+            elif is_squeeze and last['close'] < last[bbl_col]: scores["BB"] = -3
+            
+        return sum(scores.values()), scores
+
     def _extract_legacy_data(self, tf_rows: Dict[str, pd.Series]):
-        """main.py의 V3 로직이 V4 데이터 구조와 호환되도록 데이터를 추가합니다."""
-        four_hour_row = tf_rows.get("4h")
-        if isinstance(four_hour_row, pd.Series):
-            adx_value = four_hour_row.get(f"ADX_14")
-            sanitized_adx = self._safe_number(adx_value)
-            # copy()를 사용하여 원본 데이터 변경 방지
-            updated = four_hour_row.copy()
-            updated["adx_value"] = sanitized_adx
-            tf_rows["4h"] = updated
-
-        daily_row = tf_rows.get("1d")
-        if isinstance(daily_row, pd.Series):
-            updated_daily = daily_row.copy()
-            close_price = self._safe_number(updated_daily.get("close"))
-            ema200 = self._safe_number(updated_daily.get("EMA_200"))
-            if close_price is not None and ema200 is not None:
-                updated_daily["is_above_ema200"] = close_price > ema200
-            tf_rows["1d"] = updated_daily
+        """main.py 호환성을 위한 데이터 추가"""
+        if "4h" in tf_rows:
+            tf_rows["4h"]["adx_value"] = self._safe_number(tf_rows["4h"].get("ADX_14"))
+        if "1d" in tf_rows:
+            close = self._safe_number(tf_rows["1d"].get("close"))
+            ema200 = self._safe_number(tf_rows["1d"].get("EMA_200"))
+            if close and ema200:
+                tf_rows["1d"]["is_above_ema200"] = close > ema200
     
     @staticmethod
     def _safe_number(val) -> Optional[float]:
-        if isinstance(val, (int, float)) and not math.isnan(val):
-            return float(val)
-        try:
-            f = float(val)
-            return f if not math.isnan(f) else None
-        except (ValueError, TypeError):
-            return None
+        if isinstance(val, (int, float)) and not math.isnan(val): return float(val)
+        return None
 
-    def extract_atr(self, tf_rows: Mapping, primary_tf: str = "4h") -> float:
-        # 이 함수는 V4에서 직접 사용되진 않지만, 외부(main.py) 호환성을 위해 유지합니다.
+    def extract_atr(self, tf_rows: dict, primary_tf: str = "4h") -> float:
         row = tf_rows.get(primary_tf)
         if row is None: return 0.0
-        
         for key in ("ATRr_14", "ATR_14"):
             val = self._safe_number(row.get(key))
-            if val is not None:
-                return val
+            if val: return val
         return 0.0
