@@ -84,6 +84,34 @@ class TradingEngine:
         finally:
             session.close()
 
+    async def close_all_positions(self) -> list:
+        """현재 보유한 모든 선물 포지션을 즉시 시장가로 청산합니다."""
+        closed_positions = []
+        try:
+            # 현재 포지션 정보 조회
+            positions = self.client.futures_position_information()
+            open_positions = [p for p in positions if float(p.get('positionAmt', 0)) != 0]
+
+            if not open_positions:
+                print("청산할 포지션이 없습니다.")
+                return []
+
+            for pos in open_positions:
+                symbol = pos['symbol']
+                quantity = abs(float(pos['positionAmt']))
+                side = "BUY" if float(pos['positionAmt']) < 0 else "SELL" # 포지션 청산을 위한 반대 주문
+                
+                print(f"🚨 긴급 청산 실행: {symbol} {side} {quantity}")
+                self.client.futures_create_order(symbol=symbol, side=side, type='MARKET', quantity=quantity)
+                closed_positions.append(symbol)
+
+            print("✅ 모든 포지션에 대한 긴급 청산 주문을 전송했습니다.")
+            # DB 상태 업데이트는 trading_decision_loop의 다음 사이클에서 자동으로 처리됩니다.
+            
+        except Exception as e:
+            print(f"🚨 긴급 전체 청산 중 심각한 오류 발생: {e}")
+        
+        return closed_positions
 
     async def close_position(self, trade_to_close: Trade, reason: str, quantity_to_close: Optional[float] = None) -> None:
         """
