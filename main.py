@@ -46,6 +46,12 @@ current_aggr_level = config.aggr_level
 panel_message: discord.Message = None
 analysis_message: discord.Message = None # 분석 메시지 객체
 
+# --- 시장 체제 정의 ---
+class MarketRegime(Enum):
+    BULL_TREND = "강세 추세"
+    BEAR_TREND = "약세 추세"
+    SIDEWAYS = "횡보"
+
 # --- 유틸리티 함수 ---
 
 def _extract_float_from_row(row, keys):
@@ -104,21 +110,68 @@ def _extract_bool_from_row(row, key):
             return False
     return None
 
-# --- 콜백 및 UI 생성 함수 (기존과 동일) ---
+# --- 콜백 및 UI 생성 함수 ---
 def on_aggr_level_change(new_level: int):
-    # ... (기존과 동일)
-    pass
+    global current_aggr_level
+    current_aggr_level = new_level
 
 def get_panel_embed() -> discord.Embed:
-    # ... (기존과 동일)
-    pass
+    """실시간 데이터를 담은 제어 패널 Embed를 생성합니다."""
+    embed = discord.Embed(title="⚙️ 통합 관제 시스템", description="봇의 모든 상태를 확인하고 제어합니다.", color=0x2E3136)
+    
+    trade_mode_text = "🔴 **실시간 매매**" if not config.is_testnet else "🟢 **테스트넷**"
+    auto_trade_text = "✅ **자동매매 ON**" if config.exec_active else "❌ **자동매매 OFF**"
+    adaptive_text = "🧠 **자동 조절 ON**" if config.adaptive_aggr_enabled else "👤 **수동 설정**"
+    embed.add_field(name="[핵심 상태]", value=f"{trade_mode_text}\n{auto_trade_text}\n{adaptive_text}", inline=True)
 
+    symbols_text = f"**{', '.join(config.symbols)}**"
+    base_aggr_text = f"**Level {config.aggr_level}**"
+    current_aggr_text = f"**Level {current_aggr_level}**"
+    if config.adaptive_aggr_enabled and config.aggr_level != current_aggr_level:
+        status = " (⚠️위험)" if current_aggr_level < config.aggr_level else " (📈안정)"
+        current_aggr_text += status
+    embed.add_field(name="[현재 전략]", value=f"분석 대상: {symbols_text}\n기본 공격성: {base_aggr_text}\n현재 공격성: {current_aggr_text}", inline=True)
+    
+    try:
+        with db_manager.get_session() as session:
+            open_positions_count = session.query(Trade).filter(Trade.status == "OPEN").count()
+        embed.add_field(name="[포트폴리오]", value=f"**{open_positions_count} / {config.max_open_positions}** 포지션 운영 중", inline=False)
+    except Exception as e:
+        print(f"DB 조회 오류 (get_panel_embed): {e}")
+        embed.add_field(name="[포트폴리오]", value="DB 조회 오류", inline=False)
+
+
+    embed.set_footer(text=f"최종 업데이트: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    return embed
+
+def diagnose_market_regime(session, symbol: str) -> MarketRegime:
+    """[시장 진단] DB 데이터를 기반으로 현재 시장 체제를 진단합니다."""
+    latest_signal = session.execute(
+        select(Signal).where(Signal.symbol == symbol).order_by(Signal.id.desc())
+    ).scalar_one_or_none()
+
+    if not latest_signal or latest_signal.adx_4h is None or getattr(latest_signal, 'is_above_ema200_1d', None) is None:
+        return MarketRegime.SIDEWAYS
+
+    adx = latest_signal.adx_4h
+    is_above_ema = latest_signal.is_above_ema200_1d
+
+    if adx > config.market_regime_adx_th:
+        return MarketRegime.BULL_TREND if is_above_ema else MarketRegime.BEAR_TREND
+    else:
+        return MarketRegime.SIDEWAYS
 # --- V3 백그라운드 작업 ---
 
 @tasks.loop(seconds=15)
 async def panel_update_loop():
-    # ... (기존과 동일)
-    pass
+    if panel_message:
+        try:
+            await panel_message.edit(embed=get_panel_embed())
+        except discord.NotFound:
+            print("패널 메시지를 찾을 수 없어 업데이트 루프를 중지합니다.")
+            panel_update_loop.stop()
+        except Exception as e:
+            print(f"패널 업데이트 중 오류 발생: {e}")
 
 
 def generate_sparkline(scores: list) -> str:
@@ -172,22 +225,41 @@ def get_analysis_embed(session) -> discord.Embed:
 @tasks.loop(minutes=1)
 async def data_collector_loop():
     global analysis_message
-    # ... (기존 데이터 수집 로직은 동일)
-    
-    # --- ▼▼▼ [Discord V3] 분석 상황판 업데이트 로직 ▼▼▼ ---
+    print(f"\n--- [Data Collector] 분석 시작 ---")
+    session = db_manager.get_session()
+    try:
+        for symbol in config.symbols:
+            final_score, tf_scores, tf_rows = confluence_engine.analyze(symbol)
+            
+            adx_4h_val = _extract_float_from_row(tf_rows.get("4h"), ("adx_value", "ADX_14"))
+            daily_row = tf_rows.get("1d")
+            is_above_ema200 = _extract_bool_from_row(daily_row, "is_above_ema200")
+
+            new_signal = Signal(
+                symbol=symbol, final_score=final_score,
+                score_1d=tf_scores.get("1d"), score_4h=tf_scores.get("4h"),
+                score_1h=tf_scores.get("1h"), score_15m=tf_scores.get("15m"),
+                atr_1d=_extract_float_from_row(daily_row, "ATR_14"),
+                adx_4h=adx_4h_val, is_above_ema200_1d=is_above_ema200
+            )
+            session.add(new_signal)
+        session.commit()
+    except Exception as e:
+        print(f"🚨 데이터 수집 중 오류: {e}")
+        session.rollback()
+    finally:
+        session.close()
+
     try:
         analysis_channel = bot.get_channel(config.analysis_channel_id)
         if not analysis_channel: return
-
         with db_manager.get_session() as session:
             analysis_embed = get_analysis_embed(session)
-
         if analysis_message:
             await analysis_message.edit(embed=analysis_embed)
         else:
-            # 기존 메시지 탐색 또는 새로 생성
             async for msg in analysis_channel.history(limit=5):
-                if msg.author == bot.user and msg.embeds and msg.embeds[0].title == "📊 라이브- 종합 상황판":
+                if msg.author == bot.user and msg.embeds and msg.embeds[0].title == "📊 라이브 종합 상황판":
                     analysis_message = msg
                     await analysis_message.edit(embed=analysis_embed)
                     return
@@ -199,143 +271,125 @@ async def data_collector_loop():
 
 @tasks.loop(minutes=5)
 async def trading_decision_loop():
+    """[V4 최종] 시장 체제, 신호 품질, 포트폴리오를 종합하여 매매를 결정합니다."""
     global current_aggr_level
 
     if not config.exec_active:
-        print("자동매매가 비활성화되어 있어 trading_decision_loop를 종료합니다.")
         return
 
+    # 적응형 로직이 켜져있으면, 매매 결정 직전에 항상 최신 시장 상황을 반영하여 레벨 조정
+    if config.adaptive_aggr_enabled:
+        update_adaptive_aggression_level()
+
+    print(f"\n--- [Trading Decision (Lvl:{current_aggr_level})] 매매 결정 시작 ---")
     session = db_manager.get_session()
     try:
-        open_trades = session.execute(select(Trade).where(Trade.status == "OPEN")).scalars().all()
-
-        # --- B. 포지션 관리 ---
-        if open_trades:
-            for trade in list(open_trades):
-                try:
-                    mark_price_info = binance_client.futures_mark_price(symbol=trade.symbol)
-                    current_price = float(mark_price_info.get('markPrice', 0.0))
-                except Exception as price_err:
-                    print(f"현재가 조회 실패 ({trade.symbol}): {price_err}")
-                    continue
-
-                # --- ▼▼▼ 괄호 오류 수정된 부분 ▼▼▼ ---
-
-                # 1. 자동 익절 (TP)
-                if trade.take_profit_price is not None:
-                    if (trade.side == "BUY" and current_price >= trade.take_profit_price) or \
-                       (trade.side == "SELL" and current_price <= trade.take_profit_price):
-                        await trading_engine.close_position(
-                            trade,
-                            f"자동 익절 (TP: ${trade.take_profit_price:,.2f})"
-                        )
-                        continue
-
-                # 2. 자동 손절 (SL)
-                if trade.stop_loss_price is not None:
-                    if (trade.side == "BUY" and current_price <= trade.stop_loss_price) or \
-                       (trade.side == "SELL" and current_price >= trade.stop_loss_price):
-                        await trading_engine.close_position(
-                            trade,
-                            f"자동 손절 (SL: ${trade.stop_loss_price:,.2f})"
-                        )
-                        continue
-
-        session.expire_all()
+        # --- 1. 현재 포트폴리오 상태 확인 ---
         open_trades = session.execute(select(Trade).where(Trade.status == "OPEN")).scalars().all()
         open_positions_count = len(open_trades)
 
-        # --- A. 신규 진입 ---
-        if open_positions_count < config.max_open_positions:
-            for symbol in config.symbols:
-                if any(t.symbol == symbol for t in open_trades):
-                    continue
-
+        # --- 2. 기존 포지션 관리 ---
+        if open_positions_count > 0:
+            print(f"총 {open_positions_count}개의 포지션 관리 중...")
+            for trade in list(open_trades): # 순회 중 객체 변경을 위해 복사본 사용
                 try:
-                    final_score, tf_scores, tf_rows = confluence_engine.analyze(symbol)
-                except Exception as analysis_err:
-                    print(f"시장 분석 실패 ({symbol}): {analysis_err}")
-                    continue
+                    mark_price_info = binance_client.futures_mark_price(symbol=trade.symbol)
+                    current_price = float(mark_price_info.get('markPrice', 0.0))
+                    if current_price == 0.0: continue
 
-                tf_values = list(tf_scores.values())
-                if not tf_values:
-                    continue
+                    # 2-1. 자동 익절 (TP)
+                    if trade.take_profit_price and ((trade.side == "BUY" and current_price >= trade.take_profit_price) or \
+                       (trade.side == "SELL" and current_price <= trade.take_profit_price)):
+                        await trading_engine.close_position(trade, f"자동 익절 (TP: ${trade.take_profit_price:,.2f})")
+                        continue
 
-                avg_score = sum(tf_values) / len(tf_values)
-                std_dev = statistics.pstdev(tf_values) if len(tf_values) > 1 else 0.0
+                    # 2-2. 자동 손절 (SL)
+                    if trade.stop_loss_price and ((trade.side == "BUY" and current_price <= trade.stop_loss_price) or \
+                       (trade.side == "SELL" and current_price >= trade.stop_loss_price)):
+                        await trading_engine.close_position(trade, f"자동 손절 (SL: ${trade.stop_loss_price:,.2f})")
+                        continue
+                except Exception as e:
+                    print(f"포지션 관리 중 오류 ({trade.symbol}): {e}")
 
-                is_quality_buy = (
-                    avg_score >= config.quality_min_avg_score
-                    and std_dev <= config.quality_max_std_dev
-                    and final_score >= config.open_th
-                )
-                is_quality_sell = (
-                    avg_score <= -config.quality_min_avg_score
-                    and std_dev <= config.quality_max_std_dev
-                    and final_score <= -config.open_th
-                )
+        # --- 3. 신규 진입 결정 (포트폴리오에 여유가 있을 때만) ---
+        # DB 세션이 만료되었을 수 있으므로, 최신 포지션 개수를 다시 확인
+        session.expire_all()
+        open_positions_count = session.query(Trade).filter(Trade.status == "OPEN").count()
+        
+        if open_positions_count < config.max_open_positions:
+            print(f"신규 진입 기회 탐색 중... (현재 {open_positions_count}/{config.max_open_positions} 슬롯 사용 중)")
+            symbols_in_trade = {t.symbol for t in open_trades}
+            
+            for symbol in config.symbols:
+                if symbol in symbols_in_trade: continue
 
-                if not (is_quality_buy or is_quality_sell):
-                    continue
+                market_regime = diagnose_market_regime(session, symbol)
 
-                side = "BUY" if is_quality_buy else "SELL"
-                entry_atr = confluence_engine.extract_atr(tf_rows)
-                if entry_atr <= 0:
-                    print(f"ATR 추출 실패 ({symbol}) → 진입 건너뜀")
-                    continue
+                # 3-1. 추세장 전략
+                if market_regime in [MarketRegime.BULL_TREND, MarketRegime.BEAR_TREND]:
+                    recent_signals = session.execute(
+                        select(Signal).where(Signal.symbol == symbol).order_by(Signal.id.desc()).limit(config.trend_entry_confirm_count)
+                    ).scalars().all()
+                    
+                    if len(recent_signals) < config.trend_entry_confirm_count: continue
 
-                quantity = position_sizer.calculate_position_size(
-                    symbol, entry_atr, current_aggr_level, open_positions_count, avg_score
-                )
-                if not quantity or quantity <= 0:
-                    continue
+                    scores = [s.final_score for s in recent_signals]
+                    avg_score = statistics.mean(scores)
+                    std_dev = statistics.pstdev(scores) if len(scores) > 1 else 0
 
-                leverage = position_sizer.get_leverage_for_symbol(symbol, current_aggr_level)
+                    is_momentum_ok = scores[0] > scores[-1] if market_regime == MarketRegime.BULL_TREND else scores[0] < scores[-1]
 
-                daily_row = tf_rows.get("1d")
-                four_hour_row = tf_rows.get("4h")
-                new_signal = Signal(
-                    symbol=symbol,
-                    final_score=final_score,
-                    score_1d=tf_scores.get("1d"),
-                    score_4h=tf_scores.get("4h"),
-                    score_1h=tf_scores.get("1h"),
-                    score_15m=tf_scores.get("15m"),
-                    atr_1d=_extract_float_from_row(daily_row, ("ATR_14", "ATRr_14", "atr_14", "atr")),
-                    adx_4h=_extract_float_from_row(four_hour_row, ("adx_value", "ADX_14", "ADX", "adx")),
-                    is_above_ema200_1d=_extract_bool_from_row(daily_row, "is_above_ema200"),
-                )
-                session.add(new_signal)
-                session.commit()
-                session.refresh(new_signal)
+                    print(f"[{symbol}] 추세장 신호 품질 평가: Avg={avg_score:.2f}, StdDev={std_dev:.2f}, Momentum={'OK' if is_momentum_ok else 'Not Good'}")
 
-                analysis_context = {
-                    "signal_id": new_signal.id,
-                    "final_score": final_score,
-                    "tf_scores": tf_scores,
-                    "avg_score": avg_score,
-                    "std_dev": std_dev,
-                    "side": side,
-                    "leverage": leverage,
-                    "entry_atr": entry_atr,
-                }
+                    side = None
+                    if market_regime == MarketRegime.BULL_TREND and avg_score >= config.quality_min_avg_score and std_dev <= config.quality_max_std_dev and is_momentum_ok:
+                        side = "BUY"
+                    elif market_regime == MarketRegime.BEAR_TREND and abs(avg_score) >= config.quality_min_avg_score and std_dev <= config.quality_max_std_dev and is_momentum_ok:
+                        side = "SELL"
+                    
+                    if side:
+                        print(f"🚀 고품질 추세 신호 포착!: {symbol} {side} (Avg: {avg_score:.2f})")
+                        
+                        entry_atr = recent_signals[0].atr_1d # 1일봉 ATR을 손절 기준으로 사용
+                        if not entry_atr or entry_atr <= 0:
+                            print(f"ATR 값이 유효하지 않아({entry_atr}) 진입을 건너뜁니다.")
+                            continue
 
-                await trading_engine.place_order_with_bracket(
-                    symbol, side, quantity, leverage, entry_atr, analysis_context
-                )
-                return
-    except Exception as loop_error:
-        print(f"🚨 trading_decision_loop 실행 중 오류: {loop_error}")
+                        quantity = position_sizer.calculate_position_size(symbol, entry_atr, current_aggr_level, open_positions_count, avg_score)
+                        if not quantity or quantity <= 0: continue
+
+                        leverage = position_sizer.get_leverage_for_symbol(symbol, current_aggr_level)
+                        
+                        analysis_context = {"signal_id": recent_signals[0].id}
+                        await trading_engine.place_order_with_bracket(symbol, side, quantity, leverage, entry_atr, analysis_context)
+                        return # 한 번에 하나의 포지션만 진입
+                
+                # 3-2. 횡보장 전략 (추후 구현을 위한 공간)
+                elif market_regime == MarketRegime.SIDEWAYS:
+                    # print(f"[{symbol}] 횡보장으로 판단되어, 추세 추종 전략을 실행하지 않습니다.")
+                    pass
+
+    except Exception as e:
+        print(f"🚨 매매 결정 루프 중 심각한 오류 발생: {e}")
     finally:
         session.close()
-
 
 # --- 한글 슬래시 명령어 (V3) ---
 
 @tree.command(name="패널", description="인터랙티브 제어실을 소환합니다.")
 async def summon_panel_kr(interaction: discord.Interaction):
-    # ... (기존과 동일)
-    pass
+    global panel_message
+    panel_channel = bot.get_channel(config.panel_channel_id)
+    if not panel_channel:
+        return await interaction.response.send_message("⚠️ `.env`에 `DISCORD_PANEL_CHANNEL_ID`를 설정해주세요.", ephemeral=True)
+    if panel_message and panel_message.channel.id == panel_channel.id:
+        try: await panel_message.delete()
+        except: pass
+    await interaction.response.send_message(f"✅ 제어 패널을 {panel_channel.mention} 채널에 소환했습니다.", ephemeral=True)
+    view = ControlPanelView(aggr_level_callback=on_aggr_level_change)
+    panel_message = await panel_channel.send(embed=get_panel_embed(), view=view)
+    if not panel_update_loop.is_running():
+        panel_update_loop.start()
 
 
 @tree.command(name="상태", description="봇의 현재 핵심 상태를 비공개로 요약합니다.")
@@ -379,8 +433,17 @@ async def manual_sell_kr(interaction: discord.Interaction, 코인: str, 수량: 
 @app_commands.describe(코인="청산할 코인 심볼 (예: BTCUSDT)")
 async def close_position_kr(interaction: discord.Interaction, 코인: str):
     symbol = 코인.upper()
-    # ... (DB에서 해당 심볼의 open_trade를 찾아 trading_engine.close_position 호출하는 로직)
-    await interaction.response.send_message(f"`{symbol}` 포지션 청산 기능은 구현 예정입니다.", ephemeral=True)
+    view = ConfirmView()
+    await interaction.response.send_message(f"**⚠️ 경고: 수동 청산**\n`{symbol}` 포지션을 즉시 시장가로 종료하시겠습니까?", view=view, ephemeral=True)
+    await view.wait()
+    if view.value is True:
+        with db_manager.get_session() as session:
+            trade_to_close = session.execute(select(Trade).where(Trade.symbol == symbol, Trade.status == "OPEN")).scalar_one_or_none()
+        if trade_to_close:
+            await trading_engine.close_position(trade_to_close, "사용자 수동 청산")
+            await interaction.followup.send(f"✅ **수동 청산 주문 성공**\n`{symbol}` 포지션이 종료되었습니다.", ephemeral=True)
+        else:
+            await interaction.followup.send(f"❌ **수동 청산 주문 실패**\n`{symbol}`에 대한 오픈된 포지션이 없습니다.", ephemeral=True)
 
 # --- 봇 준비 이벤트 ---
 @bot.event
