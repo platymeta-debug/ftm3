@@ -10,15 +10,14 @@ from database.manager import db_manager
 from database.models import Signal, Trade
 
 class TradingEngine:
-    def __init__(self, client: Client):
-        self.client = client
-        print("🚚 [V4] 트레이딩 엔진이 초기화되었습니다.")
-
-    # ... place_order_with_bracket 함수는 V3와 동일 ...
+    # ... (__init__ 함수는 동일) ...
     async def place_order_with_bracket(
         self, symbol: str, side: str, quantity: float, leverage: int, entry_atr: float, analysis_context: dict
     ) -> None:
-        """[V4] 시장가 진입과 함께 손절/익절 가격을 DB에 기록하는 브라켓 주문을 실행합니다."""
+        """
+        [V4.1 수정] 시장가 진입과 함께 실제 SL/TP 주문을 바이낸스에 전송하고,
+        결과를 DB에 기록하는 진정한 브라켓 주문을 실행합니다.
+        """
         session = db_manager.get_session()
         try:
             # 1. 레버리지 설정
@@ -29,24 +28,38 @@ class TradingEngine:
             order_params = {"symbol": symbol, "side": side, "type": "MARKET", "quantity": quantity, "newOrderRespType": "RESULT"}
             binance_order = self.client.futures_create_order(**order_params)
             entry_price = float(binance_order.get('avgPrice', 0.0))
-            if entry_price == 0.0:
-                entry_price = float(binance_order.get('price', 0.0))
-
+            
             # 3. 손절/익절 가격 계산
             stop_loss_distance = entry_atr * config.sl_atr_multiplier
-            if side == "BUY":
-                stop_loss_price = entry_price - stop_loss_distance
-                take_profit_price = entry_price + (stop_loss_distance * config.risk_reward_ratio)
-            else: # SELL
-                stop_loss_price = entry_price + stop_loss_distance
-                take_profit_price = entry_price - (stop_loss_distance * config.risk_reward_ratio)
+            close_side = "BUY" if side == "SELL" else "SELL" # 청산 주문 방향
 
-            # 4. DB에 거래 정보 및 브라켓 가격 기록
+            if side == "BUY":
+                stop_loss_price = round(entry_price - stop_loss_distance, 4)
+                take_profit_price = round(entry_price + (stop_loss_distance * config.risk_reward_ratio), 4)
+            else: # SELL
+                stop_loss_price = round(entry_price + stop_loss_distance, 4)
+                take_profit_price = round(entry_price - (stop_loss_distance * config.risk_reward_ratio), 4)
+            
+            # --- ▼▼▼ [V4.1 핵심] 실제 SL/TP 주문 전송 ▼▼▼ ---
+            print(f"서버에 SL/TP 주문 전송 시도... (SL: {stop_loss_price}, TP: {take_profit_price})")
+            sl_order = self.client.futures_create_order(
+                symbol=symbol, side=close_side, type='STOP_MARKET', quantity=quantity, stopPrice=stop_loss_price, closePosition=True
+            )
+            tp_order = self.client.futures_create_order(
+                symbol=symbol, side=close_side, type='TAKE_PROFIT_MARKET', quantity=quantity, stopPrice=take_profit_price, closePosition=True
+            )
+            print("✅ SL/TP 주문이 성공적으로 전송되었습니다.")
+            # --- ▲▲▲ [V4.1 핵심] ▲▲▲ ---
+
+            # 4. DB에 거래 정보 기록
             new_trade = Trade(
                 signal_id=analysis_context.get("signal_id"),
                 binance_order_id=binance_order.get("orderId"),
-                symbol=symbol, side=side, quantity=float(binance_order.get('origQty', quantity)),
+                symbol=symbol, 
+                side=side, 
+                quantity=float(binance_order.get('origQty', quantity)),
                 entry_price=entry_price,
+                leverage=leverage, # V4.1에 추가된 레버리지 저장
                 entry_atr=entry_atr,
                 stop_loss_price=stop_loss_price,
                 take_profit_price=take_profit_price,
@@ -56,15 +69,14 @@ class TradingEngine:
             session.add(new_trade)
             session.commit()
             print(f"✅ 주문 성공 및 DB 기록 완료: {symbol} {side} {quantity}")
-            print(f"   ㄴ SL: ${stop_loss_price:,.2f}, TP: ${take_profit_price:,.2f} (손익비 1:{config.risk_reward_ratio})")
             
-            # 이벤트 발행
+            # 이벤트 발행 (이제 핸들러가 이 이벤트를 처리할 것)
             await event_bus.publish("ORDER_SUCCESS", {"trade": new_trade, "context": analysis_context})
 
         except Exception as e:
             session.rollback()
             print(f"🚨 주문 처리 중 오류 발생: {e}")
-            await event_bus.publish("ORDER_FAILURE", {"error": str(e)})
+            await event_bus.publish("ORDER_FAILURE", {"symbol": symbol, "error": str(e)})
         finally:
             session.close()
 
