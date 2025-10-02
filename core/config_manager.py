@@ -22,17 +22,26 @@ class ConfigManager:
             self.api_secret = os.getenv("BINANCE_LIVE_API_SECRET")
 
         # Analysis Engine
-        self.timeframes = self._get_list("ANALYSIS_TIMEFRAMES", ["15m", "1h", "4h", "1d"])
-        self.tf_vote_weights = self._get_list_float("TF_VOTE_WEIGHTS", [1.0, 2.0, 3.0, 4.0])
-        self.open_threshold = self._get_float("OPEN_TH", 10.0)
+        self.analysis_timeframes = self._get_list("ANALYSIS_TIMEFRAMES", ["1d", "4h", "1h", "15m"])
+        self.tf_vote_weights = self._get_list_float("TF_VOTE_WEIGHTS", [4.0, 3.0, 2.0, 1.0])
+        self.open_th = self._get_float("OPEN_TH", 12.0)
+        self.market_regime_adx_th = self._get_float("MARKET_REGIME_ADX_TH", 23.0)
+        # 하위 호환성 유지
+        self.timeframes = self.analysis_timeframes
+        self.open_threshold = self.open_th
 
         # Signal Quality Rules
         self.quality_min_avg_score = self._get_float("QUALITY_MIN_AVG_SCORE", 15.0)
         self.quality_max_std_dev = self._get_float("QUALITY_MAX_STD_DEV", 3.0)
 
         # Trading Logic Rules
-        self.entry_confirm_count = self._get_int("ENTRY_CONFIRM_COUNT", 3)
+        self.trend_entry_confirm_count = self._get_int("TREND_ENTRY_CONFIRM_COUNT", 3)
+        self.sideways_rsi_confirm_count = self._get_int("SIDEWAYS_RSI_CONFIRM_COUNT", 2)
+        self.sideways_rsi_oversold = self._get_float("SIDEWAYS_RSI_OVERSOLD", 35.0)
+        self.sideways_rsi_overbought = self._get_float("SIDEWAYS_RSI_OVERBOUGHT", 65.0)
         self.reversal_confirm_count = self._get_int("REVERSAL_CONFIRM_COUNT", 2)
+        # 하위 호환성 유지
+        self.entry_confirm_count = self.trend_entry_confirm_count
         
         # Risk Management
         self.aggr_level = self._get_int("AGGR_LEVEL", 3)
@@ -58,6 +67,9 @@ class ConfigManager:
         # Adaptive Logic
         self.adaptive_aggr_enabled = self._get_bool("ADAPTIVE_AGGR_ENABLED", True)
         self.adaptive_volatility_threshold = self._get_float("ADAPTIVE_VOLATILITY_THRESHOLD", 0.04)
+
+        # Portfolio Management
+        self.max_open_positions = self._get_int("MAX_OPEN_POSITIONS", 1)
 
         # Infrastructure
         self.db_path = os.getenv("DB_PATH", "./runtime/trader.db")

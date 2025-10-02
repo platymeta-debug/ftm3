@@ -10,6 +10,7 @@ from typing import Dict, Tuple, Mapping, Optional
 
 import pandas as pd
 from binance.client import Client
+import pandas_ta as ta
 
 from core.config_manager import config
 from . import data_fetcher, indicator_calculator  # ← 점(.) 누락 버그 수정
@@ -133,8 +134,8 @@ class ConfluenceEngine:
         tf_scores: Dict[str, int] = {}
         tf_rows: Dict[str, pd.Series] = {}
 
-        # config.timeframes 가 리스트/튜플 전제. (문자열 1개만 올 가능성도 대비)
-        timeframes = config.timeframes
+        # config.analysis_timeframes 가 리스트/튜플 전제. (문자열 1개만 올 가능성도 대비)
+        timeframes = config.analysis_timeframes
         if isinstance(timeframes, (str,)):
             timeframes = [timeframes]
         elif not isinstance(timeframes, (list, tuple)):
@@ -158,6 +159,25 @@ class ConfluenceEngine:
 
             tf_scores[tf_str] = self._calculate_bias_score(indicators, tf_str)
             tf_rows[tf_str] = indicators.iloc[-1]
+
+        # --- [Milestone 3] 추가 분석 데이터 추출 ---
+        four_hour_row = tf_rows.get("4h")
+        if isinstance(four_hour_row, pd.Series):
+            adx_value = four_hour_row.get(f"ADX_{ta.ADX_LENGTH}")
+            sanitized_adx = self._safe_number(adx_value)
+            updated = four_hour_row.copy()
+            updated["adx_value"] = sanitized_adx
+            tf_rows["4h"] = updated
+
+        daily_row = tf_rows.get("1d")
+        if isinstance(daily_row, pd.Series):
+            updated_daily = daily_row.copy()
+            close_price = self._safe_number(updated_daily.get("close"))
+            ema200 = self._safe_number(updated_daily.get("EMA_200"))
+            if close_price is not None and ema200 is not None:
+                updated_daily["is_above_ema200"] = close_price > ema200
+            tf_rows["1d"] = updated_daily
+        # --- [Milestone 3] 추가 분석 데이터 추출 ---
 
         # 가중 투표
         final_score = 0.0
@@ -202,11 +222,11 @@ class ConfluenceEngine:
         # 키 정규화 (리스트 키 → 문자열 키)
         tf_rows_norm = self._normalize_tf_rows(tf_rows)
 
-        # primary_tf 우선: 명시 인자 → config.timeframes[0]
+        # primary_tf 우선: 명시 인자 → config.analysis_timeframes[0]
         tf_choice = self._to_scalar_tf(primary_tf)
         if not tf_choice:
             # config 기반 1순위 사용
-            tfs = config.timeframes
+            tfs = config.analysis_timeframes
             if isinstance(tfs, (str,)):
                 tf_choice = tfs
             elif isinstance(tfs, (list, tuple)) and tfs:

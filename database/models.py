@@ -1,5 +1,5 @@
 from datetime import datetime
-from sqlalchemy import Column, DateTime, Float, ForeignKey, Integer, String
+from sqlalchemy import Boolean, Column, DateTime, Float, ForeignKey, Integer, String
 from sqlalchemy.orm import declarative_base, relationship
 
 Base = declarative_base()
@@ -16,6 +16,10 @@ class Signal(Base):
     score_15m = Column(Float)
     # 1일봉 ATR 값을 저장하여 변동성 분석에 사용
     atr_1d = Column(Float)
+    # 4시간봉 ADX 값을 저장하여 추세/횡보 판단에 사용
+    adx_4h = Column(Float)
+    # 1일봉 200 이평선 위에 있는지 여부 (장기 추세 판단)
+    is_above_ema200_1d = Column(Boolean)
     trade = relationship("Trade", back_populates="signal", uselist=False)
 
 class Trade(Base):
