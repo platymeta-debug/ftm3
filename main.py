@@ -130,26 +130,61 @@ def get_panel_embed() -> discord.Embed:
         current_aggr_text += status
     embed.add_field(name="[현재 전략]", value=f"분석 대상: {symbols_text}\n기본 공격성: {base_aggr_text}\n현재 공격성: {current_aggr_text}", inline=True)
     try:
-        with db_manager.get_session() as session:
-            open_positions_count = session.query(Trade).filter(Trade.status == "OPEN").count()
-        embed.add_field(name="[포트폴리오]", value=f"**{open_positions_count} / {config.max_open_positions}** 포지션 운영 중", inline=False)
-        positions = binance_client.futures_position_information()
-        open_positions = [p for p in positions if float(p.get('positionAmt', 0)) != 0]
-        if not open_positions:
+        # --- ▼▼▼ [V4.1] 자산 정보 및 총 PnL 계산 ▼▼▼ ---
+        account_info = binance_client.futures_account()
+        total_balance = float(account_info.get('totalWalletBalance', 0.0))
+        total_pnl = float(account_info.get('totalUnrealizedProfit', 0.0))
+        pnl_color = "📈" if total_pnl >= 0 else "📉"
+        
+        db_session = db_manager.get_session()
+        open_trades_from_db = db_session.query(Trade).filter(Trade.status == "OPEN").all()
+        open_positions_count = len(open_trades_from_db)
+        
+        embed.add_field(
+            name="[포트폴리오]",
+            value=f"💰 **총 자산**: `${total_balance:,.2f}`\n"
+                  f"{pnl_color} **총 PnL**: `${total_pnl:,.2f}`\n"
+                  f"📊 **운영 포지션**: **{open_positions_count} / {config.max_open_positions}** 개",
+            inline=False
+        )
+        # --- ▲▲▲ [V4.1] ▲▲▲ ---
+
+        if not open_trades_from_db:
             embed.add_field(name="[오픈된 포지션]", value="현재 오픈된 포지션이 없습니다.", inline=False)
         else:
-            for pos in open_positions:
-                symbol, side = pos['symbol'], "LONG" if float(pos['positionAmt']) > 0 else "SHORT"
-                quantity, entry_price, pnl = abs(float(pos['positionAmt'])), float(pos['entryPrice']), float(pos['unRealizedProfit'])
-                pnl_color, leverage = "📈" if pnl >= 0 else "📉", int(pos.get('leverage', 1))
-                margin = float(pos.get('isolatedWallet', 0)) if float(pos.get('isolatedWallet', 0)) > 0 else (quantity * entry_price / leverage)
+            # API에서 가져온 실시간 정보와 DB 정보를 매칭
+            positions_from_api = {p['symbol']: p for p in binance_client.futures_position_information() if float(p.get('positionAmt', 0)) != 0}
+            
+            for trade in open_trades_from_db:
+                pos_api_data = positions_from_api.get(trade.symbol)
+                if not pos_api_data: continue
+
+                side = "LONG" if float(pos_api_data['positionAmt']) > 0 else "SHORT"
+                quantity = abs(float(pos_api_data['positionAmt']))
+                entry_price = float(pos_api_data['entryPrice'])
+                pnl = float(pos_api_data['unRealizedProfit'])
+                notional_value = quantity * entry_price # 포지션 가치
+                
+                # --- ▼▼▼ [V4.1] DB에서 레버리지 조회 ▼▼▼ ---
+                leverage = trade.leverage if trade.leverage else int(pos_api_data.get('leverage', 1))
+                # --- ▲▲▲ [V4.1] ▲▲▲ ---
+
+                margin = notional_value / leverage if leverage > 0 else 0
                 pnl_percent = (pnl / margin * 100) if margin > 0 else 0.0
-                pos_value = (f"**{side}** | `{quantity}` @ `${entry_price:,.2f}` | **{leverage}x**\n"
-                             f"> PnL: `${pnl:,.2f}` ({pnl_percent:+.2f}%) {pnl_color}")
-                embed.add_field(name=f"--- {symbol} ---", value=pos_value, inline=True)
+                pnl_color = "📈" if pnl >= 0 else "📉"
+
+                pos_value = (
+                    f"**{side}** | `{quantity}` @ `${entry_price:,.2f}` | **{leverage}x**\n"
+                    f"> **가치**: `${notional_value:,.2f}`\n"
+                    f"> **PnL**: `${pnl:,.2f}` ({pnl_percent:+.2f}%) {pnl_color}"
+                )
+                embed.add_field(name=f"--- {trade.symbol} ---", value=pos_value, inline=True)
+        db_session.close()
+
     except Exception as e:
         print(f"패널 포지션 정보 업데이트 중 오류: {e}")
         embed.add_field(name="[오픈된 포지션]", value="⚠️ 정보를 가져오는 중 오류가 발생했습니다.", inline=False)
+    
     embed.set_footer(text=f"최종 업데이트: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S %Z')}")
     return embed
 
@@ -414,6 +449,50 @@ async def find_new_entry_opportunities(session, open_positions_count, symbols_in
                 analysis_context = {"signal_id": recent_signals[0].id}
                 await trading_engine.place_order_with_bracket(symbol, side, quantity, leverage, entry_atr, analysis_context)
                 return # 한 번에 하나의 신규 진입만 실행
+            
+# --- ▼▼▼ [V4.1] 이벤트 핸들러 루프 추가 ▼▼▼ ---
+async def event_handler_loop():
+    """이벤트 버스에서 이벤트를 구독하고, 유형에 따라 적절한 동작을 수행합니다."""
+    print("이벤트 핸들러 루프가 시작되었습니다. 알림 대기 중...")
+    while True:
+        try:
+            event = await event_bus.subscribe()
+            event_type = event.get("type")
+            data = event.get("data", {})
+            
+            alerts_channel = bot.get_channel(config.alerts_channel_id)
+            if not alerts_channel:
+                print("⚠️ 알림 채널 ID를 찾을 수 없습니다. .env 파일을 확인하세요.")
+                continue
+
+            if event_type == "ORDER_SUCCESS":
+                trade = data.get("trade")
+                embed = discord.Embed(title="🚀 신규 포지션 진입", color=0x00FF00 if trade.side == "BUY" else 0xFF0000)
+                embed.add_field(name="코인", value=trade.symbol, inline=True)
+                embed.add_field(name="방향", value=trade.side, inline=True)
+                embed.add_field(name="수량", value=f"{trade.quantity}", inline=True)
+                embed.add_field(name="진입 가격", value=f"${trade.entry_price:,.4f}", inline=False)
+                embed.add_field(name="손절 (SL)", value=f"${trade.stop_loss_price:,.4f}", inline=True)
+                embed.add_field(name="익절 (TP)", value=f"${trade.take_profit_price:,.4f}", inline=True)
+                embed.set_footer(text=f"주문 ID: {trade.binance_order_id}")
+                await alerts_channel.send(embed=embed)
+
+            elif event_type == "ORDER_CLOSE_SUCCESS":
+                trade = data.get("trade")
+                reason = data.get("reason")
+                pnl_percent = (trade.pnl / (trade.entry_price * trade.quantity) * 100)
+                embed = discord.Embed(title="✅ 포지션 종료", description=f"사유: {reason}", color=0x3498DB)
+                embed.add_field(name="코인", value=trade.symbol, inline=True)
+                embed.add_field(name="수익 (PnL)", value=f"${trade.pnl:,.2f} ({pnl_percent:+.2f}%)", inline=True)
+                await alerts_channel.send(embed=embed)
+
+            elif event_type == "ORDER_FAILURE":
+                embed = discord.Embed(title="🚨 주문 실패", description=data.get("error"), color=0xFF0000)
+                embed.add_field(name="코인", value=data.get("symbol"), inline=True)
+                await alerts_channel.send(embed=embed)
+
+        except Exception as e:
+            print(f"이벤트 핸들러 오류: {e}")
 
 @tasks.loop(minutes=5)
 async def trading_decision_loop():
@@ -556,6 +635,12 @@ async def on_ready():
         trading_decision_loop.start()
 
     print("모든 준비 완료. 디스코드 채널을 확인하세요.")
+
+    # 3. 이벤트 핸들러 루프 시작
+    asyncio.create_task(event_handler_loop())
+
+    print("모든 준비 완료. 디스코드 채널을 확인하세요.")
+
 # --- 봇 실행 ---
 if __name__ == "__main__":
     if not config.discord_bot_token:
