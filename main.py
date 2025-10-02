@@ -278,7 +278,10 @@ async def data_collector_loop():
     try:
         for symbol in config.symbols:
             final_score, tf_scores, tf_rows = confluence_engine.analyze(symbol)
-            
+
+            atr_1d_val = confluence_engine.extract_atr(tf_rows, primary_tf='1d')
+            atr_4h_val = confluence_engine.extract_atr(tf_rows, primary_tf='4h')
+
             adx_4h_val = _extract_float_from_row(tf_rows.get("4h"), ("adx_value", "ADX_14"))
             daily_row = tf_rows.get("1d")
             is_above_ema200 = _extract_bool_from_row(daily_row, "is_above_ema200")
@@ -371,7 +374,7 @@ async def trading_decision_loop():
                         avg_score = statistics.mean(scores)
                         std_dev = statistics.pstdev(scores) if len(scores) > 1 else 0
 
-                        # --- ▼▼▼ [오류 2 해결] 'Momentum' 조건 완화 ▼▼▼ ---
+                        
                         print(f"[{symbol}] 추세장 신호 품질 평가: Avg={avg_score:.2f}, StdDev={std_dev:.2f}")
 
                         side = None
@@ -379,22 +382,17 @@ async def trading_decision_loop():
                             side = "BUY"
                         elif market_regime == MarketRegime.BEAR_TREND and abs(avg_score) >= config.quality_min_avg_score and std_dev <= config.quality_max_std_dev:
                             side = "SELL"
-                        # --- ▲▲▲ [오류 2 해결] ▲▲▲ ---
+                        
                         
                         if side:
                             print(f"🚀 고품질 추세 신호 포착!: {symbol} {side} (Avg: {avg_score:.2f})")
                             
-                            # --- ▼▼▼ [오류 2 해결] ATR 조회 로직 강화 ▼▼▼ ---
-                            entry_atr = recent_signals[0].atr_1d
+                            
+                            entry_atr = recent_signals[0].atr_4h 
                             if not entry_atr or entry_atr <= 0:
-                                print(f"경고: 1일봉 ATR({entry_atr})이 유효하지 않습니다. 4시간봉 ATR로 대체합니다.")
-                                # 4시간봉 ATR을 조회하기 위해 Confluence Engine 재활용
-                                _, _, tf_rows = confluence_engine.analyze(symbol)
-                                entry_atr = _extract_float_from_row(tf_rows.get("4h"), "ATR_14")
-                                if not entry_atr or entry_atr <= 0:
-                                    print(f"오류: 4시간봉 ATR도 유효하지 않아({entry_atr}) 진입을 건너뜁니다.")
-                                    continue
-                            # --- ▲▲▲ [오류 2 해결] ▲▲▲ ---
+                                print(f"ATR 값이 유효하지 않아({entry_atr}) 진입을 건너뜁니다.")
+                                continue
+                            
 
                             quantity = position_sizer.calculate_position_size(symbol, entry_atr, current_aggr_level, open_positions_count, avg_score)
                             if not quantity or quantity <= 0: continue
