@@ -1,0 +1,27 @@
+{
+  "TrendStrategy": {
+    "enabled": true,
+    "ema_short": 20,
+    "ema_long": 50,
+    "score_strong_trend": 2
+  },
+  "OscillatorStrategy": {
+    "enabled": true,
+    "rsi_period": 14,
+    "stoch_k": 14,
+    "stoch_d": 3,
+    "stoch_smooth_k": 3,
+    "mfi_period": 14,
+    "obv_ema_period": 20,
+    "rsi_oversold": 30,
+    "rsi_overbought": 70,
+    "stoch_oversold": 20,
+    "stoch_overbought": 80,
+    "mfi_oversold": 20,
+    "mfi_overbought": 80,
+    "score_oversold": 2,
+    "score_overbought": -2,
+    "score_inflow": 1,
+    "score_outflow": -1
+  }
+}
