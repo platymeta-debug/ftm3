@@ -2,17 +2,18 @@
 
 import discord
 from discord.ext import tasks
-from datetime import datetime, timezone, time
+from datetime import datetime, timezone, time, timedelta # timedelta 추가
 from sqlalchemy import select
 from core.event_bus import event_bus
-from .models import AccountSnapshot
+import pandas as pd
+import requests
 
 import pandas as pd
 import requests
 
 # 핵심 모듈 임포트
 from database.manager import db_manager
-from database.models import Signal, Trade
+from database.models import Signal, Trade, AccountSnapshot
 from analysis.core_strategy import diagnose_market_regime, MarketRegime
 
 class BackgroundTasks:
