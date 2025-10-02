@@ -219,29 +219,22 @@ async def trading_decision_loop():
                     print(f"현재가 조회 실패 ({trade.symbol}): {price_err}")
                     continue
 
-                if trade.side == "BUY":
-                    if trade.highest_price_since_entry is None or current_price > trade.highest_price_since_entry:
-                        trade.highest_price_since_entry = current_price
-                        session.commit()
-                else:
-                    if trade.highest_price_since_entry is None or current_price < trade.highest_price_since_entry:
-                        trade.highest_price_since_entry = current_price
-                        session.commit()
+                # --- ▼▼▼ 괄호 오류 수정된 부분 ▼▼▼ ---
 
+                # 1. 자동 익절 (TP)
                 if trade.take_profit_price is not None:
-                    if (trade.side == "BUY" and current_price >= trade.take_profit_price) or (
-                        trade.side == "SELL" and current_price <= trade.take_profit_price
-                    ):
+                    if (trade.side == "BUY" and current_price >= trade.take_profit_price) or \
+                       (trade.side == "SELL" and current_price <= trade.take_profit_price):
                         await trading_engine.close_position(
                             trade,
                             f"자동 익절 (TP: ${trade.take_profit_price:,.2f})"
                         )
                         continue
 
+                # 2. 자동 손절 (SL)
                 if trade.stop_loss_price is not None:
-                    if (trade.side == "BUY" and current_price <= trade.stop_loss_price) or (
-                        trade.side == "SELL" and current_price >= trade.stop_loss_price
-                    ):
+                    if (trade.side == "BUY" and current_price <= trade.stop_loss_price) or \
+                       (trade.side == "SELL" and current_price >= trade.stop_loss_price):
                         await trading_engine.close_position(
                             trade,
                             f"자동 손절 (SL: ${trade.stop_loss_price:,.2f})"
