@@ -1,6 +1,7 @@
 # core/config_manager.py (V5 - 최적화 파라미터 적용)
 
 import os
+import json
 from typing import List, Optional, Dict
 from dotenv import load_dotenv
 
@@ -8,6 +9,19 @@ class ConfigManager:
     def __init__(self) -> None:
         load_dotenv()
         print("환경 변수 파일(.env)을 로드했습니다.")
+        
+        # ▼▼▼ [시즌 2 추가] 전략 설정 파일 로드 ▼▼▼
+        try:
+            with open("strategies.json", "r", encoding="utf-8") as f:
+                self.strategy_configs = json.load(f)
+            print("✅ strategies.json 설정 파일을 성공적으로 로드했습니다.")
+        except FileNotFoundError:
+            print("⚠️ strategies.json 파일을 찾을 수 없어, 전략이 기본값으로 실행됩니다.")
+            self.strategy_configs = {}
+        except json.JSONDecodeError:
+            print("🚨 strategies.json 파일의 형식이 잘못되었습니다. 파일을 확인해주세요.")
+            self.strategy_configs = {}
+        # ▲▲▲ [시즌 2 추가] ▲▲▲
 
         # Core Settings
         self.trade_mode = os.getenv("TRADE_MODE", "testnet")
