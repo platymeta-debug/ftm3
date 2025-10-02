@@ -166,6 +166,7 @@ class ConfluenceEngine:
             # ta.ADX_LENGTH 대신 기본값 '14'를 직접 사용
             adx_value = four_hour_row.get(f"ADX_14") 
             sanitized_adx = self._safe_number(adx_value)
+            # copy()를 사용하여 원본 데이터 변경 방지
             updated = four_hour_row.copy()
             updated["adx_value"] = sanitized_adx
             tf_rows["4h"] = updated
