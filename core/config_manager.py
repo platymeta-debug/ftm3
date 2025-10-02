@@ -1,5 +1,7 @@
+# core/config_manager.py (V5 - 최적화 파라미터 적용)
+
 import os
-from typing import List, Optional
+from typing import List, Optional, Dict
 from dotenv import load_dotenv
 
 class ConfigManager:
@@ -11,7 +13,7 @@ class ConfigManager:
         self.trade_mode = os.getenv("TRADE_MODE", "testnet")
         self.is_testnet = self.trade_mode == "testnet"
         self.exec_active = self._get_bool("EXEC_ACTIVE", False)
-        self.symbols = self._get_list("SYMBOLS", ["BTCUSDT"])
+        self.symbols = self._get_list("SYMBOLS", ["BTCUSDT", "ETHUSDT"]) # symbols 기본값 수정
 
         # Binance Keys
         if self.is_testnet:
@@ -21,11 +23,29 @@ class ConfigManager:
             self.api_key = os.getenv("BINANCE_LIVE_API_KEY")
             self.api_secret = os.getenv("BINANCE_LIVE_API_SECRET")
 
+        # --- ▼▼▼ [핵심] 최적화 결과 적용 ▼▼▼ ---
         # Analysis Engine
         self.analysis_timeframes = self._get_list("ANALYSIS_TIMEFRAMES", ["1d", "4h", "1h", "15m"])
         self.tf_vote_weights = self._get_list_float("TF_VOTE_WEIGHTS", [4.0, 3.0, 2.0, 1.0])
-        self.open_th = self._get_float("OPEN_TH", 12.0)
         self.market_regime_adx_th = self._get_float("MARKET_REGIME_ADX_TH", 23.0)
+
+        # 코인별 개별 전략 파라미터 설정
+        self.strategy_params = {
+            "BTCUSDT": {
+                "open_th": self._get_float("OPEN_TH_BTC", 12.0),
+                "risk_reward_ratio": self._get_float("RR_RATIO_BTC", 2.5)
+            },
+            "ETHUSDT": {
+                "open_th": self._get_float("OPEN_TH_ETH", 8.0),
+                "risk_reward_ratio": self._get_float("RR_RATIO_ETH", 2.5)
+            },
+            # 기본값: 다른 코인이 추가될 경우를 대비
+            "DEFAULT": {
+                "open_th": self._get_float("OPEN_TH_DEFAULT", 12.0),
+                "risk_reward_ratio": self._get_float("RR_RATIO_DEFAULT", 2.0)
+            }
+        }
+        # --- ▲▲▲ [핵심] 최적화 결과 적용 ▲▲▲ ---
 
         # Signal Quality Rules
         self.quality_min_avg_score = self._get_float("QUALITY_MIN_AVG_SCORE", 15.0)
@@ -38,18 +58,15 @@ class ConfigManager:
         self.sideways_rsi_overbought = self._get_float("SIDEWAYS_RSI_OVERBOUGHT", 65.0)
         self.reversal_confirm_count = self._get_int("REVERSAL_CONFIRM_COUNT", 2)
 
-        # --- ▼▼▼ V4 수정 사항 ▼▼▼ ---
         # Risk Management
         self.aggr_level = self._get_int("AGGR_LEVEL", 3)
         self.risk_target_pct = self._get_float("RISK_TARGET_PCT", 0.02)
         self.sl_atr_multiplier = self._get_float("SL_ATR_MULTIPLIER", 1.5)
-        self.risk_reward_ratio = self._get_float("RISK_REWARD_RATIO", 2.0) # take_profit_pct 대체
 
         # Risk Scales
         self.risk_scale_high = self._get_float("RISK_SCALE_HIGH_CONFIDENCE", 1.5)
         self.risk_scale_medium = self._get_float("RISK_SCALE_MEDIUM_CONFIDENCE", 1.0)
         self.risk_scale_low = self._get_float("RISK_SCALE_LOW_CONFIDENCE", 0.5)
-        # --- ▲▲▲ V4 수정 사항 ▲▲▲ ---
 
         # Leverage Map
         self.leverage_map = {
@@ -76,11 +93,13 @@ class ConfigManager:
         self.panel_channel_id = self._get_int("DISCORD_PANEL_CHANNEL_ID")
         self.analysis_channel_id = self._get_int("DISCORD_ANALYSIS_CHANNEL_ID")
         self.alerts_channel_id = self._get_int("DISCORD_ALERTS_CHANNEL_ID")
-        # Discord Channel IDs
         self.dashboard_channel_id = self._get_int("DISCORD_CHANNEL_ID_DASHBOARD")
-        self.alerts_channel_id = self._get_int("DISCORD_CHANNEL_ID_ALERTS")
-        self.analysis_channel_id = self._get_int("DISCORD_CHANNEL_ID_ANALYSIS")
-        self.panel_channel_id = self._get_int("DISCORD_CHANNEL_ID_PANEL")
+
+    # --- ▼▼▼ [핵심] 코인별 전략 파라미터를 쉽게 가져오는 함수 추가 ▼▼▼ ---
+    def get_strategy_params(self, symbol: str) -> Dict:
+        """해당 심볼에 맞는 전략 파라미터를 반환합니다. 없으면 기본값을 반환합니다."""
+        return self.strategy_params.get(symbol, self.strategy_params["DEFAULT"])
+    # --- ▲▲▲ [핵심] ▲▲▲ ---
 
     def _get_bool(self, key: str, default: bool = False) -> bool:
         val = os.getenv(key)
