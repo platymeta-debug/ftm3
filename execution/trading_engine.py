@@ -1,3 +1,5 @@
+# 파일명: execution/trading_engine.py (V4 업그레이드)
+
 from typing import Optional
 from datetime import datetime
 from binance.client import Client
@@ -10,8 +12,9 @@ from database.models import Signal, Trade
 class TradingEngine:
     def __init__(self, client: Client):
         self.client = client
-        print("트레이딩 엔진이 초기화되었습니다.")
+        print("🚚 [V4] 트레이딩 엔진이 초기화되었습니다.")
 
+    # ... place_order_with_bracket 함수는 V3와 동일 ...
     async def place_order_with_bracket(
         self, symbol: str, side: str, quantity: float, leverage: int, entry_atr: float, analysis_context: dict
     ) -> None:
@@ -65,11 +68,14 @@ class TradingEngine:
         finally:
             session.close()
 
-    async def close_position(self, trade_to_close: Trade, reason: str) -> None:
-        """[V4] 지정된 거래(포지션)를 시장가로 청산하고 DB를 업데이트합니다."""
+
+    async def close_position(self, trade_to_close: Trade, reason: str, quantity_to_close: Optional[float] = None) -> None:
+        """
+        [V4] 지정된 거래(포지션)를 시장가로 청산하고 DB를 업데이트합니다.
+        quantity_to_close가 지정되면 부분 청산을, None이면 전체 청산을 실행합니다.
+        """
         session = db_manager.get_session()
         try:
-            # DB에서 최신 trade 객체를 다시 불러옴
             trade = session.get(Trade, trade_to_close.id)
             if not trade or trade.status == "CLOSED":
                 print(f"이미 처리되었거나 존재하지 않는 거래입니다: ID {trade_to_close.id}")
@@ -77,16 +83,17 @@ class TradingEngine:
 
             close_side = "BUY" if trade.side == "SELL" else "SELL"
             
-            position_info = self.client.futures_position_information(symbol=trade.symbol)
-            # positionAmt는 문자열로 오므로 float으로 변환
-            quantity_to_close = abs(float(position_info[0]['positionAmt']))
+            # 청산할 수량 결정
+            if quantity_to_close is None: # 전체 청산
+                position_info = self.client.futures_position_information(symbol=trade.symbol)
+                current_position_amt = abs(float(position_info[0]['positionAmt']))
+                if current_position_amt == 0:
+                    print(f"⚠️ 청산할 포지션이 이미 없습니다: {trade.symbol}. DB 상태를 'CLOSED'로 강제 업데이트합니다.")
+                    trade.status = "CLOSED"
+                    session.commit()
+                    return
+                quantity_to_close = current_position_amt
             
-            if quantity_to_close == 0:
-                print(f"⚠️ 청산할 포지션이 이미 없습니다: {trade.symbol}. DB 상태를 'CLOSED'로 강제 업데이트합니다.")
-                trade.status = "CLOSED"
-                session.commit()
-                return
-
             print(f"포지션 종료 요청: {trade.symbol} {close_side} {quantity_to_close} | 사유: {reason}")
             
             close_order = self.client.futures_create_order(
@@ -94,16 +101,26 @@ class TradingEngine:
             )
             
             exit_price = float(close_order.get("avgPrice", 0.0))
-            pnl = (exit_price - trade.entry_price) * trade.quantity if trade.side == "BUY" else (trade.entry_price - exit_price) * trade.quantity
+            pnl = (exit_price - trade.entry_price) * quantity_to_close if trade.side == "BUY" else (trade.entry_price - exit_price) * quantity_to_close
             
-            trade.status = "CLOSED"
-            trade.exit_price = exit_price
-            trade.exit_time = datetime.utcnow()
-            trade.pnl = pnl
-            session.commit()
-            print(f"✅ 포지션 종료 및 DB 업데이트 완료. PnL: ${pnl:,.2f}")
+            # 남은 포지션이 있는지 확인
+            position_info = self.client.futures_position_information(symbol=trade.symbol)
+            remaining_amt = abs(float(position_info[0]['positionAmt']))
 
-            await event_bus.publish("ORDER_CLOSE_SUCCESS", {"trade": trade, "reason": reason})
+            if remaining_amt > 0: # 부분 청산 완료
+                trade.pnl = (trade.pnl or 0) + pnl
+                trade.quantity -= quantity_to_close # 남은 수량 업데이트
+                print(f"💰 부분 익절 완료. PnL: ${pnl:,.2f} | 남은 수량: {trade.quantity}")
+                # is_scaled_out 플래그는 trading_decision_loop에서 직접 처리
+            else: # 전체 청산 완료
+                trade.status = "CLOSED"
+                trade.exit_price = exit_price
+                trade.exit_time = datetime.utcnow()
+                trade.pnl = (trade.pnl or 0) + pnl
+                print(f"✅ 포지션 전체 종료 및 DB 업데이트 완료. 최종 PnL: ${trade.pnl:,.2f}")
+
+            session.commit()
+            await event_bus.publish("ORDER_CLOSE_SUCCESS", {"trade": trade, "reason": reason, "is_partial": remaining_amt > 0})
 
         except Exception as e:
             session.rollback()
