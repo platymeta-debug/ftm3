@@ -48,3 +48,9 @@ class Trade(Base):
     # --- ▲▲▲ [V4] 컬럼 추가 완료 ▲▲▲ ---
 
     signal = relationship("Signal", back_populates="trade")
+
+class AccountSnapshot(Base):
+    __tablename__ = "account_snapshots"
+    id = Column(Integer, primary_key=True)
+    timestamp = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    total_balance = Column(Float, nullable=False)
