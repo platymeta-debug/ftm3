@@ -1,170 +1,196 @@
-# 파일명: analysis/confluence_engine.py
-# (전체 최종 수정안)
-
-"""Hierarchical confluence engine responsible for scoring market bias."""
+# 파일명: analysis/confluence_engine.py (V4 업그레이드)
+# 'Executive's Brain' 업그레이드의 핵심. 시장의 거시/미시 환경과 심리를 복합적으로 분석.
 
 from __future__ import annotations
-
 import math
 from typing import Dict, Tuple, Mapping, Optional
-
 import pandas as pd
 from binance.client import Client
-import pandas_ta as ta
+import requests # V4: 공포-탐욕 지수 API 연동을 위해 추가
 
 from core.config_manager import config
-from . import data_fetcher, indicator_calculator  # ← 점(.) 누락 버그 수정
-
+from . import data_fetcher, indicator_calculator
 
 class ConfluenceEngine:
-    """Combine multi-timeframe indicators into a single confluence score."""
-
+    """
+    [V4] Macro-Tactical Confluence Engine.
+    시장의 거시 환경(날씨), 참여자 심리(온도), 그리고 미시적 타점(전술)을 계층적으로 분석하여
+    'A급 타점'을 식별하고 점수화합니다.
+    """
     def __init__(self, client: Client):
         self.client = client
-        print("계층적 컨플루언스 엔진이 초기화되었습니다.")
+        self.fear_and_greed_index = 50 # 기본값: 중립
+        print("📈 [V4] Macro-Tactical 컨플루언스 엔진이 초기화되었습니다.")
 
-    # =========================
-    # 내부 유틸 (정규화/안전장치)
-    # =========================
-    @staticmethod
-    def _to_scalar_tf(tf_val) -> Optional[str]:
-        """'4h' | ['4h'] | ('4h',) | None -> '4h' or None"""
-        if tf_val is None:
-            return None
-        if isinstance(tf_val, (list, tuple)):
-            if not tf_val:
-                return None
-            tf_val = tf_val[0]
-        # 숫자 등도 들어올 수 있으므로 문자열로 보정
-        return str(tf_val)
-
-    @staticmethod
-    def _normalize_tf_rows(tf_rows: Mapping) -> Dict[str, pd.Series]:
-        """tf_rows의 키가 리스트/튜플이어도 문자열 스칼라 키로 정규화."""
-        if not isinstance(tf_rows, Mapping):
-            raise TypeError(f"tf_rows는 dict(Mapping)이어야 합니다. got: {type(tf_rows).__name__}")
-        fixed: Dict[str, pd.Series] = {}
-        for k, v in tf_rows.items():
-            nk = ConfluenceEngine._to_scalar_tf(k)
-            if nk is None:
-                # 키가 None이면 스킵
-                continue
-            fixed[nk] = v
-        return fixed
-
-    @staticmethod
-    def _safe_number(val) -> Optional[float]:
-        """숫자이면 float로, NaN이면 None, 그 외는 None."""
-        if isinstance(val, (int, float)):
-            if math.isnan(val):
-                return None
-            return float(val)
-        # numpy/pandas 스칼라 호환
+    # ==================================
+    # 🚀 1단계: 시장의 '날씨'와 '심리' 분석 - Macro Analysis Layer
+    # ==================================
+    def _fetch_fear_and_greed_index(self) -> None:
+        """외부 API를 통해 공포-탐욕 지수를 가져와 업데이트합니다."""
         try:
-            f = float(val)
-            if math.isnan(f):
-                return None
-            return f
-        except Exception:
-            return None
+            # 하루에 한 번만 호출해도 충분하지만, 데모를 위해 매 분석 시 호출
+            response = requests.get("https://api.alternative.me/fng/?limit=1", timeout=5)
+            response.raise_for_status()
+            data = response.json()['data'][0]
+            self.fear_and_greed_index = int(data['value'])
+            print(f"🧠 공포-탐욕 지수 업데이트: {self.fear_and_greed_index} ({data['value_classification']})")
+        except requests.RequestException as e:
+            print(f"⚠️ 공포-탐욕 지수 API 호출 실패: {e}. 이전 값({self.fear_and_greed_index})을 사용합니다.")
 
-    # =========================
-    # 스코어 계산
-    # =========================
-    def _calculate_bias_score(self, df: pd.DataFrame, timeframe: str) -> int:
-        if df is None or df.empty or len(df) < 200:
-            print(f"[{timeframe}] 데이터 부족으로 점수 계산 건너뜀 (데이터 수: {0 if df is None else len(df)})")
+    # ==================================
+    # 🚀 2단계: 'A급 타점' 식별 - Tactical Entry Layer
+    # ==================================
+    def _find_rsi_divergence(self, df: pd.DataFrame, lookback: int = 14) -> int:
+        """RSI 다이버전스를 탐지하여 강력한 추세 전환 신호에 높은 점수를 부여합니다."""
+        if len(df) < lookback + 5: return 0
+        
+        recent_df = df.tail(lookback)
+        lows = recent_df['low']
+        highs = recent_df['high']
+        rsi = recent_df['RSI_14']
+
+        # 강세 다이버전스: 가격은 저점을 낮추는데, RSI는 저점을 높임
+        if lows.iloc[-1] < lows.iloc[0] and rsi.iloc[-1] > rsi.iloc[0]:
+            # 더 명확한 신호를 위해, 최근 5개 봉 중 가장 낮은 저점과 비교
+            if lows.idxmin() == lows.index[-1]:
+                print(f"💎 강세 다이버전스 발견!")
+                return 5 # 매우 높은 가산점
+
+        # 약세 다이버전스: 가격은 고점을 높이는데, RSI는 고점을 낮춤
+        if highs.iloc[-1] > highs.iloc[0] and rsi.iloc[-1] < rsi.iloc[0]:
+            if highs.idxmax() == highs.index[-1]:
+                print(f" Alerts  약세 다이버전스 발견!")
+                return -5 # 매우 높은 감점
+
+        return 0
+
+    def _calculate_tactical_score(self, df: pd.DataFrame, timeframe: str) -> int:
+        """[V4 핵심] 지정된 타임프레임의 기술적 지표를 복합적으로 분석하여 전술적 점수를 계산합니다."""
+        if df is None or df.empty or len(df) < 50:
+            print(f"[{timeframe}] 데이터 부족으로 전술 분석 건너뜀 (데이터 수: {0 if df is None else len(df)})")
             return 0
 
         score = 0
-        last_row = df.iloc[-1]
+        last = df.iloc[-1]
+        
+        # --- 1. 자금 흐름(Money Flow) 분석 ---
+        mfi = self._safe_number(last.get("MFI_14"))
+        obv = self._safe_number(last.get("OBV"))
+        obv_ema = self._safe_number(df['OBV'].ewm(span=20, adjust=False).mean().iloc[-1])
+        
+        money_flow_score = 0
+        if mfi is not None and obv is not None and obv_ema is not None:
+            if mfi > 80: money_flow_score -= 1 # 과매수
+            if mfi < 20: money_flow_score += 1 # 과매도
+            if obv > obv_ema: money_flow_score += 1 # 매집 우위
+            if obv < obv_ema: money_flow_score -= 1 # 분산 우위
 
-        close_price = self._safe_number(last_row.get("close"))
-        ema20 = self._safe_number(last_row.get("EMA_20"))
-        ema50 = self._safe_number(last_row.get("EMA_50"))
-        ema200 = self._safe_number(last_row.get("EMA_200"))
-        rsi_value = self._safe_number(last_row.get("RSI_14"))
-        tenkan_sen = self._safe_number(last_row.get("ITS_9"))
-        kijun_sen = self._safe_number(last_row.get("IKS_26"))
-        senkou_a = self._safe_number(last_row.get("ISA_9"))
-        senkou_b = self._safe_number(last_row.get("ISB_26"))
+        # --- 2. 오실레이터 교차 확인 (RSI + Stochastic) ---
+        rsi = self._safe_number(last.get("RSI_14"))
+        stoch_k = self._safe_number(last.get("STOCHk_14_3_3"))
+        
+        oscillator_score = 0
+        if rsi is not None and stoch_k is not None:
+            if rsi < 30 and stoch_k < 20: oscillator_score = 2   # 동시 과매도 (강력 매수)
+            elif rsi > 70 and stoch_k > 80: oscillator_score = -2  # 동시 과매수 (강력 매도)
+            elif rsi < 40: oscillator_score = 1
+            elif rsi > 60: oscillator_score = -1
 
-        def f(val):
-            return f"{val:.2f}" if isinstance(val, (int, float)) else ("N/A" if val is None else str(val))
+        # --- 3. 다이버전스 자동 탐지 (가장 높은 가중치) ---
+        divergence_score = self._find_rsi_divergence(df)
 
-        print(f"--- [{timeframe}] 지표 값 ---")
-        print(f"Close: {f(close_price)}, EMA20: {f(ema20)}, EMA50: {f(ema50)}, EMA200: {f(ema200)}")
-        print(f"RSI: {f(rsi_value)}, Tenkan: {f(tenkan_sen)}, Kijun: {f(kijun_sen)}, SpanA: {f(senkou_a)}, SpanB: {f(senkou_b)}")
+        # --- 4. 볼린저 밴드 스퀴즈 후 돌파 ---
+        bb_squeeze_score = 0
+        bbw = df['BBP_20_2.0'] # pandas-ta의 bbands()는 BBP 컬럼을 제공
+        if not bbw.empty:
+            # 최근 20개 캔들 중 BBW가 최저치 근처에 있다가(스퀴즈), 최근 캔들이 밴드를 돌파
+            is_squeeze = bbw.iloc[-5:-1].min() < 0.3
+            is_breakout_up = last['close'] > last['BBU_20_2.0']
+            is_breakout_down = last['close'] < last['BBL_20_2.0']
+            
+            if is_squeeze and is_breakout_up:
+                bb_squeeze_score = 3
+                print("🔥 볼린저 밴드 상방 돌파!")
+            elif is_squeeze and is_breakout_down:
+                bb_squeeze_score = -3
+                print("🧊 볼린저 밴드 하방 돌파!")
 
-        trend_score, rsi_score, ichimoku_score = 0, 0, 0
-
-        # Trend
-        if all(v is not None for v in [close_price, ema20, ema50, ema200]):
-            if ema20 > ema50 > ema200:
-                trend_score = 2
-            elif ema20 < ema50 < ema200:
-                trend_score = -2
-            elif close_price > ema50:
-                trend_score = 1
-            elif close_price < ema50:
-                trend_score = -1
-
-        # RSI
-        if rsi_value is not None:
-            if rsi_value > 70:
-                rsi_score = -1
-            elif rsi_value < 30:
-                rsi_score = 1
-
-        # Ichimoku
-        if all(v is not None for v in [close_price, tenkan_sen, kijun_sen, senkou_a, senkou_b]):
-            if close_price > senkou_a and close_price > senkou_b:
-                ichimoku_score = 2 if tenkan_sen > kijun_sen else 1
-            elif close_price < senkou_a and close_price < senkou_b:
-                ichimoku_score = -2 if tenkan_sen < kijun_sen else -1
-
-        score = trend_score + rsi_score + ichimoku_score
-        print(f"점수 계산: Trend({trend_score}), RSI({rsi_score}), Ichimoku({ichimoku_score}) -> 합계: {score}")
+        # --- 5. 기존 추세 분석 (EMA 기반) ---
+        ema20 = self._safe_number(last.get("EMA_20"))
+        ema50 = self._safe_number(last.get("EMA_50"))
+        close = self._safe_number(last.get("close"))
+        
+        trend_score = 0
+        if all(v is not None for v in [close, ema20, ema50]):
+            if close > ema20 > ema50: trend_score = 2  # 정배열 강세
+            elif close < ema20 < ema50: trend_score = -2 # 역배열 약세
+            elif close > ema50: trend_score = 1
+            elif close < ema50: trend_score = -1
+            
+        score = trend_score + money_flow_score + oscillator_score + divergence_score + bb_squeeze_score
+        print(f"[{timeframe}] 전술 점수: 추세({trend_score}) + 자금({money_flow_score}) + 오실({oscillator_score}) + 다이버({divergence_score}) + BB({bb_squeeze_score}) -> 합계: {score}")
         return score
 
-    # =========================
-    # 메인 분석
-    # =========================
+    # ==================================
+    # 🚀 3단계: 최종 판단 - Confluence Layer
+    # ==================================
     def analyze(self, symbol: str) -> Tuple[float, Dict[str, int], Dict[str, pd.Series]]:
+        """[V4] 시장의 모든 요소를 종합하여 최종 컨플루언스 점수를 계산합니다."""
+        # 1. 거시 심리 분석 (API 호출)
+        self._fetch_fear_and_greed_index()
+        
         tf_scores: Dict[str, int] = {}
         tf_rows: Dict[str, pd.Series] = {}
-
-        # config.analysis_timeframes 가 리스트/튜플 전제. (문자열 1개만 올 가능성도 대비)
         timeframes = config.analysis_timeframes
-        if isinstance(timeframes, (str,)):
-            timeframes = [timeframes]
-        elif not isinstance(timeframes, (list, tuple)):
-            # 안전장치
-            timeframes = list(timeframes) if timeframes is not None else []
 
         for timeframe in timeframes:
-            tf_str = self._to_scalar_tf(timeframe)  # 혹시 리스트/튜플로 들어오면 보정
-            if not tf_str:
-                continue
-
-            df = data_fetcher.fetch_klines(self.client, symbol, tf_str)
+            df = data_fetcher.fetch_klines(self.client, symbol, timeframe, limit=200) # 다이버전스 계산 위해 데이터 증가
             if df is None or df.empty:
-                tf_scores[tf_str] = 0
+                tf_scores[timeframe] = 0
                 continue
-
+            
             indicators = indicator_calculator.calculate_all_indicators(df)
             if indicators is None or indicators.empty:
-                tf_scores[tf_str] = 0
+                tf_scores[timeframe] = 0
                 continue
+            
+            tf_scores[timeframe] = self._calculate_tactical_score(indicators, timeframe)
+            tf_rows[timeframe] = indicators.iloc[-1]
 
-            tf_scores[tf_str] = self._calculate_bias_score(indicators, tf_str)
-            tf_rows[tf_str] = indicators.iloc[-1]
+        # 2. 최종 점수 집계 (가중 투표 + 심리 지수 반영)
+        final_score = 0.0
+        for idx, timeframe in enumerate(timeframes):
+            weight = config.tf_vote_weights[idx] if idx < len(config.tf_vote_weights) else 1.0
+            final_score += tf_scores.get(timeframe, 0) * float(weight)
 
-        # --- [Milestone 3] 추가 분석 데이터 추출 ---
+        # 3. 거시-미시 동조화 가중
+        # 4h와 1d의 방향성이 같으면 신뢰도 상승
+        if (tf_scores.get("4h", 0) > 0 and tf_scores.get("1d", 0) > 0) or \
+           (tf_scores.get("4h", 0) < 0 and tf_scores.get("1d", 0) < 0):
+            final_score *= 1.2
+            print("📈 4h-1d 추세 동조! 신뢰도 가중치 적용.")
+
+        # 4. 시장 심리 반영
+        # 극단적 공포 상태에서 매수 신호가 나오면 가산점, 탐욕 상태에서 매도 신호가 나오면 가산점
+        if self.fear_and_greed_index <= 25 and final_score > 0:
+            final_score *= 1.2
+            print("🥶 극심한 공포! 역추세 매수 기회일 수 있습니다. 가중치 적용.")
+        if self.fear_and_greed_index >= 75 and final_score < 0:
+            final_score *= 1.2
+            print("🤑 극심한 탐욕! 시장 과열 가능성. 매도 신호에 가중치 적용.")
+
+        # V3 호환성을 위한 추가 데이터 추출 (main.py에서 사용)
+        self._extract_legacy_data(tf_rows)
+
+        return final_score, tf_scores, tf_rows
+    
+    # --- 유틸리티 및 하위 호환성 함수들 (기존과 거의 동일) ---
+    
+    def _extract_legacy_data(self, tf_rows: Dict[str, pd.Series]):
+        """main.py의 V3 로직이 V4 데이터 구조와 호환되도록 데이터를 추가합니다."""
         four_hour_row = tf_rows.get("4h")
         if isinstance(four_hour_row, pd.Series):
-            # ta.ADX_LENGTH 대신 기본값 '14'를 직접 사용
-            adx_value = four_hour_row.get(f"ADX_14") 
+            adx_value = four_hour_row.get(f"ADX_14")
             sanitized_adx = self._safe_number(adx_value)
             # copy()를 사용하여 원본 데이터 변경 방지
             updated = four_hour_row.copy()
@@ -179,86 +205,24 @@ class ConfluenceEngine:
             if close_price is not None and ema200 is not None:
                 updated_daily["is_above_ema200"] = close_price > ema200
             tf_rows["1d"] = updated_daily
-        # --- [Milestone 3] 추가 분석 데이터 추출 ---
+    
+    @staticmethod
+    def _safe_number(val) -> Optional[float]:
+        if isinstance(val, (int, float)) and not math.isnan(val):
+            return float(val)
+        try:
+            f = float(val)
+            return f if not math.isnan(f) else None
+        except (ValueError, TypeError):
+            return None
 
-        # 가중 투표
-        final_score = 0.0
-        for idx, timeframe in enumerate(timeframes):
-            tf_str = self._to_scalar_tf(timeframe)
-            if not tf_str:
-                continue
-            weight = (
-                config.tf_vote_weights[idx]
-                if hasattr(config, "tf_vote_weights") and idx < len(getattr(config, "tf_vote_weights", []))
-                else 1.0
-            )
-            final_score += tf_scores.get(tf_str, 0) * float(weight)
-
-        # 4h & 1d 동조 가중(있으면)
-        if (tf_scores.get("4h", 0) > 0 and tf_scores.get("1d", 0) > 0) or (
-            tf_scores.get("4h", 0) < 0 and tf_scores.get("1d", 0) < 0
-        ):
-            final_score *= 1.2
-
-        return final_score, tf_scores, tf_rows
-
-    # =========================
-    # ATR 추출 (버그 수정 핵심)
-    # =========================
-    def extract_atr(
-        self,
-        tf_rows: Mapping,
-        primary_tf: Optional[str | list | tuple] = None,
-        fallback_order: tuple[str, ...] = ("4h", "1h", "30m", "15m", "5m"),
-    ) -> float:
-        """
-        tf_rows에서 ATR 값을 추출한다.
-
-        - primary_tf 가 리스트/튜플이어도 안전하게 첫 요소로 정규화한다.
-        - primary_tf 가 없거나 해당 키가 없으면 fallback_order 순서대로 시도.
-        - tf_rows 키가 리스트/튜플로 잘못 들어와도 문자열 스칼라로 정규화한다.
-        """
-        if not tf_rows:
-            return 0.0
-
-        # 키 정규화 (리스트 키 → 문자열 키)
-        tf_rows_norm = self._normalize_tf_rows(tf_rows)
-
-        # primary_tf 우선: 명시 인자 → config.analysis_timeframes[0]
-        tf_choice = self._to_scalar_tf(primary_tf)
-        if not tf_choice:
-            # config 기반 1순위 사용
-            tfs = config.analysis_timeframes
-            if isinstance(tfs, (str,)):
-                tf_choice = tfs
-            elif isinstance(tfs, (list, tuple)) and tfs:
-                tf_choice = self._to_scalar_tf(tfs[0])
-            else:
-                tf_choice = None
-
-        # primary 후보가 tf_rows에 없다면 fallback 사용
-        if not tf_choice or tf_choice not in tf_rows_norm:
-            for cand in fallback_order:
-                if cand in tf_rows_norm:
-                    tf_choice = cand
-                    break
-
-        # 그래도 없으면 사용 가능한 첫 키 사용
-        if not tf_choice:
-            if not tf_rows_norm:
-                return 0.0
-            # 키 하나 뽑기
-            tf_choice = next(iter(tf_rows_norm.keys()))
-
-        row = tf_rows_norm.get(tf_choice)
-        if row is None:
-            return 0.0
-
-        # 지원 키 우선순위
-        for key in ("ATR_14", "ATRr_14", "atr_14", "atr"):
-            value = row.get(key) if isinstance(row, Mapping) else (row[key] if key in row.index else None)
-            val = self._safe_number(value)
+    def extract_atr(self, tf_rows: Mapping, primary_tf: str = "4h") -> float:
+        # 이 함수는 V4에서 직접 사용되진 않지만, 외부(main.py) 호환성을 위해 유지합니다.
+        row = tf_rows.get(primary_tf)
+        if row is None: return 0.0
+        
+        for key in ("ATRr_14", "ATR_14"):
+            val = self._safe_number(row.get(key))
             if val is not None:
-                return float(val)
-
+                return val
         return 0.0
