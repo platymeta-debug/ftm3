@@ -22,6 +22,19 @@ def calculate_all_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df.ta.atr(append=True)
     df.ta.adx(append=True)
 
+    # 1. 자금 흐름 (Money Flow) 분석용
+    df.ta.mfi(append=True)  # MFI (Money Flow Index)
+    df.ta.obv(append=True)  # OBV (On-Balance Volume)
+
+    # 2. 오실레이터 교차 확인 및 다이버전스 탐지용
+    df.ta.stoch(append=True) # Stochastic Oscillator
+
+    # 3. 변동성 기반 패턴 인식용 ('볼린저 밴드 스퀴즈')
+    bbands = df.ta.bbands(append=False) # bbands는 여러 컬럼을 반환하므로 append=False
+    if bbands is not None and not bbands.empty:
+        df = pd.concat([df, bbands], axis=1)
+
+
     # 모든 컬럼을 숫자로 변환, 변환 불가 시 NaN으로 처리하여 오류 방지
     for col in df.columns:
         if col not in ['open', 'high', 'low', 'close', 'volume']:
