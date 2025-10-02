@@ -2,16 +2,15 @@ import discord
 from discord import app_commands
 from discord.ext import commands, tasks
 from binance.client import Client
-from binance.exceptions import BinanceAPIException
 import asyncio
 from datetime import datetime, timezone, timedelta
 from sqlalchemy import select
 import pandas as pd
 from enum import Enum
+import statistics
 
 # 1. 모듈 임포트
 from core.config_manager import config
-from core.event_bus import event_bus
 from database.manager import db_manager, Signal, Trade
 from execution.trading_engine import TradingEngine
 from analysis.confluence_engine import ConfluenceEngine
@@ -42,6 +41,64 @@ position_sizer = PositionSizer(binance_client)
 current_aggr_level = config.aggr_level
 panel_message: discord.Message = None
 analysis_message: discord.Message = None # 분석 메시지 객체
+
+# --- 유틸리티 함수 ---
+
+def _extract_float_from_row(row, keys):
+    if row is None:
+        return None
+    if isinstance(keys, str):
+        keys = (keys,)
+    for key in keys:
+        value = None
+        if hasattr(row, "get"):
+            try:
+                value = row.get(key)
+            except Exception:
+                value = None
+        if value is None:
+            try:
+                if key in row:
+                    value = row[key]
+            except Exception:
+                value = None
+        if value is None:
+            continue
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def _extract_bool_from_row(row, key):
+    if row is None:
+        return None
+    value = None
+    if hasattr(row, "get"):
+        try:
+            value = row.get(key)
+        except Exception:
+            value = None
+    if value is None:
+        try:
+            if key in row:
+                value = row[key]
+        except Exception:
+            value = None
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in {"true", "1", "t", "yes", "y"}:
+            return True
+        if lowered in {"false", "0", "f", "no", "n"}:
+            return False
+    return None
 
 # --- 콜백 및 UI 생성 함수 (기존과 동일) ---
 def on_aggr_level_change(new_level: int):
@@ -138,8 +195,142 @@ async def data_collector_loop():
 
 @tasks.loop(minutes=5)
 async def trading_decision_loop():
-    # ... (기존 매매 결정 로직은 그대로 유지)
-    pass
+    global current_aggr_level
+
+    if not config.exec_active:
+        print("자동매매가 비활성화되어 있어 trading_decision_loop를 종료합니다.")
+        return
+
+    session = db_manager.get_session()
+    try:
+        open_trades = session.execute(select(Trade).where(Trade.status == "OPEN")).scalars().all()
+
+        # --- B. 포지션 관리 ---
+        if open_trades:
+            for trade in list(open_trades):
+                try:
+                    mark_price_info = binance_client.futures_mark_price(symbol=trade.symbol)
+                    current_price = float(mark_price_info.get('markPrice', 0.0))
+                except Exception as price_err:
+                    print(f"현재가 조회 실패 ({trade.symbol}): {price_err}")
+                    continue
+
+                if trade.side == "BUY":
+                    if trade.highest_price_since_entry is None or current_price > trade.highest_price_since_entry:
+                        trade.highest_price_since_entry = current_price
+                        session.commit()
+                else:
+                    if trade.highest_price_since_entry is None or current_price < trade.highest_price_since_entry:
+                        trade.highest_price_since_entry = current_price
+                        session.commit()
+
+                if trade.take_profit_price is not None:
+                    if (trade.side == "BUY" and current_price >= trade.take_profit_price) or (
+                        trade.side == "SELL" and current_price <= trade.take_profit_price
+                    ):
+                        await trading_engine.close_position(
+                            trade,
+                            f"자동 익절 (TP: ${trade.take_profit_price:,.2f})"
+                        )
+                        continue
+
+                if trade.stop_loss_price is not None:
+                    if (trade.side == "BUY" and current_price <= trade.stop_loss_price) or (
+                        trade.side == "SELL" and current_price >= trade.stop_loss_price
+                    ):
+                        await trading_engine.close_position(
+                            trade,
+                            f"자동 손절 (SL: ${trade.stop_loss_price:,.2f})"
+                        )
+                        continue
+
+        session.expire_all()
+        open_trades = session.execute(select(Trade).where(Trade.status == "OPEN")).scalars().all()
+        open_positions_count = len(open_trades)
+
+        # --- A. 신규 진입 ---
+        if open_positions_count < config.max_open_positions:
+            for symbol in config.symbols:
+                if any(t.symbol == symbol for t in open_trades):
+                    continue
+
+                try:
+                    final_score, tf_scores, tf_rows = confluence_engine.analyze(symbol)
+                except Exception as analysis_err:
+                    print(f"시장 분석 실패 ({symbol}): {analysis_err}")
+                    continue
+
+                tf_values = list(tf_scores.values())
+                if not tf_values:
+                    continue
+
+                avg_score = sum(tf_values) / len(tf_values)
+                std_dev = statistics.pstdev(tf_values) if len(tf_values) > 1 else 0.0
+
+                is_quality_buy = (
+                    avg_score >= config.quality_min_avg_score
+                    and std_dev <= config.quality_max_std_dev
+                    and final_score >= config.open_th
+                )
+                is_quality_sell = (
+                    avg_score <= -config.quality_min_avg_score
+                    and std_dev <= config.quality_max_std_dev
+                    and final_score <= -config.open_th
+                )
+
+                if not (is_quality_buy or is_quality_sell):
+                    continue
+
+                side = "BUY" if is_quality_buy else "SELL"
+                entry_atr = confluence_engine.extract_atr(tf_rows)
+                if entry_atr <= 0:
+                    print(f"ATR 추출 실패 ({symbol}) → 진입 건너뜀")
+                    continue
+
+                quantity = position_sizer.calculate_position_size(
+                    symbol, entry_atr, current_aggr_level, open_positions_count, avg_score
+                )
+                if not quantity or quantity <= 0:
+                    continue
+
+                leverage = position_sizer.get_leverage_for_symbol(symbol, current_aggr_level)
+
+                daily_row = tf_rows.get("1d")
+                four_hour_row = tf_rows.get("4h")
+                new_signal = Signal(
+                    symbol=symbol,
+                    final_score=final_score,
+                    score_1d=tf_scores.get("1d"),
+                    score_4h=tf_scores.get("4h"),
+                    score_1h=tf_scores.get("1h"),
+                    score_15m=tf_scores.get("15m"),
+                    atr_1d=_extract_float_from_row(daily_row, ("ATR_14", "ATRr_14", "atr_14", "atr")),
+                    adx_4h=_extract_float_from_row(four_hour_row, ("adx_value", "ADX_14", "ADX", "adx")),
+                    is_above_ema200_1d=_extract_bool_from_row(daily_row, "is_above_ema200"),
+                )
+                session.add(new_signal)
+                session.commit()
+                session.refresh(new_signal)
+
+                analysis_context = {
+                    "signal_id": new_signal.id,
+                    "final_score": final_score,
+                    "tf_scores": tf_scores,
+                    "avg_score": avg_score,
+                    "std_dev": std_dev,
+                    "side": side,
+                    "leverage": leverage,
+                    "entry_atr": entry_atr,
+                }
+
+                await trading_engine.place_order_with_bracket(
+                    symbol, side, quantity, leverage, entry_atr, analysis_context
+                )
+                return
+    except Exception as loop_error:
+        print(f"🚨 trading_decision_loop 실행 중 오류: {loop_error}")
+    finally:
+        session.close()
 
 
 # --- 한글 슬래시 명령어 (V3) ---
