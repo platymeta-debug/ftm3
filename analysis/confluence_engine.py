@@ -65,68 +65,77 @@ class ConfluenceEngine:
         return 0
 
     def _calculate_tactical_score(self, df: pd.DataFrame, timeframe: str) -> int:
-        """[V4 핵심] 지정된 타임프레임의 기술적 지표를 복합적으로 분석하여 전술적 점수를 계산합니다."""
+        
         if df is None or df.empty or len(df) < 50:
-            print(f"[{timeframe}] 데이터 부족으로 전술 분석 건너뜀 (데이터 수: {0 if df is None else len(df)})")
+            print(f"[{timeframe}] 데이터 부족으로 전술 분석 건너뜀")
             return 0
 
         score = 0
         last = df.iloc[-1]
         
-        # --- 1. 자금 흐름(Money Flow) 분석 ---
-        mfi = self._safe_number(last.get("MFI_14"))
-        obv = self._safe_number(last.get("OBV"))
-        obv_ema = self._safe_number(df['OBV'].ewm(span=20, adjust=False).mean().iloc[-1])
-        
-        money_flow_score = 0
-        if mfi is not None and obv is not None and obv_ema is not None:
-            if mfi > 80: money_flow_score -= 1 # 과매수
-            if mfi < 20: money_flow_score += 1 # 과매도
-            if obv > obv_ema: money_flow_score += 1 # 매집 우위
-            if obv < obv_ema: money_flow_score -= 1 # 분산 우위
+        trend_score, money_flow_score, oscillator_score, divergence_score, bb_squeeze_score = 0, 0, 0, 0, 0
 
-        # --- 2. 오실레이터 교차 확인 (RSI + Stochastic) ---
-        rsi = self._safe_number(last.get("RSI_14"))
-        stoch_k = self._safe_number(last.get("STOCHk_14_3_3"))
-        
-        oscillator_score = 0
-        if rsi is not None and stoch_k is not None:
-            if rsi < 30 and stoch_k < 20: oscillator_score = 2   # 동시 과매도 (강력 매수)
-            elif rsi > 70 and stoch_k > 80: oscillator_score = -2  # 동시 과매수 (강력 매도)
-            elif rsi < 40: oscillator_score = 1
-            elif rsi > 60: oscillator_score = -1
+        # --- 1, 2, 3번 로직은 안정적으로 작동하므로 그대로 유지 ---
+        # ... (자금 흐름, 오실레이터, 다이버전스 분석 로직) ...
+        if all(k in df.columns for k in ["MFI_14", "OBV"]):
+            mfi = self._safe_number(last.get("MFI_14"))
+            obv = self._safe_number(last.get("OBV"))
+            obv_ema = self._safe_number(df['OBV'].ewm(span=20, adjust=False).mean().iloc[-1])
+            if mfi is not None and obv is not None and obv_ema is not None:
+                if mfi > 80: money_flow_score -= 1
+                if mfi < 20: money_flow_score += 1
+                if obv > obv_ema: money_flow_score += 1
+                if obv < obv_ema: money_flow_score -= 1
 
-        # --- 3. 다이버전스 자동 탐지 (가장 높은 가중치) ---
-        divergence_score = self._find_rsi_divergence(df)
+        if all(k in df.columns for k in ["RSI_14", "STOCHk_14_3_3"]):
+            rsi = self._safe_number(last.get("RSI_14"))
+            stoch_k = self._safe_number(last.get("STOCHk_14_3_3"))
+            if rsi is not None and stoch_k is not None:
+                if rsi < 30 and stoch_k < 20: oscillator_score = 2
+                elif rsi > 70 and stoch_k > 80: oscillator_score = -2
+                elif rsi < 40: oscillator_score = 1
+                elif rsi > 60: oscillator_score = -1
 
-        # --- 4. 볼린저 밴드 스퀴즈 후 돌파 ---
-        bb_squeeze_score = 0
-        bbw = df['BBP_20_2.0'] # pandas-ta의 bbands()는 BBP 컬럼을 제공
-        if not bbw.empty:
-            # 최근 20개 캔들 중 BBW가 최저치 근처에 있다가(스퀴즈), 최근 캔들이 밴드를 돌파
-            is_squeeze = bbw.iloc[-5:-1].min() < 0.3
-            is_breakout_up = last['close'] > last['BBU_20_2.0']
-            is_breakout_down = last['close'] < last['BBL_20_2.0']
-            
-            if is_squeeze and is_breakout_up:
-                bb_squeeze_score = 3
-                print("🔥 볼린저 밴드 상방 돌파!")
-            elif is_squeeze and is_breakout_down:
-                bb_squeeze_score = -3
-                print("🧊 볼린저 밴드 하방 돌파!")
+        if "RSI_14" in df.columns:
+            divergence_score = self._find_rsi_divergence(df)
 
-        # --- 5. 기존 추세 분석 (EMA 기반) ---
-        ema20 = self._safe_number(last.get("EMA_20"))
-        ema50 = self._safe_number(last.get("EMA_50"))
-        close = self._safe_number(last.get("close"))
-        
-        trend_score = 0
-        if all(v is not None for v in [close, ema20, ema50]):
-            if close > ema20 > ema50: trend_score = 2  # 정배열 강세
-            elif close < ema20 < ema50: trend_score = -2 # 역배열 약세
-            elif close > ema50: trend_score = 1
-            elif close < ema50: trend_score = -1
-            
+
+        # --- 4. 볼린저 밴드 스퀴즈 (최종 수정된 부분) ---
+        try:
+            # 컬럼 이름의 시작 부분만으로 유연하게 검색
+            bbu_col = next((col for col in df.columns if col.startswith('BBU_20_2.0')), None)
+            bbl_col = next((col for col in df.columns if col.startswith('BBL_20_2.0')), None)
+            bbb_col = next((col for col in df.columns if col.startswith('BBB_20_2.0')), None)
+
+            if all([bbu_col, bbl_col, bbb_col]):
+                bbw = df[bbb_col]
+                is_squeeze = last[bbb_col] < bbw.rolling(90).quantile(0.05).iloc[-1]
+                is_breakout_up = last['close'] > last[bbu_col]
+                is_breakout_down = last['close'] < last[bbl_col]
+                
+                if is_squeeze and is_breakout_up:
+                    bb_squeeze_score = 3
+                    print("🔥 볼린저 밴드 상방 돌파!")
+                elif is_squeeze and is_breakout_down:
+                    bb_squeeze_score = -3
+                    print("🧊 볼린저 밴드 하방 돌파!")
+            else:
+                # 이 메시지가 보인다면, 여전히 컬럼이 생성되지 않은 것
+                print(f"⚠️ [{timeframe}] 볼린저 밴드 지표 컬럼을 찾을 수 없어 분석을 건너뜁니다.")
+        except Exception as e:
+            print(f"🚨 볼린저 밴드 분석 중 예외 발생: {e}")
+
+        # --- 5. 추세 분석 (EMA 기반) ---
+        if all(k in df.columns for k in ["EMA_20", "EMA_50"]):
+            ema20 = self._safe_number(last.get("EMA_20"))
+            ema50 = self._safe_number(last.get("EMA_50"))
+            close = self._safe_number(last.get("close"))
+            if all(v is not None for v in [close, ema20, ema50]):
+                if close > ema20 > ema50: trend_score = 2
+                elif close < ema20 < ema50: trend_score = -2
+                elif close > ema50: trend_score = 1
+                elif close < ema50: trend_score = -1
+
         score = trend_score + money_flow_score + oscillator_score + divergence_score + bb_squeeze_score
         print(f"[{timeframe}] 전술 점수: 추세({trend_score}) + 자금({money_flow_score}) + 오실({oscillator_score}) + 다이버({divergence_score}) + BB({bb_squeeze_score}) -> 합계: {score}")
         return score
@@ -150,6 +159,13 @@ class ConfluenceEngine:
                 continue
             
             indicators = indicator_calculator.calculate_all_indicators(df)
+            print(f"--- [confluence_engine] '{timeframe}' 분석 직전, 수신된 컬럼 목록 ---")
+            if indicators is not None and not indicators.empty:
+                print(indicators.columns.to_list())
+            else:
+                print("수신된 데이터가 비어있습니다.")
+            print("--------------------------------------------------------------")
+
             if indicators is None or indicators.empty:
                 tf_scores[timeframe] = 0
                 continue
