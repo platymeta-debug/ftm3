@@ -31,12 +31,19 @@ class Trade(Base):
     side = Column(String)
     quantity = Column(Float)
     entry_price = Column(Float)
+    
+    # --- ▼▼▼ V4 수정 사항 ▼▼▼ ---
+    # 진입 시점의 ATR 값을 저장하여 기술적 손절 라인 계산에 사용
+    entry_atr = Column(Float)
+    # 진입 시점에 계산된 고정 손절/익절 가격 (브라켓 주문)
+    stop_loss_price = Column(Float)
+    take_profit_price = Column(Float)
+    # --- ▲▲▲ V4 수정 사항 ▲▲▲ ---
+
     highest_price_since_entry = Column(Float)
     exit_price = Column(Float)
     pnl = Column(Float)
     entry_time = Column(DateTime, default=datetime.utcnow)
     exit_time = Column(DateTime)
     status = Column(String, default="OPEN")
-    # 진입 시점의 ATR 값을 저장하여 기술적 손절 라인 계산에 사용
-    entry_atr = Column(Float)
     signal = relationship("Signal", back_populates="trade")
