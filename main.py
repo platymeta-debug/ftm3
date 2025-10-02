@@ -493,7 +493,7 @@ async def manage_open_positions(session, open_trades):
             session.rollback()
 
 async def find_new_entry_opportunities(session, open_positions_count, symbols_in_trade) -> str:
-    """[V6.1] 공용 전략 모듈을 사용하여 신규 진입 기회를 탐색하고, 결정 과정을 반환합니다."""
+    """[V7 - 두뇌 이식] ConfluenceEngine에 모든 분석과 결정을 위임합니다."""
     if open_positions_count >= config.max_open_positions:
         return f"슬롯 부족 ({open_positions_count}/{config.max_open_positions}). 관망."
         
@@ -501,61 +501,35 @@ async def find_new_entry_opportunities(session, open_positions_count, symbols_in
     for symbol in config.symbols:
         if symbol in symbols_in_trade: continue
 
-        decision_reason = f"[{symbol}]: "
-        
-        # DB에서 최근 신호들을 가져옵니다.
+        # 1. 판단에 필요한 과거 신호 데이터를 DB에서 가져옵니다.
         recent_signals = session.execute(
             select(Signal).where(Signal.symbol == symbol).order_by(Signal.id.desc()).limit(config.trend_entry_confirm_count)
         ).scalars().all()
+
+        # [수정] Signal 객체 리스트 대신, 점수 리스트만 추출하여 전달합니다.
+        recent_scores = [s.final_score for s in recent_signals]
+
+        # 2. '두뇌'에게 분석 및 최종 결정을 요청합니다.
+        side, decision_reason, context = confluence_engine.analyze_and_decide(symbol, recent_scores)
         
-        if not recent_signals:
-            decision_reason += "분석할 신호 데이터가 없어 관망."
-            continue
-
-        # --- ▼▼▼ [핵심 수정] 공용 모듈 사용 ▼▼▼ ---
-        # 1. 가장 최신 신호 데이터를 pandas Series 형태로 변환합니다.
-        latest_signal = recent_signals[0]
-        indicator_data = pd.Series({
-            'adx_4h': latest_signal.adx_4h,
-            'is_above_ema200_1d': latest_signal.is_above_ema200_1d
-        })
-
-        # 2. 공용 함수를 호출하여 시장 체제를 진단합니다.
-        market_regime = diagnose_market_regime(indicator_data, config.market_regime_adx_th)
-        # --- ▲▲▲ [핵심 수정] ▲▲▲ ---
-
-        if market_regime not in [MarketRegime.BULL_TREND, MarketRegime.BEAR_TREND]:
-            decision_reason += f"추세장({market_regime.value})이 아니므로 관망."
-            continue
-
-        # (이하 신호 품질 검증 및 주문 실행 로직은 기존과 동일)
-        if len(recent_signals) < config.trend_entry_confirm_count:
-            decision_reason += f"신호 데이터 부족({len(recent_signals)}/{config.trend_entry_confirm_count}). 관망."
-            continue
-        
-        scores = [s.final_score for s in recent_signals]
-        avg_score = statistics.mean(scores)
-        std_dev = statistics.pstdev(scores) if len(scores) > 1 else 0
-
-        side = None
-        if market_regime == MarketRegime.BULL_TREND and avg_score >= config.quality_min_avg_score and std_dev <= config.quality_max_std_dev:
-            side = "BUY"
-        elif market_regime == MarketRegime.BEAR_TREND and abs(avg_score) >= config.quality_min_avg_score and std_dev <= config.quality_max_std_dev:
-            side = "SELL"
-        
-        if not side:
-            decision_reason += f"신호 품질 기준 미달 (Avg: {avg_score:.2f}, StdDev: {std_dev:.2f}). 관망."
-            continue
+        # 3. '두뇌'가 진입 결정을 내렸을 경우에만 주문을 실행합니다.
+        if side:
+            # 주문에 필요한 파라미터를 계산합니다 (이 부분은 기존 로직 활용)
+            params = config.get_strategy_params(symbol)
+            leverage = position_sizer.get_leverage_for_symbol(symbol, current_aggr_level)
+            avg_score = statistics.mean([s.final_score for s in recent_signals])
+            entry_atr = confluence_engine.extract_atr(confluence_engine.analyze_symbol(symbol)[2]) # 약간 복잡하지만, 분석 결과에서 atr 추출
             
-        # 모든 조건을 통과하여 진입 결정
-        # ... (기존의 quantity, leverage 계산 및 주문 실행 로직) ...
-        # 이 부분은 누락된 변수(quantity 등)가 있어 그대로 실행하면 오류가 발생할 수 있습니다.
-        # 실제 운영 코드의 해당 부분을 그대로 유지하시면 됩니다.
-        # await trading_engine.place_order_with_bracket(symbol, side, quantity, leverage, entry_atr, analysis_context)
-        # return f"🚀 [{symbol}] {side} 진입 주문 실행! (Avg: {avg_score:.2f})"
-        
-        # 임시로 결정까지만 로그를 남기도록 수정
-        decision_reason += f"🚀 {side} 진입 결정! (Avg: {avg_score:.2f}, StdDev: {std_dev:.2f})"
+            quantity = position_sizer.calculate_position_size(
+                symbol, entry_atr, current_aggr_level, open_positions_count, avg_score
+            )
+
+            if quantity:
+                analysis_context = {"signal_id": recent_signals[0].id if recent_signals else None}
+                await trading_engine.place_order_with_bracket(symbol, side, quantity, leverage, entry_atr, analysis_context)
+                return decision_reason # "🚀 [BTCUSDT] BUY 진입 결정!..."
+            else:
+                decision_reason = f"[{symbol}]: 포지션 규모 계산 실패."
 
     return decision_reason # 최종 결정 사유 반환
             
