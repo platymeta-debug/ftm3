@@ -4,6 +4,14 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 from sqlalchemy import select
+import asyncio
+
+# ▼▼▼ [시즌 2 추가] 백테스팅 및 시각화 관련 모듈 임포트 ▼▼▼
+from backtesting import Backtest
+from backtesting.backtest_runner import StrategyRunner
+from backtesting.performance_visualizer import create_performance_report
+from analysis.data_fetcher import fetch_klines
+# ▲▲▲ [시즌 2 추가] ▲▲▲
 
 from database.manager import db_manager
 from database.models import Trade
@@ -14,6 +22,40 @@ class CommandCog(commands.Cog):
     def __init__(self, bot: commands.Bot, trading_engine: TradingEngine):
         self.bot = bot
         self.trading_engine = trading_engine
+        
+    @app_commands.command(name="성과", description="지정한 코인에 대한 전략 백테스팅을 실행하고 결과를 시각화합니다.")
+    @app_commands.describe(코인="백테스팅을 실행할 코인 심볼 (예: BTCUSDT)")
+    async def run_backtest_kr(self, interaction: discord.Interaction, 코인: str):
+        symbol = 코인.upper()
+        await interaction.response.defer(ephemeral=False, thinking=True) # "생각 중..." 메시지 표시
+
+        try:
+            # 비동기 환경에서 동기적인 백테스팅 코드를 실행하기 위한 тrick
+            loop = asyncio.get_event_loop()
+            klines_data = await loop.run_in_executor(
+                None, fetch_klines, self.bot.binance_client, symbol, "1d", 500
+            )
+
+            if klines_data is None or klines_data.empty:
+                await interaction.followup.send(f"❌ `{symbol}`의 과거 데이터를 가져오는 데 실패했습니다.")
+                return
+
+            klines_data.columns = [col.capitalize() for col in klines_data.columns]
+
+            # 최적화 없이 기본 파라미터로 1회 실행
+            bt = Backtest(klines_data, StrategyRunner, cash=10_000, commission=.002)
+            stats = bt.run()
+
+            report_text, chart_buffer = create_performance_report(stats)
+
+            if chart_buffer:
+                file = discord.File(chart_buffer, filename=f"{symbol}_performance.png")
+                await interaction.followup.send(content=report_text, file=file)
+            else:
+                await interaction.followup.send(content=report_text)
+
+        except Exception as e:
+            await interaction.followup.send(f"🚨 백테스팅 실행 중 오류가 발생했습니다: {e}")
 
     @app_commands.command(name="패널", description="인터랙티브 제어실을 소환합니다.")
     async def summon_panel_kr(self, interaction: discord.Interaction):
