@@ -1,7 +1,10 @@
-from datetime import datetime
+from typing import Optional
 from binance.client import Client
-from core.config_manager import config
-from database.manager import db_manager, Trade
+from binance.exceptions import BinanceAPIException
+# --- ▼▼▼ 수정된 부분 ▼▼▼ ---
+from database.manager import db_manager
+from database.models import Signal, Trade # Signal과 Trade를 models.py에서 가져오도록 수정
+# --- ▲▲▲ 수정된 부분 ▲▲▲ ---
 
 class TradingEngine:
     def __init__(self, client: Client):
