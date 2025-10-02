@@ -10,7 +10,11 @@ from database.manager import db_manager
 from database.models import Signal, Trade
 
 class TradingEngine:
-    # ... (__init__ 함수는 동일) ...
+    
+    def __init__(self, client: Client):
+        self.client = client
+        print("🚚 [V4.1] 트레이딩 엔진이 초기화되었습니다.")
+    
     async def place_order_with_bracket(
         self, symbol: str, side: str, quantity: float, leverage: int, entry_atr: float, analysis_context: dict
     ) -> None:
