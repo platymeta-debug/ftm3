@@ -116,14 +116,12 @@ def on_aggr_level_change(new_level: int):
     current_aggr_level = new_level
 
 def get_panel_embed() -> discord.Embed:
-    """실시간 데이터를 담은 제어 패널 Embed를 생성합니다."""
+    """[V4 최종] 실시간 포지션 정보를 포함한 제어 패널 Embed를 생성합니다."""
     embed = discord.Embed(title="⚙️ 통합 관제 시스템", description="봇의 모든 상태를 확인하고 제어합니다.", color=0x2E3136)
-    
     trade_mode_text = "🔴 **실시간 매매**" if not config.is_testnet else "🟢 **테스트넷**"
     auto_trade_text = "✅ **자동매매 ON**" if config.exec_active else "❌ **자동매매 OFF**"
     adaptive_text = "🧠 **자동 조절 ON**" if config.adaptive_aggr_enabled else "👤 **수동 설정**"
     embed.add_field(name="[핵심 상태]", value=f"{trade_mode_text}\n{auto_trade_text}\n{adaptive_text}", inline=True)
-
     symbols_text = f"**{', '.join(config.symbols)}**"
     base_aggr_text = f"**Level {config.aggr_level}**"
     current_aggr_text = f"**Level {current_aggr_level}**"
@@ -131,36 +129,28 @@ def get_panel_embed() -> discord.Embed:
         status = " (⚠️위험)" if current_aggr_level < config.aggr_level else " (📈안정)"
         current_aggr_text += status
     embed.add_field(name="[현재 전략]", value=f"분석 대상: {symbols_text}\n기본 공격성: {base_aggr_text}\n현재 공격성: {current_aggr_text}", inline=True)
-    
     try:
         with db_manager.get_session() as session:
             open_positions_count = session.query(Trade).filter(Trade.status == "OPEN").count()
         embed.add_field(name="[포트폴리오]", value=f"**{open_positions_count} / {config.max_open_positions}** 포지션 운영 중", inline=False)
-
         positions = binance_client.futures_position_information()
         open_positions = [p for p in positions if float(p.get('positionAmt', 0)) != 0]
-
         if not open_positions:
             embed.add_field(name="[오픈된 포지션]", value="현재 오픈된 포지션이 없습니다.", inline=False)
         else:
             for pos in open_positions:
-                symbol = pos['symbol']
-                side = "LONG" if float(pos['positionAmt']) > 0 else "SHORT"
-                quantity = abs(float(pos['positionAmt']))
-                entry_price = float(pos['entryPrice'])
-                unrealized_pnl = float(pos['unRealizedProfit'])
-                pnl_color = "📈" if unrealized_pnl >= 0 else "📉"
-                leverage = int(pos.get('leverage', 1))
-                margin = float(pos.get('isolatedWallet', 0))
-                pnl_percent = (unrealized_pnl / margin * 100) if margin > 0 else 0.0
+                symbol, side = pos['symbol'], "LONG" if float(pos['positionAmt']) > 0 else "SHORT"
+                quantity, entry_price, pnl = abs(float(pos['positionAmt'])), float(pos['entryPrice']), float(pos['unRealizedProfit'])
+                pnl_color, leverage = "📈" if pnl >= 0 else "📉", int(pos.get('leverage', 1))
+                margin = float(pos.get('isolatedWallet', 0)) if float(pos.get('isolatedWallet', 0)) > 0 else (quantity * entry_price / leverage)
+                pnl_percent = (pnl / margin * 100) if margin > 0 else 0.0
                 pos_value = (f"**{side}** | `{quantity}` @ `${entry_price:,.2f}` | **{leverage}x**\n"
-                             f"> PnL: `${unrealized_pnl:,.2f}` ({pnl_percent:+.2f}%) {pnl_color}")
+                             f"> PnL: `${pnl:,.2f}` ({pnl_percent:+.2f}%) {pnl_color}")
                 embed.add_field(name=f"--- {symbol} ---", value=pos_value, inline=True)
     except Exception as e:
         print(f"패널 포지션 정보 업데이트 중 오류: {e}")
         embed.add_field(name="[오픈된 포지션]", value="⚠️ 정보를 가져오는 중 오류가 발생했습니다.", inline=False)
-
-    embed.set_footer(text=f"최종 업데이트: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    embed.set_footer(text=f"최종 업데이트: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S %Z')}")
     return embed
 
 def diagnose_market_regime(session, symbol: str) -> MarketRegime:
@@ -228,47 +218,39 @@ async def panel_update_loop():
 
 
 def generate_sparkline(scores: list) -> str:
-    """점수 리스트로 텍스트 스파크라인 차트를 생성합니다."""
-    if not scores: return ""
+    """점수 리스트로 보기 좋은 텍스트 스파크라인 차트를 생성합니다."""
+    if not scores or len(scores) < 2: return "데이터 수집 중..."
     bar_chars = [' ', '▂', '▃', '▄', '▅', '▆', '▇', '█']
-    min_score, max_score = min(scores), max(scores)
-    score_range = max_score - min_score if max_score > min_score else 1
-    
-    sparkline = []
-    for score in scores:
-        index = int((score - min_score) / score_range * (len(bar_chars) - 1))
-        sparkline.append(bar_chars[index])
-        
+    min_s, max_s = min(scores), max(scores)
+    score_range = max_s - min_s if max_s > min_s else 1
+    sparkline = [bar_chars[int((s - min_s) / score_range * (len(bar_chars) - 1))] for s in scores]
     trend_emoji = "📈" if scores[-1] > scores[0] else "📉" if scores[-1] < scores[0] else "➡️"
-    return "".join(sparkline) + f" {scores[-1]:.1f} {trend_emoji}"
+    return f"`{''.join(sparkline)}` **{scores[-1]:.1f}** {trend_emoji}"
 
 
 def get_analysis_embed(session) -> discord.Embed:
-    """'라이브 종합 상황판' Embed를 생성합니다."""
+    """[V4 최종] '라이브 종합 상황판' Embed를 생성합니다."""
     embed = discord.Embed(title="📊 라이브 종합 상황판", color=0x4A90E2)
+    btc_market_regime = diagnose_market_regime(session, "BTCUSDT")
+    embed.description = f"현재 BTC 시장을 **{btc_market_regime.value}** (으)로 판단하고 있습니다."
     
     for symbol in config.symbols:
-        # 시장 체제 진단
-        market_regime = diagnose_market_regime(session, symbol)
-        
-        # 스코어 흐름 (최근 10분)
-        lookback_time = datetime.now(timezone.utc) - timedelta(minutes=10)
-        recent_signals = session.execute(
-            select(Signal.final_score)
-            .where(Signal.symbol == symbol, Signal.timestamp >= lookback_time)
-            .order_by(Signal.timestamp.asc())
-        ).scalars().all()
-        
-        sparkline = generate_sparkline(recent_signals)
-        
-        # 현재 분석 스냅샷
+        lookback_time = datetime.now(timezone.utc) - timedelta(minutes=15)
+        recent_scores = session.execute(select(Signal.final_score).where(Signal.symbol == symbol, Signal.timestamp >= lookback_time).order_by(Signal.timestamp.asc())).scalars().all()
+        sparkline = generate_sparkline(recent_scores)
         latest_signal_tuple = session.execute(select(Signal).where(Signal.symbol == symbol).order_by(Signal.id.desc())).first()
         latest_signal = latest_signal_tuple[0] if latest_signal_tuple else None
-        score_text = f"**{latest_signal.final_score:.2f}**" if latest_signal else "N/A"
-        embed.add_field(name=f"{symbol} | {market_regime.value}", value=f"스코어 흐름: {sparkline}\n현재 점수: {score_text}", inline=False)
-    embed.set_footer(text=f"최종 업데이트: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        
+        value_text = f"**스코어 흐름 (15분):** {sparkline}\n"
+        if latest_signal:
+            score_color = "🟢" if latest_signal.final_score > 0 else "🔴" if latest_signal.final_score < 0 else "⚪"
+            value_text += f"**현재 점수:** {score_color} **{latest_signal.final_score:.2f}**"
+        else:
+            value_text += "**현재 점수:** 데이터 없음"
+            
+        embed.add_field(name=f"--- {symbol} ---", value=value_text, inline=False)
+    embed.set_footer(text=f"최종 업데이트: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S %Z')}")
     return embed
-
 
 @tasks.loop(minutes=1)
 async def data_collector_loop():
@@ -482,23 +464,40 @@ async def close_position_kr(interaction: discord.Interaction, 코인: str):
 # --- 봇 준비 이벤트 ---
 @bot.event
 async def on_ready():
-    """봇이 준비되었을 때 한 번 실행되는 함수"""
+    """봇이 준비되었을 때 모든 작업을 시작합니다."""
+    global panel_message
     await tree.sync()
     print(f'{bot.user.name} 봇이 준비되었습니다. 슬래시 명령어가 동기화되었습니다.')
     print('------------------------------------')
 
-    # 백그라운드 루프를 시작합니다.
+    # 1. 패널 자동 소환
+    panel_channel = bot.get_channel(config.panel_channel_id)
+    if panel_channel:
+        # 기존 패널 메시지가 있다면 삭제
+        async for msg in panel_channel.history(limit=5):
+            if msg.author == bot.user and msg.embeds and msg.embeds[0].title == "⚙️ 통합 관제 시스템":
+                try: await msg.delete()
+                except: pass
+        
+        print(f"'{panel_channel.name}' 채널에 제어 패널을 자동으로 생성합니다...")
+        view = ControlPanelView(aggr_level_callback=on_aggr_level_change)
+        panel_message = await panel_channel.send(embed=get_panel_embed(), view=view)
+        
+        if not panel_update_loop.is_running():
+            panel_update_loop.start()
+    else:
+        print("경고: .env에 설정된 DISCORD_PANEL_CHANNEL_ID를 찾을 수 없어 패널을 자동으로 시작할 수 없습니다.")
+
+    # 2. 백그라운드 루프 시작
     if not data_collector_loop.is_running():
         data_collector_loop.start()
     
-    # data_collector가 데이터를 먼저 쌓을 수 있도록 잠시 기다립니다.
     await asyncio.sleep(5) 
     
     if not trading_decision_loop.is_running():
         trading_decision_loop.start()
 
-    print("모든 준비 완료. `/패널` 명령어를 사용하여 제어실을 소환하세요.")
-
+    print("모든 준비 완료. 디스코드 채널을 확인하세요.")
 # --- 봇 실행 ---
 if __name__ == "__main__":
     if not config.discord_bot_token:
