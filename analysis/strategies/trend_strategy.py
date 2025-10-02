@@ -1,27 +1,29 @@
-# 파일명: analysis/strategies/trend_strategy.py
+# analysis/strategies/trend_strategy.py (설정 파일 적용)
 
 import pandas as pd
 from .base_strategy import BaseStrategy
 
 class TrendStrategy(BaseStrategy):
-    """
-    EMA 크로스오버와 배열을 기반으로 추세의 방향과 강도를 분석하여 점수를 반환합니다.
-    """
     name = "추세 전략"
 
+    def __init__(self, params: dict):
+        self.ema_short = params.get("ema_short", 20)
+        self.ema_long = params.get("ema_long", 50)
+        self.score = params.get("score_strong_trend", 2)
+        # EMA 컬럼명을 동적으로 생성
+        self.ema_short_col = f"EMA_{self.ema_short}"
+        self.ema_long_col = f"EMA_{self.ema_long}"
+
     def analyze(self, data: pd.DataFrame) -> dict:
-        """EMA 배열을 분석하여 추세 점수를 계산합니다."""
         scores = {"추세": 0}
         last = data.iloc[-1]
 
-        # 데이터 유효성 검사
-        if pd.isna(last.get("EMA_20")) or pd.isna(last.get("EMA_50")):
+        if pd.isna(last.get(self.ema_short_col)) or pd.isna(last.get(self.ema_long_col)):
             return scores
 
-        # EMA 정배열/역배열에 따른 점수 부여
-        if last["close"] > last["EMA_20"] > last["EMA_50"]:
-            scores["추세"] = 2  # 강한 상승 추세
-        elif last["close"] < last["EMA_20"] < last["EMA_50"]:
-            scores["추세"] = -2 # 강한 하락 추세
+        if last["close"] > last[self.ema_short_col] > last[self.ema_long_col]:
+            scores["추세"] = self.score
+        elif last["close"] < last[self.ema_short_col] < last[self.ema_long_col]:
+            scores["추세"] = -self.score
 
         return scores
