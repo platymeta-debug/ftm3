@@ -1,12 +1,7 @@
-"""Risk management helper for determining order quantities."""
-
 from typing import Optional
-
 from binance.client import Client
 from binance.exceptions import BinanceAPIException
-
 from core.config_manager import config
-
 
 class PositionSizer:
     def __init__(self, client: Client):
@@ -14,78 +9,55 @@ class PositionSizer:
         print("포지션 사이저가 초기화되었습니다.")
 
     def _get_usdt_balance(self) -> float:
-        """바이낸스 선물 계좌의 USDT 잔고를 조회합니다."""
         try:
-            account_info = self.client.futures_account_balance()
-            for asset in account_info:
-                if asset.get("asset") == "USDT":
-                    return float(asset.get("balance", 0))
+            balances = self.client.futures_account_balance()
+            for balance in balances:
+                if balance['asset'] == 'USDT':
+                    return float(balance['balance'])
             return 0.0
-        except BinanceAPIException as exc:
-            print(f"계좌 잔고 조회 실패: {exc}")
-            return 0.0
-        except Exception as exc:
-            print(f"계좌 잔고 조회 중 알 수 없는 오류: {exc}")
+        except BinanceAPIException as e:
+            print(f"계좌 잔고 조회 실패: {e}")
             return 0.0
 
-    def _get_mark_price(self, symbol: str) -> Optional[float]:
-        try:
-            mark_price = self.client.futures_mark_price(symbol=symbol)
-            return float(mark_price.get("markPrice"))
-        except BinanceAPIException as exc:
-            print(f"마크 가격 조회 실패: {exc}")
-        except Exception as exc:
-            print(f"마크 가격 조회 중 알 수 없는 오류: {exc}")
-        return None
+    def get_leverage_for_symbol(self, symbol: str, aggr_level: int) -> int:
+        symbol_leverage_map = config.leverage_map.get(symbol, config.leverage_map.get("BTCUSDT"))
+        if 1 <= aggr_level <= 4:
+            return symbol_leverage_map["LOW"]
+        elif 5 <= aggr_level <= 7:
+            return symbol_leverage_map["MID"]
+        else: # 8 to 10
+            return symbol_leverage_map["HIGH"]
 
-    def calculate_position_size(
-        self, symbol: str, entry_price: float, atr: float
-    ) -> Optional[float]:
-        """
-        리스크 설정에 기반하여 동적으로 포지션 크기(수량)를 계산합니다.
-
-        :return: 계산된 주문 수량 또는 계산 불가 시 None
-        """
+    def calculate_position_size(self, symbol: str, atr: float, aggr_level: int) -> Optional[float]:
         account_balance = self._get_usdt_balance()
-        if account_balance <= 0:
-            print("계산 불가: 잔고가 0 이하입니다.")
+        if account_balance <= 0 or atr <= 0:
+            print(f"계산 불가: 잔고({account_balance}) 또는 ATR({atr})이 유효하지 않습니다.")
             return None
 
-        if atr is None or atr <= 0:
-            print("계산 불가: ATR이 0 이하입니다.")
-            return None
-
-        max_risk_per_trade = account_balance * config.risk_target_pct
+        risk_multiplier = 1 + ((aggr_level - 5) / 10.0) # Level 5=1.0x, 1=0.6x, 10=1.5x
+        dynamic_risk_pct = config.risk_target_pct * risk_multiplier
+        max_risk_per_trade = account_balance * dynamic_risk_pct
+        
         stop_loss_distance = atr * config.sl_atr_multiplier
-
-        price = entry_price
-        if price is None or price <= 0:
-            mark_price = self._get_mark_price(symbol)
-            if mark_price is None or mark_price <= 0:
-                print(f"가격 조회 실패로 수량 계산 불가: {symbol}")
-                return None
-            price = mark_price
-
         if stop_loss_distance <= 0:
-            print("계산 불가: 손절매 거리가 0 이하입니다.")
+            print("계산 불가: 손절 거리가 0 이하입니다.")
             return None
-
+            
         quantity = max_risk_per_trade / stop_loss_distance
 
-        if quantity <= 0:
-            print("계산 불가: 계산된 수량이 0 이하입니다.")
+        try:
+            info = self.client.futures_exchange_info()
+            for s in info['symbols']:
+                if s['symbol'] == symbol:
+                    precision = s['quantityPrecision']
+                    rounded_quantity = round(quantity, precision)
+                    if rounded_quantity <= 0:
+                        print("계산 불가: 반올림된 수량이 0 이하입니다.")
+                        return None
+                    print(f"동적 수량 계산(Lvl:{aggr_level}): 리스크=${max_risk_per_trade:,.2f} -> 수량={rounded_quantity}")
+                    return rounded_quantity
+        except Exception as e:
+            print(f"수량 정밀도 조회 실패: {e}")
             return None
-
-        precision = 3
-        rounded_quantity = round(quantity, precision)
-
-        if rounded_quantity <= 0:
-            print("계산 불가: 반올림된 수량이 0 이하입니다.")
-            return None
-
-        print(
-            "동적 수량 계산: 잔고=${:,.2f}, 리스크=${:,.2f}, ATR=${:,.2f}, 가격=${:,.2f} -> 수량={}".format(
-                account_balance, max_risk_per_trade, atr, price, rounded_quantity
-            )
-        )
-        return rounded_quantity
+        
+        return None
