@@ -10,9 +10,10 @@ if TYPE_CHECKING:
 class ControlPanelView(discord.ui.View):
     """V3: 봇의 상태를 제어하는 동적 인터랙티브 패널"""
 
-    def __init__(self, aggr_level_callback: 'on_aggr_level_change'):
+    def __init__(self, aggr_level_callback: 'on_aggr_level_change', trading_engine: 'TradingEngine'):
         super().__init__(timeout=None)
         self.aggr_level_callback = aggr_level_callback
+        self.trading_engine = trading_engine # trading_engine 인스턴스 저장
         self._update_adaptive_button()
 
     def _update_adaptive_button(self):
@@ -58,9 +59,13 @@ class ControlPanelView(discord.ui.View):
 
     @discord.ui.button(label="🚨 긴급 전체 청산", style=discord.ButtonStyle.danger, custom_id="panic_close_all", row=2)
     async def panic_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        # 이벤트 버스를 통해 긴급 청산 신호 발행
-        await interaction.response.send_message("🚨 긴급 전체 청산 신호를 보냈습니다. 결과를 확인해주세요.", ephemeral=True)
-        # event_bus.publish(...) # 추후 직접 청산 로직으로 강화 가능
+        await interaction.response.defer(ephemeral=True) # 응답 시간을 확보
+        closed_positions = await self.trading_engine.close_all_positions()
+        
+        if closed_positions:
+            await interaction.followup.send(f"✅ **긴급 전체 청산 신호를 보냈습니다.**\n> 대상: `{', '.join(closed_positions)}`", ephemeral=True)
+        else:
+            await interaction.followup.send("⚠️ 청산할 포지션이 없습니다.", ephemeral=True)
 
 
 # --- ▼▼▼ [Discord V3] 파일 끝에 아래 클래스 추가 ▼▼▼ ---
