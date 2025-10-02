@@ -29,6 +29,7 @@ class Trade(Base):
     binance_order_id = Column(Integer, unique=True)
     symbol = Column(String)
     side = Column(String)
+    leverage = Column(Integer) # 주문 시 설정한 레버리지
     quantity = Column(Float)
     entry_price = Column(Float)
     entry_atr = Column(Float)
