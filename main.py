@@ -11,11 +11,15 @@ import statistics
 
 # 1. 모듈 임포트
 from core.config_manager import config
-from database.manager import db_manager, Signal, Trade
+from core.event_bus import event_bus
+# --- ▼▼▼ 수정된 부분 ▼▼▼ ---
+from database.manager import db_manager
+from database.models import Signal, Trade # Signal과 Trade를 models.py에서 가져오도록 수정
+# --- ▲▲▲ 수정된 부분 ▲▲▲ ---
 from execution.trading_engine import TradingEngine
 from analysis.confluence_engine import ConfluenceEngine
 from risk_management.position_sizer import PositionSizer
-from ui.views import ControlPanelView, ConfirmView # ConfirmView 임포트 추가
+from ui.views import ControlPanelView, ConfirmView
 
 # 2. 초기화 (기존과 동일)
 intents = discord.Intents.default()
