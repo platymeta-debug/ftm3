@@ -28,7 +28,7 @@ class PositionSizer:
         else: # 8 to 10
             return symbol_leverage_map["HIGH"]
 
-    def calculate_position_size(self, symbol: str, atr: float, aggr_level: int) -> Optional[float]:
+    def calculate_position_size(self, symbol: str, aggr_level: int, atr: float) -> Optional[float]:
         account_balance = self._get_usdt_balance()
         if account_balance <= 0 or atr <= 0:
             print(f"계산 불가: 잔고({account_balance}) 또는 ATR({atr})이 유효하지 않습니다.")

@@ -1,8 +1,6 @@
 from typing import Optional
-from datetime import datetime
 from binance.client import Client
 from binance.exceptions import BinanceAPIException
-from core.event_bus import event_bus
 from database.manager import db_manager, Signal, Trade
 
 class TradingEngine:
@@ -11,38 +9,49 @@ class TradingEngine:
         print("트레이딩 엔진이 초기화되었습니다.")
 
     async def place_order(
-        self, symbol: str, side: str, quantity: float, leverage: int, atr: float, analysis_context: dict
+        self, symbol: str, side: str, quantity: float, analysis_context: dict
     ) -> None:
         session = db_manager.get_session()
-        new_signal: Optional[Signal] = None
         try:
-            # 1. 신호 DB 기록 (기존과 동일)
-            new_signal = Signal(**analysis_context) # analysis_context에 모든 정보 담기
-            session.add(new_signal)
-            session.commit()
+            signal_id = analysis_context.get("signal_id")
+            linked_signal: Optional[Signal] = None
+            if signal_id:
+                linked_signal = session.get(Signal, signal_id)
+                if linked_signal is None:
+                    print(f"⚠️ 연관 신호(ID={signal_id})를 찾을 수 없어 새 거래와 연결하지 않습니다.")
 
-            # 2. 레버리지 설정
-            print(f"레버리지 설정 시도: {symbol} {leverage}x")
-            self.client.futures_change_leverage(symbol=symbol, leverage=leverage)
+            leverage = analysis_context.get("leverage")
+            if leverage:
+                try:
+                    print(f"레버리지 설정 시도: {symbol} {leverage}x")
+                    self.client.futures_change_leverage(symbol=symbol, leverage=int(leverage))
+                except BinanceAPIException as leverage_err:
+                    print(f"레버리지 설정 실패: {leverage_err}")
 
-            # 3. 주문 실행
+            # 주문 실행
             order_params = {"symbol": symbol, "side": side, "type": "MARKET", "quantity": quantity, "newOrderRespType": "RESULT"}
             binance_order = self.client.futures_create_order(**order_params)
 
-            # 4. 거래 DB 기록 (entry_atr 추가)
-            entry_price = float(binance_order.get("avgPrice", 0.0))
+            # 거래 DB 기록 (entry_atr 및 최고가 초기화)
+            avg_price = binance_order.get("avgPrice") or binance_order.get("price")
+            entry_price = float(avg_price) if avg_price not in (None, "") else 0.0
+            trade_qty = binance_order.get("origQty", quantity)
+            linked_signal_id = linked_signal.id if linked_signal else None
             new_trade = Trade(
-                signal_id=new_signal.id,
+                signal_id=linked_signal_id,
                 binance_order_id=binance_order.get("orderId"),
-                symbol=symbol, side=side, quantity=quantity,
+                symbol=symbol,
+                side=side,
+                quantity=float(trade_qty),
                 entry_price=entry_price,
                 status="OPEN",
-                entry_atr=atr # 진입 시점 ATR 기록
+                entry_atr=analysis_context.get("entry_atr"),
+                highest_price_since_entry=entry_price
             )
             session.add(new_trade)
             session.commit()
             print(f"✅ 주문 성공 및 DB 기록 완료: {symbol} {side} {quantity}")
-            
+
             # ... (이벤트 발행은 기존과 동일)
 
         except Exception as exc:

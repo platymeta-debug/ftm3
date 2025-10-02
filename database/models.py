@@ -27,6 +27,7 @@ class Trade(Base):
     side = Column(String)
     quantity = Column(Float)
     entry_price = Column(Float)
+    highest_price_since_entry = Column(Float)
     exit_price = Column(Float)
     pnl = Column(Float)
     entry_time = Column(DateTime, default=datetime.utcnow)
