@@ -23,14 +23,23 @@ class ConfluenceEngine:
         self.client = client
         self.fear_and_greed_index = 50
 
-        # --- ▼▼▼ [Phase 2 수정] 필터 전략 추가 ▼▼▼ ---
-        self.strategies = [
-            TrendStrategy(),
-            OscillatorStrategy(),
-        ]
-        self.filter = SignalFilterStrategy() # 필터는 별도로 관리
-        print(f"✅ [Phase 2] {len(self.strategies)}개 분석 전략, 1개 신호 필터가 로드되었습니다.")
-        # --- ▲▲▲ [Phase 2 수정] ▲▲▲ ---
+        # --- ▼▼▼ [시즌 2 수정] 설정 파일을 읽어 전략 인스턴스 생성 ▼▼▼ ---
+        self.strategies = []
+        strategy_classes = {
+            "TrendStrategy": TrendStrategy,
+            "OscillatorStrategy": OscillatorStrategy,
+        }
+
+        for name, cls in strategy_classes.items():
+            strategy_config = config.strategy_configs.get(name, {})
+            if strategy_config.get("enabled", False):
+                self.strategies.append(cls(params=strategy_config))
+            else:
+                print(f"INFO: '{name}' 전략이 비활성화되어 로드하지 않습니다.")
+
+        self.filter = SignalFilterStrategy()
+        print(f"✅ [시즌 2] {len(self.strategies)}개 분석 전략, 1개 신호 필터가 로드되었습니다.")
+        # --- ▲▲▲ [시즌 2 수정] ▲▲▲ ---
 
     def analyze_and_decide(self, symbol: str, recent_scores: List[float]) -> Tuple[Optional[str], str, Optional[dict]]:
         """모든 분석과 필터링을 종합하여 최종 매매 방향, 결정 사유, 주문 컨텍스트를 반환합니다."""
