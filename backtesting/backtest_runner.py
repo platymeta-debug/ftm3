@@ -1,5 +1,5 @@
 # backtesting/backtest_runner.py (V23 - 최신 두뇌 탑재)
-
+import os
 import pandas as pd
 from backtesting import Strategy
 from backtesting.lib import FractionalBacktest
@@ -13,6 +13,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from analysis.confluence_engine import ConfluenceEngine
 from analysis.data_fetcher import fetch_klines
 from core.config_manager import config
+from backtesting.performance_visualizer import create_performance_report
 
 class StrategyRunner(Strategy):
     # 최적화할 파라미터들
@@ -60,28 +61,38 @@ class StrategyRunner(Strategy):
                 if tp_price > 0: self.sell(sl=sl_price, tp=tp_price, size=0.1)
 
 if __name__ == '__main__':
-    # ... (실행 부분은 거의 동일) ...
-    binance_client = Client(config.api_key, config.api_secret, testnet=config.is_testnet)
-    symbol = "ETHUSDT" # 테스트를 위해 ETH만 실행
-    
-    print(f"\n{'='*50}\n🚀 {symbol}에 대한 최적화를 시작합니다...\n{'='*50}")
-    klines_data = fetch_klines(binance_client, symbol, "1d", limit=500)
-    
+    # ... (상단 binance_client, symbol, klines_data 부분은 동일) ...
+
     if klines_data is not None and not klines_data.empty:
-        data_for_bt = prepare_data_for_backtesting(klines_data)
-        bt = FractionalBacktest(data_for_bt, StrategyRunner, cash=10_000, commission=.002, finalize_trades=True)
-        
+        klines_data.columns = [col.capitalize() for col in klines_data.columns]
+        bt = Backtest(klines_data, StrategyRunner, cash=10_000, commission=.002)
+
+        # ▼▼▼ [개선] 결과물 저장 폴더 지정 ▼▼▼
+        results_folder = "backtesting/results"
+        os.makedirs(results_folder, exist_ok=True) # 폴더가 없으면 자동 생성
+
+        chart_filename = os.path.join(results_folder, f"{symbol}_performance_chart.png")
+        report_filename = os.path.join(results_folder, f"{symbol}_backtest_report.html")
+        # ▲▲▲ [개선] ▲▲▲
+
         stats = bt.optimize(
-            open_threshold=range(4, 13, 2),
-            risk_reward_ratio=[1.5, 2.0, 2.5],
+            open_threshold=range(8, 15, 2),
+            risk_reward_ratio=[2.0, 2.5, 3.0],
             maximize='Equity Final [$]'
         )
-        
+
         print(f"\n--- [{symbol}] 최적화 결과 ---")
         print("\n✅ 가장 성과가 좋았던 파라미터 조합:")
         print(stats._strategy)
-        print("\n📊 상세 성과:")
-        print(stats)
-        
-        bt.plot(filename=f"{symbol}_strategy_pattern_result.html")
-        print(f"\n📈 {symbol}_strategy_pattern_result.html 파일에 상세 차트가 저장되었습니다.")
+
+        report_text, chart_buffer = create_performance_report(stats)
+
+        print("\n" + report_text)
+
+        if chart_buffer:
+            with open(chart_filename, "wb") as f: # <--- 수정된 경로 사용
+                f.write(chart_buffer.getbuffer())
+            print(f"\n📈 {chart_filename} 파일에 상세 차트가 저장되었습니다.") # <--- 수정된 경로 사용
+
+        bt.plot(filename=report_filename) # <--- 수정된 경로 사용
+        print(f"\n📄 {report_filename} 파일에 상세 리포트가 저장되었습니다.") # <--- 수정된 경로 사용
