@@ -62,6 +62,8 @@ class ConfigManager:
         self.aggr_level = self._get_int("AGGR_LEVEL", 3)
         self.risk_target_pct = self._get_float("RISK_TARGET_PCT", 0.02)
         self.sl_atr_multiplier = self._get_float("SL_ATR_MULTIPLIER", 1.5)
+        self.volume_spike_factor = self._get_float("VOLUME_SPIKE_FACTOR", 1.5) # 거래량 급증 기준 (배수)
+        self.max_volatility_ratio = self._get_float("MAX_VOLATILITY_RATIO", 0.05) # 최대 변동성 기준 (ATR/현재가)
 
         # Risk Scales
         self.risk_scale_high = self._get_float("RISK_SCALE_HIGH_CONFIDENCE", 1.5)
