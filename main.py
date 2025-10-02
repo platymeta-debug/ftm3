@@ -370,29 +370,35 @@ def get_analysis_embed(session) -> discord.Embed:
 
 @tasks.loop(minutes=1)
 async def data_collector_loop():
-    """[V5.9 최종] 분석 결과를 받아 상황판 메시지를 생성하거나 업데이트합니다."""
+    """[V7] 분석 엔진을 호출하고 결과를 DB와 전역 변수에 저장합니다."""
     global analysis_message, latest_analysis_results
-    print(f"\n--- [Data Collector] 분석 시작 ---")
-    session = db_manager.get_session()
-    try:
+    with db_manager.get_session() as session:
         for symbol in config.symbols:
-            # 분석 엔진 호출
-            final_score, tf_scores, tf_rows, tf_breakdowns, fng_index, confluence = confluence_engine.analyze(symbol)
-
-            # 분석 결과 저장
+            analysis_result = confluence_engine.analyze_symbol(symbol)
+            if not analysis_result: continue
+            
+            final_score, tf_scores, tf_rows, tf_breakdowns, fng_index, confluence = analysis_result
+            
+            # 전역 변수 업데이트 (Discord UI용)
+            indicator_data = pd.Series({
+                'adx_4h': tf_rows.get("4h", {}).get('ADX_14'),
+                'is_above_ema200_1d': tf_rows.get("1d", {}).get('is_above_ema200')
+            })
             latest_analysis_results[symbol] = {
                 "final_score": final_score, "tf_rows": tf_rows,
-                "tf_breakdowns": tf_breakdowns, "market_regime": diagnose_market_regime(session, symbol),
+                "tf_breakdowns": tf_breakdowns, 
+                "market_regime": diagnose_market_regime(indicator_data, config.market_regime_adx_th),
                 "fng_index": fng_index, "confluence": confluence
             }
-            # DB에 Signal 정보 저장
-            # ... (기존의 new_signal 생성 및 session.add(new_signal) 로직) ...
+            
+            # DB에 Signal 정보 저장 (main.py의 핵심 역할)
+            new_signal = Signal(
+                symbol=symbol,
+                final_score=final_score,
+                # ( ... 기타 점수 및 데이터 저장 ... )
+            )
+            session.add(new_signal)
         session.commit()
-    except Exception as e:
-        print(f"🚨 데이터 수집 중 오류: {e}")
-        session.rollback()
-    finally:
-        session.close()
 
     # --- 상황판 업데이트 로직 ---
     try:
@@ -501,37 +507,24 @@ async def find_new_entry_opportunities(session, open_positions_count, symbols_in
     for symbol in config.symbols:
         if symbol in symbols_in_trade: continue
 
-        # 1. 판단에 필요한 과거 신호 데이터를 DB에서 가져옵니다.
         recent_signals = session.execute(
             select(Signal).where(Signal.symbol == symbol).order_by(Signal.id.desc()).limit(config.trend_entry_confirm_count)
         ).scalars().all()
 
-        # [수정] Signal 객체 리스트 대신, 점수 리스트만 추출하여 전달합니다.
-        recent_scores = [s.final_score for s in recent_signals]
-
-        # 2. '두뇌'에게 분석 및 최종 결정을 요청합니다.
-        side, decision_reason, context = confluence_engine.analyze_and_decide(symbol, recent_scores)
+        side, decision_reason, context = confluence_engine.analyze_and_decide(symbol, recent_signals)
         
-        # 3. '두뇌'가 진입 결정을 내렸을 경우에만 주문을 실행합니다.
-        if side:
-            # 주문에 필요한 파라미터를 계산합니다 (이 부분은 기존 로직 활용)
-            params = config.get_strategy_params(symbol)
+        if side and context:
             leverage = position_sizer.get_leverage_for_symbol(symbol, current_aggr_level)
-            avg_score = statistics.mean([s.final_score for s in recent_signals])
-            entry_atr = confluence_engine.extract_atr(confluence_engine.analyze_symbol(symbol)[2]) # 약간 복잡하지만, 분석 결과에서 atr 추출
-            
             quantity = position_sizer.calculate_position_size(
-                symbol, entry_atr, current_aggr_level, open_positions_count, avg_score
+                symbol, context['entry_atr'], current_aggr_level, open_positions_count, context['avg_score']
             )
-
             if quantity:
-                analysis_context = {"signal_id": recent_signals[0].id if recent_signals else None}
-                await trading_engine.place_order_with_bracket(symbol, side, quantity, leverage, entry_atr, analysis_context)
-                return decision_reason # "🚀 [BTCUSDT] BUY 진입 결정!..."
+                await trading_engine.place_order_with_bracket(symbol, side, quantity, leverage, context['entry_atr'], context)
+                return decision_reason
             else:
                 decision_reason = f"[{symbol}]: 포지션 규모 계산 실패."
 
-    return decision_reason # 최종 결정 사유 반환
+    return decision_reason
             
 # --- ▼▼▼ [V4.1] 이벤트 핸들러 루프 추가 ▼▼▼ ---
 async def event_handler_loop():
