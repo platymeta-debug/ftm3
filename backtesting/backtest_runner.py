@@ -1,7 +1,7 @@
 # backtesting/backtest_runner.py (V23 - 최신 두뇌 탑재)
 import os
 import pandas as pd
-from backtesting import Strategy
+from backtesting import Backtest, Strategy
 from backtesting.lib import FractionalBacktest
 from binance.client import Client
 import sys, os, contextlib, io
@@ -9,10 +9,9 @@ from collections import deque
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-# 이제 ConfluenceEngine을 직접 사용합니다.
 from analysis.confluence_engine import ConfluenceEngine
 from analysis.data_fetcher import fetch_klines
-from core.config_manager import config
+from core.config_manager import config # <--- config 임포트 추가
 from backtesting.performance_visualizer import create_performance_report
 
 class StrategyRunner(Strategy):
