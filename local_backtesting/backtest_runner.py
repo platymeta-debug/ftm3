@@ -25,19 +25,27 @@ class StrategyRunner(Strategy):
     trend_entry_confirm_count = 3
 
     def init(self):
-        # ConfluenceEngine은 순수 계산용으로만 사용 (API 호출 X)
+        # ▼▼▼ [진단 코드 추가] ▼▼▼
+        print("[StrategyRunner] init() 메소드 시작.")
         self.engine = ConfluenceEngine(Client("", ""))
         self.recent_scores = deque(maxlen=self.trend_entry_confirm_count)
-        # 백테스팅 시작 시 모든 지표를 한 번만 미리 계산하여 성능 향상
+        
+        # 데이터가 비어 있는지 확인
+        if self.data.df.empty:
+            print("[StrategyRunner] 오류: init()에서 데이터프레임이 비어있습니다.")
+            return
+
         self.indicators = indicator_calculator.calculate_all_indicators(self.data.df)
+        print(f"[StrategyRunner] init() 완료. 지표 계산 완료. (총 {len(self.indicators)}개 데이터)")
+        # ▲▲▲ [진단 코드 추가] ▲▲▲
 
     def next(self):
         # self.i는 현재 캔들(시간)의 인덱스를 가리킴
-        if self.i < self.trend_entry_confirm_count:
+        if self.I < self.trend_entry_confirm_count:
             return
 
         # 현재 시점까지의 데이터로 점수 계산 (미리 계산된 지표 사용)
-        current_indicators = self.indicators.iloc[:self.i + 1]
+        current_indicators = self.indicators.iloc[:self.I + 1]
         if current_indicators.empty: return
 
         final_score, _ = self.engine._calculate_tactical_score(current_indicators)
@@ -53,7 +61,7 @@ class StrategyRunner(Strategy):
 
         # 주문 실행
         if side and not self.position:
-            last_row = self.indicators.iloc[self.i] # 현재 캔들의 지표
+            last_row = self.indicators.iloc[self.I] # 현재 캔들의 지표
             entry_atr = last_row.get("ATRr_14", last_row.get("ATR_14", 0))
             if not entry_atr or entry_atr <= 0: return
 
