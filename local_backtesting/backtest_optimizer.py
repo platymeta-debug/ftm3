@@ -1,4 +1,4 @@
-# local_backtesting/backtest_optimizer.py (최종 완성본 - 타입 오류 해결)
+# local_backtesting/backtest_optimizer.py (최종 완성본 - 누락된 인자 전달 오류 해결)
 
 import pandas as pd
 import json
@@ -9,6 +9,7 @@ from collections import deque
 import sys
 import os
 from datetime import timedelta
+from tqdm import tqdm
 
 # --- 프로젝트 경로 설정 ---
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
@@ -20,10 +21,29 @@ from analysis.confluence_engine import ConfluenceEngine
 from analysis.macro_analyzer import MacroAnalyzer
 from core.config_manager import config
 
-# (segment_data_by_regime 함수는 이전과 동일)
-def segment_data_by_regime(klines_df: pd.DataFrame) -> dict:
-    return {} # Placeholder for brevity
+def segment_data_by_regime(klines_df: pd.DataFrame, macro_data: dict) -> dict:
+    print("\n...과거 데이터 전체에 대한 거시 경제 분석을 시작합니다...")
+    macro_analyzer = MacroAnalyzer()
+    regime_periods = []
+    
+    for date in tqdm(klines_df.index, desc="과거 시장 상황 분석 중"):
+        # --- ▼▼▼ [수정] 누락되었던 macro_data 인자 전달 ▼▼▼ ---
+        regime, _, _ = macro_analyzer.diagnose_macro_regime_for_date(date, macro_data)
+        # --- ▲▲▲ [수정] ---
+        regime_periods.append(regime.name)
+    
+    klines_df['Regime'] = regime_periods
+    
+    segmented_data = {
+        "BULL": klines_df[klines_df['Regime'] == 'BULL'],
+        "BEAR": klines_df[klines_df['Regime'] == 'BEAR'],
+    }
+    print("...거시 경제 분석 및 데이터 구간 선별 완료!")
+    print(f"   - 강세장(BULL) 데이터: {len(segmented_data['BULL'])}개 캔들")
+    print(f"   - 약세장(BEAR) 데이터: {len(segmented_data['BEAR'])}개 캔들")
+    return segmented_data
 
+# (OptoRunner 클래스는 이전과 동일)
 class OptoRunner(Strategy):
     open_threshold = 12.0
     risk_reward_ratio = 2.5
@@ -34,12 +54,8 @@ class OptoRunner(Strategy):
 
     def init(self):
         self.engine = ConfluenceEngine(Client("", ""))
-        if self.data.df.empty: return
         self.indicators = indicator_calculator.calculate_all_indicators(self.data.df)
-        
-        # --- ▼▼▼ [수정] numpy int 타입을 표준 int 타입으로 변환하여 오류 해결 ▼▼▼ ---
         self.recent_scores = deque(maxlen=int(self.trend_entry_confirm_count))
-        # --- ▲▲▲ [수정] ---
 
     def next(self):
         current_index = len(self.data) - 1
@@ -64,6 +80,7 @@ class OptoRunner(Strategy):
 
             stop_loss_distance = entry_atr * self.sl_atr_multiplier
             take_profit_distance = stop_loss_distance * self.risk_reward_ratio
+            trade_size = 0.50
             
             current_price = self.data.Close[-1]
             sl_price, tp_price = 0, 0
@@ -77,9 +94,8 @@ class OptoRunner(Strategy):
 
             if sl_price <= 0 or tp_price <= 0: return
 
-            if side == "BUY": self.buy(sl=sl_price, tp=tp_price, size=0.95)
-            else: self.sell(sl=sl_price, tp=tp_price, size=0.95)
-
+            if side == "BUY": self.buy(sl=sl_price, tp=tp_price, size=trade_size)
+            else: self.sell(sl=sl_price, tp=tp_price, size=trade_size)
 
 if __name__ == '__main__':
     symbols_to_optimize = ["BTCUSDT", "ETHUSDT"]
@@ -90,18 +106,24 @@ if __name__ == '__main__':
         with open(results_file, 'r', encoding='utf-8') as f: all_settings = json.load(f)
     except (FileNotFoundError, json.JSONDecodeError): all_settings = {}
 
+    macro_analyzer_preload = MacroAnalyzer()
+    preloaded_macro_data = macro_analyzer_preload.preload_all_macro_data()
+
     for symbol in symbols_to_optimize:
-        print(f"\n🚀 **{symbol}** 최적화 시작...")
-        klines_data = data_fetcher.fetch_klines(binance_client, symbol, "1d", limit=1000)
-        if klines_data is None or klines_data.empty: continue
+        print(f"\n\n{'='*50}\n🚀 **{symbol}** 자동 최적화 시작...\n{'='*50}")
         
-        segmented_data = {"BULL": klines_data, "BEAR": klines_data} 
+        klines_data = data_fetcher.fetch_klines(binance_client, symbol, "1d", limit=1000)
+        if klines_data is None or len(klines_data) < 200: continue
+        
+        segmented_data = segment_data_by_regime(klines_data, preloaded_macro_data)
 
         for regime in ["BULL", "BEAR"]:
             print(f"\n--- 🔬 [{symbol}] '{regime}' 시장 구간 최적화 ---")
             regime_klines = segmented_data.get(regime)
-            if regime_klines is None or len(regime_klines) < 50: continue
-            
+            if regime_klines is None or len(regime_klines) < 50:
+                print(f"'{regime}' 시장 데이터가 부족하여 최적화를 건너뜁니다.")
+                continue
+
             regime_klines.columns = [col.capitalize() for col in regime_klines.columns]
             OptoRunner.symbol = symbol
             OptoRunner.market_regime = regime
