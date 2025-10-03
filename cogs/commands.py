@@ -16,9 +16,9 @@ if project_root not in sys.path:
     sys.path.insert(0, project_root)
 # ▲▲▲ [오류 수정] ▲▲▲
 
-from backtesting import Backtest
-from backtesting.backtest_runner import StrategyRunner
-from backtesting.performance_visualizer import create_performance_report
+from backtesting import Backtest  # 설치된 라이브러리, 그대로 둠
+from local_backtesting.backtest_runner import StrategyRunner
+from local_backtesting.performance_visualizer import create_performance_report
 from analysis.data_fetcher import fetch_klines
 from database.manager import db_manager
 from database.models import Trade
