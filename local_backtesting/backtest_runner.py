@@ -77,8 +77,15 @@ class StrategyRunner(Strategy):
 
 if __name__ == '__main__':
     binance_client = Client(config.api_key, config.api_secret, testnet=config.is_testnet)
-    initial_cash = 10_000
-    
+
+    try:
+        account_info = binance_client.futures_account()
+        initial_cash = float(account_info.get('totalWalletBalance', 10000))
+        print(f"💰 실제 계좌 잔고를 시작 자본금으로 설정: ${initial_cash:,.2f}")
+    except Exception as e:
+        initial_cash = 10_000
+        print(f"⚠️ 계좌 정보 조회 실패: {e}. 기본 자본금($10,000)으로 시작합니다.")
+
     # --- ▼▼▼ [수정] optimal_settings.json을 불러와 기준으로 사용 ---
     optimal_settings_path = os.path.join(project_root, "optimal_settings.json")
     try:
@@ -91,7 +98,7 @@ if __name__ == '__main__':
 
     for symbol in ["BTCUSDT", "ETHUSDT"]:
         print(f"\n🚀 {symbol}에 대한 로컬 백테스팅을 시작합니다...")
-        klines_data = fetch_klines(binance_client, symbol, "1d", limit=500)
+        klines_data = data_fetcher.fetch_klines(binance_client, symbol, "4h", limit=1000)
 
         if klines_data is not None and not klines_data.empty:
             klines_data.columns = [col.capitalize() for col in klines_data.columns]
