@@ -17,7 +17,7 @@ from analysis import indicator_calculator
 from analysis.confluence_engine import ConfluenceEngine
 from core.config_manager import config
 from analysis.data_fetcher import fetch_klines
-from backtesting.performance_visualizer import create_performance_report
+from local_backtesting.performance_visualizer import create_performance_report
 
 class StrategyRunner(Strategy):
     open_threshold = 12.0
