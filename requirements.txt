@@ -10,3 +10,5 @@ bokeh
 matplotlib
 pytest
 alembic
+yfinance
+fredapi
