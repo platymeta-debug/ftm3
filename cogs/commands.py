@@ -57,12 +57,17 @@ class CommandCog(commands.Cog):
             klines_data.columns = [col.capitalize() for col in klines_data.columns]
 
             def run_bt():
-                # ▼▼▼ [진단 코드 추가] ▼▼▼
                 print("[/성과] 3. 백테스팅 라이브러리 실행 직전...")
+
+                # ▼▼▼ [수정] 코인별로 다른 진입 점수를 사용하도록 동적 설정 ▼▼▼
+                strategy_params = self.bot.config.get_strategy_params(symbol)
+                StrategyRunner.open_threshold = strategy_params.get("open_th", 12.0)
+                print(f"[/성과] '{symbol}'의 진입 점수 임계값: {StrategyRunner.open_threshold}")
+                # ▲▲▲ [수정] ▲▲▲
+
                 bt = Backtest(klines_data, StrategyRunner, cash=10_000, commission=.002)
                 stats = bt.run()
                 print("[/성과] 4. 백테스팅 실행 완료.")
-                # ▲▲▲ [진단 코드 추가] ▲▲▲
                 return stats
 
             stats = await loop.run_in_executor(None, run_bt)
