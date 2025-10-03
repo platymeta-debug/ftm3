@@ -1,4 +1,4 @@
-# cogs/commands.py
+# cogs/commands.py (최종 수정본)
 
 import discord
 from discord import app_commands
@@ -6,13 +6,20 @@ from discord.ext import commands
 from sqlalchemy import select
 import asyncio
 
-# ▼▼▼ [시즌 2 추가] 백테스팅 및 시각화 관련 모듈 임포트 ▼▼▼
+# ▼▼▼ [오류 수정] 프로젝트 루트 폴더를 시스템 경로에 최우선으로 추가 ▼▼▼
+import sys
+import os
+# 현재 파일의 디렉토리(cogs) -> 그 부모 디렉토리(프로젝트 루트)의 절대 경로를 가져옴
+project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+# 경로가 이미 추가되지 않았다면, 파이썬이 모듈을 찾는 경로 리스트의 맨 앞에 추가
+if project_root not in sys.path:
+    sys.path.insert(0, project_root)
+# ▲▲▲ [오류 수정] ▲▲▲
+
 from backtesting import Backtest
 from backtesting.backtest_runner import StrategyRunner
 from backtesting.performance_visualizer import create_performance_report
 from analysis.data_fetcher import fetch_klines
-# ▲▲▲ [시즌 2 추가] ▲▲▲
-
 from database.manager import db_manager
 from database.models import Trade
 from execution.trading_engine import TradingEngine
@@ -22,16 +29,16 @@ class CommandCog(commands.Cog):
     def __init__(self, bot: commands.Bot, trading_engine: TradingEngine):
         self.bot = bot
         self.trading_engine = trading_engine
-        
+
     @app_commands.command(name="성과", description="지정한 코인에 대한 전략 백테스팅을 실행하고 결과를 시각화합니다.")
     @app_commands.describe(코인="백테스팅을 실행할 코인 심볼 (예: BTCUSDT)")
     async def run_backtest_kr(self, interaction: discord.Interaction, 코인: str):
         symbol = 코인.upper()
-        await interaction.response.defer(ephemeral=False, thinking=True) # "생각 중..." 메시지 표시
+        await interaction.response.defer(ephemeral=False, thinking=True)
 
         try:
-            # 비동기 환경에서 동기적인 백테스팅 코드를 실행하기 위한 тrick
             loop = asyncio.get_event_loop()
+            # 백그라운드 스레드에서 동기 함수 실행
             klines_data = await loop.run_in_executor(
                 None, fetch_klines, self.bot.binance_client, symbol, "1d", 500
             )
@@ -42,10 +49,12 @@ class CommandCog(commands.Cog):
 
             klines_data.columns = [col.capitalize() for col in klines_data.columns]
 
-            # 최적화 없이 기본 파라미터로 1회 실행
-            bt = Backtest(klines_data, StrategyRunner, cash=10_000, commission=.002)
-            stats = bt.run()
+            # 백테스팅 실행 또한 동기 함수이므로 스레드에서 실행
+            def run_bt():
+                bt = Backtest(klines_data, StrategyRunner, cash=10_000, commission=.002)
+                return bt.run()
 
+            stats = await loop.run_in_executor(None, run_bt)
             report_text, chart_buffer = create_performance_report(stats)
 
             if chart_buffer:
@@ -55,12 +64,13 @@ class CommandCog(commands.Cog):
                 await interaction.followup.send(content=report_text)
 
         except Exception as e:
-            await interaction.followup.send(f"🚨 백테스팅 실행 중 오류가 발생했습니다: {e}")
+            print(f"🚨 백테스팅 실행 중 심각한 오류: {e}")
+            await interaction.followup.send(f"🚨 백테스팅 실행 중 오류가 발생했습니다: `{e}`")
 
+
+    # ... (이하 다른 명령어들은 그대로 유지)
     @app_commands.command(name="패널", description="인터랙티브 제어실을 소환합니다.")
     async def summon_panel_kr(self, interaction: discord.Interaction):
-        # 이 명령어는 이제 main.py의 on_ready에서 자동으로 패널을 생성하므로
-        # 수동 호출 시에는 안내 메시지만 보내는 것이 더 안정적입니다.
         await interaction.response.send_message(
             f"✅ 제어 패널은 봇 시작 시 자동으로 생성됩니다. <#{self.bot.config.panel_channel_id}> 채널을 확인해주세요.",
             ephemeral=True
@@ -68,8 +78,6 @@ class CommandCog(commands.Cog):
 
     @app_commands.command(name="상태", description="봇의 현재 핵심 상태를 비공개로 요약합니다.")
     async def status_kr(self, interaction: discord.Interaction):
-        # main.py에 있는 get_panel_embed 함수를 호출합니다.
-        # on_ready에서 bot 객체에 함수를 할당해두었기 때문에 접근 가능합니다.
         if hasattr(self.bot, 'get_panel_embed'):
             embed = self.bot.get_panel_embed()
             await interaction.response.send_message(embed=embed, ephemeral=True)
@@ -116,16 +124,12 @@ class CommandCog(commands.Cog):
         await view.wait()
         if view.value is True:
             try:
-                # trading_engine의 close_all_positions는 모든 포지션을 닫으므로, 특정 심볼만 닫는 로직이 필요
-                # 여기서는 간단하게 trading_engine을 통해 직접 구현합니다.
                 with db_manager.get_session() as session:
                     trade_to_close = session.execute(select(Trade).where(Trade.symbol == symbol, Trade.status == "OPEN")).scalar_one_or_none()
-                
                 if trade_to_close:
                     await self.trading_engine.close_position(trade_to_close, "사용자 수동 청산")
                     await interaction.followup.send(f"✅ **수동 청산 주문 성공**\n`{symbol}` 포지션이 종료되었습니다.", ephemeral=True)
                 else:
-                    # DB에 없는 포지션 강제 청산
                     positions = self.bot.binance_client.futures_position_information()
                     target_pos = next((p for p in positions if p.get('symbol') == symbol and float(p.get('positionAmt', 0)) != 0), None)
                     if target_pos:
@@ -135,7 +139,6 @@ class CommandCog(commands.Cog):
                         await interaction.followup.send(f"✅ **수동 강제 청산 주문 성공**\n`{symbol}` 포지션이 종료되었습니다.", ephemeral=True)
                     else:
                         await interaction.followup.send(f"❌ **수동 청산 실패**\n`{symbol}`에 대한 오픈된 포지션을 찾을 수 없습니다.", ephemeral=True)
-
             except Exception as e:
                 await interaction.followup.send(f"❌ **수동 청산 주문 실패**\n`{e}`", ephemeral=True)
 
