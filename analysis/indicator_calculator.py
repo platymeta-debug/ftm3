@@ -1,4 +1,4 @@
-# analysis/indicator_calculator.py (모든 지표 계산 최종본)
+# analysis/indicator_calculator.py (모든 지표 계산 최종 완성본)
 
 import pandas as pd
 import pandas_ta as ta
@@ -19,7 +19,7 @@ def calculate_all_indicators(df: pd.DataFrame) -> pd.DataFrame:
         print(f"🚨 데이터 준비 과정 오류: {e}")
         return pd.DataFrame()
 
-    # ▼▼▼ [핵심] pandas-ta 라이브러리의 모든 주요 지표를 포함하는 전략 생성 ▼▼▼
+    # ▼▼▼ [핵심 수정] ComprehensiveStrategy에서 사용하는 모든 지표를 추가합니다. ▼▼▼
     AllIndicatorsStrategy = ta.Strategy(
         name="Comprehensive Indicator Arsenal",
         description="Calculates a vast array of indicators for ML and analysis",
@@ -33,39 +33,34 @@ def calculate_all_indicators(df: pd.DataFrame) -> pd.DataFrame:
             {"kind": "ichimoku"},
             {"kind": "psar"},
             {"kind": "chop"},
-            {"kind": "vortex"}, # Vortex Indicator
+            {"kind": "vortex"},
+            {"kind": "trix", "length": 30, "signal": 9}, # TRIX 추가
 
             # Momentum (모멘텀)
             {"kind": "rsi"},
             {"kind": "stoch"},
-            {"kind": "stochrsi"},
+            {"kind": "stochrsi"}, # 스토캐스틱 RSI 추가
             {"kind": "mfi"},
             {"kind": "cci"},
             {"kind": "roc"},
-            {"kind": "ppo"}, # Percentage Price Oscillator
-            {"kind": "trix"}, # Trix
-            {"kind": "cmo"}, # Chande Momentum Oscillator
+            {"kind": "ppo"}, # PPO 추가
+            {"kind": "cmo"},
 
             # Volume (거래량)
             {"kind": "obv"},
             {"kind": "vwap"},
-            {"kind": "cmf"}, # Chaikin Money Flow
-            {"kind": "efi"}, # Elder's Force Index
+            {"kind": "cmf"},
+            {"kind": "efi"}, # 엘더의 힘 지수 추가
 
             # Volatility (변동성)
             {"kind": "bbands"},
             {"kind": "atr"},
             {"kind": "true_range"},
-            {"kind": "donchian"}, # Donchian Channels
-            {"kind": "kc"}, # Keltner Channels
-
-            # Other (기타/사용자 정의)
-            # 예시: 특정 기간의 최고/최저가
-            {"kind": "highest", "length": 50},
-            {"kind": "lowest", "length": 50},
+            {"kind": "donchian"},
+            {"kind": "kc"}, # 켈트너 채널 추가
         ]
     )
-    # ▲▲▲ [핵심] ▲▲▲
+    # ▲▲▲ [핵심 수정] ▲▲▲
 
     try:
         df_out.ta.strategy(AllIndicatorsStrategy)
@@ -78,6 +73,5 @@ def calculate_all_indicators(df: pd.DataFrame) -> pd.DataFrame:
         df_out["ISB_26"] = df_out["ISB_26"].shift(-25)
 
     print(f"--- [indicator_calculator] 총 {len(df_out.columns)}개의 컬럼(지표 포함) 생성 완료 ---")
-    # print(df_out.columns.to_list()) # 너무 길어서 주석 처리
 
     return df_out
