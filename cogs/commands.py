@@ -7,17 +7,16 @@ from sqlalchemy import select
 from binance.client import Client
 import asyncio
 
-# ▼▼▼ [오류 수정] 프로젝트 루트 폴더를 시스템 경로에 최우선으로 추가 ▼▼▼
+# ▼▼▼ [수정] 프로젝트 경로 설정 및 FractionalBacktest 임포트 ▼▼▼
 import sys
 import os
-# 현재 파일의 디렉토리(cogs) -> 그 부모 디렉토리(프로젝트 루트)의 절대 경로를 가져옴
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
-# 경로가 이미 추가되지 않았다면, 파이썬이 모듈을 찾는 경로 리스트의 맨 앞에 추가
 if project_root not in sys.path:
     sys.path.insert(0, project_root)
-# ▲▲▲ [오류 수정] ▲▲▲
 
-from backtesting import Backtest  # 설치된 라이브러리, 그대로 둠
+from backtesting.lib import FractionalBacktest # FractionalBacktest 임포트
+# ▲▲▲ [수정] ▲▲▲
+
 from local_backtesting.backtest_runner import StrategyRunner
 from local_backtesting.performance_visualizer import create_performance_report
 from analysis.data_fetcher import fetch_klines
@@ -39,16 +38,14 @@ class CommandCog(commands.Cog):
         try:
             await interaction.response.defer(ephemeral=False, thinking=True)
             
-            # ▼▼▼ [수정] 현재 계좌 잔고를 가져오는 로직 추가 ▼▼▼
             print(f"[/성과] 1. '{symbol}' 백테스팅 시작... 현재 계좌 잔고 조회 중...")
             try:
                 account_info = self.bot.binance_client.futures_account()
-                initial_cash = float(account_info.get('totalWalletBalance', 10000)) # 기본값 10,000
+                initial_cash = float(account_info.get('totalWalletBalance', 10000))
                 print(f"[/성과] 현재 총 자산: ${initial_cash:,.2f}")
             except Exception as e:
-                print(f"⚠️ 계좌 정보 조회 실패: {e}. 기본 자본금($10,000)으로 백테스팅을 시작합니다.")
+                print(f"⚠️ 계좌 정보 조회 실패: {e}. 기본 자본금($10,000)으로 시작합니다.")
                 initial_cash = 10_000
-            # ▲▲▲ [수정] ▲▲▲
 
             loop = asyncio.get_event_loop()
 
@@ -68,12 +65,17 @@ class CommandCog(commands.Cog):
             klines_data.columns = [col.capitalize() for col in klines_data.columns]
 
             def run_bt():
-                # ... (run_bt 함수 내용은 이전과 동일) ...
                 print("[/성과] 3. 백테스팅 라이브러리 실행 직전...")
                 strategy_params = self.bot.config.get_strategy_params(symbol)
                 StrategyRunner.open_threshold = strategy_params.get("open_th", 12.0)
-                print(f"[/성과] '{symbol}'의 진입 점수 임계값: {StrategyRunner.open_threshold}")
-                bt = Backtest(klines_data, StrategyRunner, cash=10_000, commission=.002, margin=1/5)
+                StrategyRunner.risk_reward_ratio = strategy_params.get("risk_reward_ratio")
+                StrategyRunner.symbol = symbol # 심볼 전달
+                print(f"[/성과] '{symbol}' 테스트 파라미터: Threshold={StrategyRunner.open_threshold}, R/R Ratio={StrategyRunner.risk_reward_ratio}")
+                
+                # ▼▼▼ [수정] FractionalBacktest 사용 및 레버리지 적용 ▼▼▼
+                bt = FractionalBacktest(klines_data, StrategyRunner, cash=initial_cash, commission=.002, margin=1/10)
+                # ▲▲▲ [수정] ▲▲▲
+                
                 stats = bt.run()
                 print("[/성과] 4. 백테스팅 실행 완료.")
                 return stats
@@ -81,7 +83,9 @@ class CommandCog(commands.Cog):
             stats = await loop.run_in_executor(None, run_bt)
             
             print("[/성과] 5. 리포트 생성 시작...")
-            report_text, chart_buffer = create_performance_report(stats)
+            # ▼▼▼ [수정] create_performance_report에 initial_cash 전달 ▼▼▼
+            report_text, chart_buffer = create_performance_report(stats, initial_cash)
+            # ▲▲▲ [수정] ▲▲▲
             print("[/성과] 6. 리포트 생성 완료.")
 
             if chart_buffer:
@@ -92,15 +96,10 @@ class CommandCog(commands.Cog):
             
             print(f"[/성과] 7. '{symbol}' 결과 전송 완료.")
 
-        except discord.errors.NotFound:
-            # 타임아웃 오류가 발생하면 사용자에게 알리지 않고, 터미널에만 로그를 남깁니다.
-            # 백테스팅 계산은 이미 완료되었으므로 터미널에서 결과를 확인할 수 있습니다.
-            print("⚠️ DISCORD TIMEOUT: Interaction expired. Backtest results are available in the console.")
         except Exception as e:
             import traceback
             print(f"🚨 [/성과] 명령어 처리 중 심각한 예외 발생:")
             traceback.print_exc()
-            # defer가 성공한 이후에 오류가 났을 경우 followup.send로 사용자에게 알립니다.
             if interaction.response.is_done():
                 await interaction.followup.send(f"🚨 백테스팅 실행 중 오류가 발생했습니다: `{e}`")
         # ▲▲▲ [최종 수정] ▲▲▲
