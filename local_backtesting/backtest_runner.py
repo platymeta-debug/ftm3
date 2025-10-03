@@ -1,17 +1,16 @@
-# local_backtesting/backtest_runner.py (최종 진단 코드 포함)
+# local_backtesting/backtest_runner.py (라이브러리 한계 우회 최종본)
 
 import pandas as pd
-from backtesting import Strategy, Backtest
+from backtesting import Strategy
 from binance.client import Client
 from collections import deque
 import sys
 import os
 
-# ▼▼▼ 프로젝트 루트 폴더 경로 추가 ▼▼▼
+# 프로젝트 루트 폴더 경로 추가
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 if project_root not in sys.path:
     sys.path.insert(0, project_root)
-# ▲▲▲ 프로젝트 루트 폴더 경로 추가 ▲▲▲
 
 from analysis import indicator_calculator
 from analysis.confluence_engine import ConfluenceEngine
@@ -53,38 +52,40 @@ class StrategyRunner(Strategy):
             
         avg_score = sum(self.recent_scores) / len(self.recent_scores)
         
-        # ▼▼▼ [핵심 진단 코드] ▼▼▼
-        # 20일에 한 번씩 현재 점수 상황을 터미널에 출력합니다.
         if current_index % 20 == 0:
             print(f"[Backtest Log] Day {current_index} | Avg Score: {avg_score:.2f} | Threshold: {self.open_threshold}")
-        # ▲▲▲ [핵심 진단 코드] ▲▲▲
 
         side = None
         if avg_score >= self.open_threshold:
             side = "BUY"
-            print(f"✅✅✅ [Backtest Log] Day {current_index} - BUY SIGNAL! Avg Score: {avg_score:.2f} ✅✅✅")
         elif avg_score <= -self.open_threshold:
             side = "SELL"
-            print(f"❌❌❌ [Backtest Log] Day {current_index} - SELL SIGNAL! Avg Score: {avg_score:.2f} ❌❌❌")
 
         if side and not self.position:
             last_row = self.indicators.iloc[current_index]
             entry_atr = last_row.get("atrr_14", last_row.get("atr_14", 0))
-            if not entry_atr or entry_atr <= 0: return
+
+            if not entry_atr or pd.isna(entry_atr) or entry_atr <= 0:
+                return
 
             stop_loss_distance = entry_atr * config.sl_atr_multiplier
             take_profit_distance = stop_loss_distance * self.risk_reward_ratio
 
+            # ▼▼▼ [최종 수정] 고정된 절대 수량(0.001 BTC)으로 거래하여 라이브러리 한계 우회 ▼▼▼
+            fixed_units_to_trade = 0.001
+
             if side == "BUY":
                 self.buy(sl=self.data.Close[-1] - stop_loss_distance,
                          tp=self.data.Close[-1] + take_profit_distance,
-                         size=0.1)
+                         size=fixed_units_to_trade)
             elif side == "SELL":
                 self.sell(sl=self.data.Close[-1] + stop_loss_distance,
                           tp=self.data.Close[-1] - take_profit_distance,
-                          size=0.1)
+                          size=fixed_units_to_trade)
+            # ▲▲▲ [최종 수정] ▲▲▲
 
 if __name__ == '__main__':
+    from backtesting import Backtest
     binance_client = Client(config.api_key, config.api_secret, testnet=config.is_testnet)
     symbol = "ETHUSDT"
     print(f"\n🚀 {symbol}에 대한 로컬 백테스팅을 시작합니다...")
@@ -92,7 +93,6 @@ if __name__ == '__main__':
     klines_data = fetch_klines(binance_client, symbol, "1d", limit=500)
 
     if klines_data is not None and not klines_data.empty:
-        # backtesting 라이브러리는 대문자 컬럼명을 사용하므로 여기서 변경
         klines_data.columns = [col.capitalize() for col in klines_data.columns]
         
         bt = Backtest(klines_data, StrategyRunner, cash=10_000, commission=.002)
