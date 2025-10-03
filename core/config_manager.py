@@ -11,6 +11,18 @@ class ConfigManager:
         print("환경 변수 파일(.env)을 로드했습니다.")
         
         self.fred_api_key = os.getenv("FRED_API_KEY")
+
+        self.optimal_settings = {}
+        try:
+            # 프로젝트 루트 경로에 있는 optimal_settings.json을 로드합니다.
+            with open("optimal_settings.json", "r", encoding="utf-8") as f:
+                self.optimal_settings = json.load(f)
+            print("✅ optimal_settings.json 최적화 설정 파일을 성공적으로 로드했습니다.")
+        except FileNotFoundError:
+            print("⚠️ optimal_settings.json 파일을 찾을 수 없어, 기본값으로 실행됩니다.")
+        except json.JSONDecodeError:
+            print("🚨 optimal_settings.json 파일의 형식이 잘못되었습니다.")
+
         # ▼▼▼ [시즌 2 추가] 전략 설정 파일 로드 ▼▼▼
         try:
             with open("strategies.json", "r", encoding="utf-8") as f:
@@ -116,6 +128,29 @@ class ConfigManager:
         self.alerts_channel_id = self._get_int("DISCORD_ALERTS_CHANNEL_ID")
         self.dashboard_channel_id = self._get_int("DISCORD_CHANNEL_ID_DASHBOARD")
 
+    def get_strategy_params(self, symbol: str, market_regime: str) -> Dict:
+        """
+        현재 시장 상황(market_regime)에 맞는 최적화된 파라미터를 반환합니다.
+        최적화된 값이 없으면 .env의 기본값을 반환합니다.
+        """
+        # market_regime은 "BULL", "BEAR", "SIDEWAYS" 중 하나
+        regime_upper = market_regime.upper()
+        
+        # optimal_settings.json에서 해당 시장, 해당 심볼의 최적값을 찾아본다
+        optimized = self.optimal_settings.get(regime_upper, {}).get(symbol)
+
+        if optimized:
+            print(f"✅ [{regime_upper}/{symbol}] 최적화 파라미터 적용: {optimized}")
+            return {
+                "open_th": optimized.get("OPEN_TH"),
+                "risk_reward_ratio": optimized.get("RR_RATIO"),
+                "sl_atr_multiplier": optimized.get("SL_ATR_MULTIPLIER")
+            }
+        else:
+            # 최적화된 값이 없으면 .env의 기본값을 사용
+            print(f"⚠️ [{regime_upper}/{symbol}] 최적화 파라미터 없음. .env 기본값 사용.")
+            return self.strategy_params.get(symbol, self.strategy_params["DEFAULT"])
+        
     # --- ▼▼▼ [핵심] 코인별 전략 파라미터를 쉽게 가져오는 함수 추가 ▼▼▼ ---
     def get_strategy_params(self, symbol: str) -> Dict:
         """해당 심볼에 맞는 전략 파라미터를 반환합니다. 없으면 기본값을 반환합니다."""
