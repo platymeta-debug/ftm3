@@ -45,16 +45,19 @@ class MacroAnalyzer:
                 print(f"🚨 FRED 데이터 조회 실패 ({series_id}): {e}")
                 return None
         return None
-
+    
+    
     def diagnose_macro_regime_for_date(self, analysis_date, macro_data: dict) -> tuple[MacroRegime, int, dict]:
         scores = {}
 
         def get_latest_row(df, date):
             if df is None: return None
+            # Timezone handling for robust date comparison
             if df.index.tz is not None and getattr(date, 'tzinfo', None) is None:
                 date = pd.Timestamp(date).tz_localize(df.index.tz)
             elif df.index.tz is None and getattr(date, 'tzinfo', None) is not None:
                 date = date.tz_convert(None).tz_localize(None)
+            
             subset = df.loc[:date]
             return subset.iloc[-1] if not subset.empty else None
 
@@ -67,6 +70,11 @@ class MacroAnalyzer:
         if nasdaq_row is not None:
             sma_val = nasdaq_row.get('SMA_200')
             close_val = nasdaq_row.get('Close')
+            
+            # AMBIGUITY FIX: Ensure values are scalars before comparison
+            if isinstance(sma_val, pd.Series): sma_val = sma_val.iloc[-1]
+            if isinstance(close_val, pd.Series): close_val = close_val.iloc[-1]
+
             if pd.notna(sma_val) and pd.notna(close_val):
                 scores["주도주(나스닥)"] = 5 if close_val > sma_val else -5
 
@@ -77,6 +85,11 @@ class MacroAnalyzer:
         if vix_row is not None:
             sma_val = vix_row.get('SMA_20')
             close_val = vix_row.get('Close')
+            
+            # AMBIGUITY FIX: Ensure values are scalars before comparison
+            if isinstance(sma_val, pd.Series): sma_val = sma_val.iloc[-1]
+            if isinstance(close_val, pd.Series): close_val = close_val.iloc[-1]
+
             if pd.notna(sma_val) and pd.notna(close_val):
                 if close_val > 30:
                     scores["변동성(VIX)"] = -5
@@ -84,6 +97,7 @@ class MacroAnalyzer:
                     scores["변동성(VIX)"] = -3
                 elif close_val < 15:
                     scores["변동성(VIX)"] = 3
+        # --- ▲▲▲ [수정] ---
 
         final_score = sum(scores.values())
 
@@ -142,7 +156,20 @@ class MacroAnalyzer:
         if data.iloc[-1]['Close'] > data.iloc[-1]['SMA_50']: return 2, "상승"
         return -2, "하락"
 
-    # --- 종합 진단 로직 ---
+    def analyze_yield_curve(self) -> (int, str):
+        """[경기침체] 미국 10년물-2년물 국채 금리차를 분석합니다."""
+        data = self._get_fred_data("T10Y2Y") # FRED에서 장단기 금리차 데이터 조회
+        if data is None or data.empty: return 0, "데이터 부족"
+
+        # 금리차가 0 아래로 내려가면(역전되면) 경기 침체 우려, 강력한 약세 신호
+        if data.iloc[-1] < 0:
+            return -7, "금리 역전 (침체 신호)"
+        elif data.iloc[-1] < 0.25:
+            return -3, "금리차 축소 (위험)"
+
+        return 2, "정상"
+    
+     # --- 종합 진단 로직 ---
     def diagnose_macro_regime(self) -> tuple[MacroRegime, int, dict]:
         """
         모든 거시 지표를 종합하고, 상관관계를 고려하여 최종 시장 체제를 진단합니다.
@@ -154,6 +181,7 @@ class MacroAnalyzer:
             "신용위험(회사채)": self.analyze_credit_risk()[0],
             "유동성(달러)": self.analyze_liquidity()[0],
             "인플레이션(유가)": self.analyze_inflation_proxy()[0],
+            "경기침체(금리차)": self.analyze_yield_curve()[0],
         }
         base_score = sum(scores.values())
         final_score = base_score
