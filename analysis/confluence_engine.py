@@ -1,4 +1,4 @@
-# 파일명: analysis/confluence_engine.py (Phase 2 - 필터 적용)
+# 파일명: analysis/confluence_engine.py (Phase 4 - 동적 파라미터 적용 최종 수정본)
 
 from __future__ import annotations
 import math
@@ -9,65 +9,61 @@ import requests
 import statistics
 
 from . import data_fetcher, indicator_calculator
-from .core_strategy import diagnose_market_regime, MarketRegime
+from .core_strategy import diagnose_market_regime
+# 'MarketRegime'은 이제 technical한 분석에만 사용하므로 이름을 명확히 합니다.
+from .core_strategy import MarketRegime as TechnicalRegime
 from .macro_analyzer import MacroAnalyzer, MacroRegime as GlobalMacroRegime
 from .strategies.trend_strategy import TrendStrategy
 from .strategies.oscillator_strategy import OscillatorStrategy
 from .strategies.comprehensive_strategy import ComprehensiveStrategy
-# --- ▼▼▼ [Phase 2 수정] 신호 필터 전략 임포트 ▼▼▼ ---
 from .strategies.signal_filter_strategy import SignalFilterStrategy
-# --- ▲▲▲ [Phase 2 수정] ▲▲▲ ---
 from core.config_manager import config
 
 class ConfluenceEngine:
-    """[Phase 2] 개별 분석 전략과 신호 필터를 통합하여 결정을 내리는 '두뇌' 모듈."""
+    """[Phase 4] 기술적 분석, 거시 경제 분석, 동적 파라미터를 통합하여 최종 결정을 내리는 '두뇌' 모듈."""
+
     def __init__(self, client: Client):
         self.client = client
         self.fear_and_greed_index = 50
         self.macro_analyzer = MacroAnalyzer()
 
-        # --- ▼▼▼ [시즌 2 수정] 설정 파일을 읽어 전략 인스턴스 생성 ▼▼▼ ---
-        self.strategies = []
-        # 이제 이 리스트만 수정하면 모든 전략을 관리할 수 있습니다.
         strategy_classes = {
             "TrendStrategy": TrendStrategy,
             "OscillatorStrategy": OscillatorStrategy,
-            "ComprehensiveStrategy": ComprehensiveStrategy, 
+            "ComprehensiveStrategy": ComprehensiveStrategy,
         }
-
+        self.strategies = []
         for name, cls in strategy_classes.items():
             strategy_config = config.strategy_configs.get(name, {})
             if strategy_config.get("enabled", False):
                 self.strategies.append(cls(params=strategy_config))
-            else:
-                print(f"INFO: '{name}' 전략이 비활성화되어 로드하지 않습니다.")
-
         self.filter = SignalFilterStrategy()
-        print(f"✅ [시즌 2] {len(self.strategies)}개 분석 전략, 1개 신호 필터가 로드되었습니다.")
-        # --- ▲▲▲ [시즌 2 수정] ▲▲▲ ---
+        print(f"✅ [Phase 4] {len(self.strategies)}개 분석 전략, 1개 신호 필터, 1개 거시 분석기가 로드되었습니다.")
 
-    def analyze_and_decide(self, symbol: str, recent_scores: List[float]) -> Tuple[Optional[str], str, Optional[dict]]:
-        """모든 분석과 필터링을 종합하여 최종 매매 방향, 결정 사유, 주문 컨텍스트를 반환합니다."""
+    def analyze_and_decide(self, symbol: str, recent_scores: List[float], market_regime: str) -> Tuple[Optional[str], str, Optional[dict]]:
+        """
+        모든 분석을 종합하여 최종 매매 방향, 결정 사유, 주문 컨텍스트를 반환합니다.
+        market_regime 인자를 받아 동적 파라미터를 적용합니다.
+        """
         analysis_result = self.analyze_symbol(symbol)
         if not analysis_result:
             return None, f"[{symbol}]: 데이터 분석 실패.", None
 
-        macro_regime, macro_score = self.macro_analyzer.diagnose_macro_regime()
-
+        # --- ▼▼▼ [수정] 기술적 분석 기반의 시장 진단 로직 (기존 로직 유지) ▼▼▼ ---
         final_score, _, tf_rows, _, _, _ = analysis_result
-        daily_row = tf_rows.get("1d")
         four_hour_row = tf_rows.get("4h")
-        if daily_row is None or four_hour_row is None:
-            return None, f"[{symbol}]: 핵심 데이터(1d/4h) 부족.", None
+        if four_hour_row is None:
+            return None, f"[{symbol}]: 핵심 데이터(4h) 부족.", None
 
         market_data_for_diag = pd.Series({
             'adx_4h': four_hour_row.get('ADX_14'),
-            'is_above_ema200_1d': daily_row.get('close') > daily_row.get('EMA_200') if pd.notna(daily_row.get('EMA_200')) else False
+            'is_above_ema200_1d': tf_rows.get("1d", {}).get('close') > tf_rows.get("1d", {}).get('EMA_200')
         })
-        market_regime = diagnose_market_regime(market_data_for_diag, config.market_regime_adx_th)
+        technical_regime = diagnose_market_regime(market_data_for_diag, config.market_regime_adx_th)
+        # --- ▲▲▲ [수정] ---
 
-        if market_regime not in [MarketRegime.BULL_TREND, MarketRegime.BEAR_TREND]:
-            return None, f"[{symbol}]: 횡보장({market_regime.value}). 관망.", None
+        if technical_regime not in [TechnicalRegime.BULL_TREND, TechnicalRegime.BEAR_TREND]:
+            return None, f"[{symbol}]: 기술적 횡보장({technical_regime.value}). 관망.", None
 
         if len(recent_scores) < config.trend_entry_confirm_count:
             return None, f"[{symbol}]: 신호 부족({len(recent_scores)}/{config.trend_entry_confirm_count}). 관망.", None
@@ -75,20 +71,23 @@ class ConfluenceEngine:
         avg_score = statistics.mean(recent_scores)
         std_dev = statistics.pstdev(recent_scores) if len(recent_scores) > 1 else 0
 
-        side = None
-        params = config.get_strategy_params(symbol)
+        # --- ▼▼▼ [수정] 중복 코드 제거 및 동적 파라미터 정상 적용 ---
+        # 외부에서 전달받은 market_regime을 사용하여 최적 파라미터를 가져옵니다.
+        params = config.get_strategy_params(symbol, market_regime)
         open_threshold = params.get('open_th', 12.0)
 
-        if market_regime == MarketRegime.BULL_TREND and avg_score >= open_threshold and std_dev <= config.quality_max_std_dev:
+        side = None
+        # 기술적 분석이 추세장일 때만 진입 고려
+        if technical_regime == TechnicalRegime.BULL_TREND and avg_score >= open_threshold and std_dev <= config.quality_max_std_dev:
             side = "BUY"
-        elif market_regime == MarketRegime.BEAR_TREND and abs(avg_score) >= open_threshold and std_dev <= config.quality_max_std_dev:
+        elif technical_regime == TechnicalRegime.BEAR_TREND and abs(avg_score) >= open_threshold and std_dev <= config.quality_max_std_dev:
             side = "SELL"
+        # --- ▲▲▲ [수정] ---
 
         if not side:
             return None, f"[{symbol}]: 신호 품질 미달(Avg:{avg_score:.1f}, Th:{open_threshold}). 관망.", None
 
-        # --- ▼▼▼ [Phase 2 수정] 신호 필터링 적용 ▼▼▼ ---
-        # 필터링은 가장 중요한 4시간봉 데이터를 기준으로 수행
+        # 신호 필터링 적용
         four_hour_data = self.get_full_data(symbol, "4h")
         if four_hour_data is None:
              return None, f"[{symbol}]: 필터링 데이터(4h) 부족.", None
@@ -96,13 +95,11 @@ class ConfluenceEngine:
         filter_result = self.filter.analyze(four_hour_data)
         if not filter_result["is_valid"]:
             return None, f"[{symbol}]: 신호 필터링됨 ({filter_result['reason']}). 관망.", None
-        # --- ▲▲▲ [Phase 2 수정] ▲▲▲ ---
 
-        decision_reason = f"🚀 [{symbol}] {side} 진입! (Avg: {avg_score:.1f}, 필터 통과)"
+        decision_reason = f"🚀 [{symbol}] {side} 진입! (Avg: {avg_score:.1f}, Tech: {technical_regime.value})"
         entry_context = {"avg_score": avg_score, "entry_atr": self.extract_atr(tf_rows)}
         return side, decision_reason, entry_context
 
-    # --- ▼▼▼ [Phase 2 추가] 필터링을 위한 전체 데이터 조회 헬퍼 함수 ▼▼▼ ---
     def get_full_data(self, symbol: str, timeframe: str) -> Optional[pd.DataFrame]:
         """특정 타임프레임의 전체 지표가 포함된 DataFrame을 반환합니다."""
         try:
@@ -111,11 +108,9 @@ class ConfluenceEngine:
             return indicator_calculator.calculate_all_indicators(df)
         except Exception:
             return None
-    # --- ▲▲▲ [Phase 2 추가] ▲▲▲ ---
 
-    # ... (analyze_symbol, _fetch_fear_and_greed_index, _calculate_tactical_score 등 나머지 메소드는 이전과 동일) ...
     def analyze_symbol(self, symbol: str) -> Optional[Tuple[float, Dict, Dict, Dict, int, str]]:
-        """한 심볼에 대한 전체 분석을 수행하고 모든 관련 데이터를 튜플로 반환합니다."""
+        """한 심볼에 대한 전체 기술적 분석을 수행하고 모든 관련 데이터를 튜플로 반환합니다."""
         try:
             self._fetch_fear_and_greed_index()
 
