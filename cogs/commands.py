@@ -36,12 +36,20 @@ class CommandCog(commands.Cog):
     async def run_backtest_kr(self, interaction: discord.Interaction, 코인: str):
         symbol = 코인.upper()
         
-        # ▼▼▼ [최종 수정] Defer 호출을 try 블록 안으로 이동 및 예외 처리 추가 ▼▼▼
         try:
-            # 봇이 응답할 시간을 벌어줍니다.
             await interaction.response.defer(ephemeral=False, thinking=True)
             
-            print(f"[/성과] 1. '{symbol}' 백테스팅 시작...")
+            # ▼▼▼ [수정] 현재 계좌 잔고를 가져오는 로직 추가 ▼▼▼
+            print(f"[/성과] 1. '{symbol}' 백테스팅 시작... 현재 계좌 잔고 조회 중...")
+            try:
+                account_info = self.bot.binance_client.futures_account()
+                initial_cash = float(account_info.get('totalWalletBalance', 10000)) # 기본값 10,000
+                print(f"[/성과] 현재 총 자산: ${initial_cash:,.2f}")
+            except Exception as e:
+                print(f"⚠️ 계좌 정보 조회 실패: {e}. 기본 자본금($10,000)으로 백테스팅을 시작합니다.")
+                initial_cash = 10_000
+            # ▲▲▲ [수정] ▲▲▲
+
             loop = asyncio.get_event_loop()
 
             backtest_client = Client(self.bot.config.api_key, self.bot.config.api_secret, testnet=self.bot.config.is_testnet)
