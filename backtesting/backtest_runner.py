@@ -1,97 +1,99 @@
-# backtesting/backtest_runner.py (V23 - 최신 두뇌 탑재)
-import os
+# backtesting/backtest_runner.py (최종 수정본)
+
 import pandas as pd
-from backtesting import Backtest, Strategy
-from backtesting.lib import FractionalBacktest
+from backtesting import Strategy, Backtest
 from binance.client import Client
-import sys, os, contextlib, io
 from collections import deque
+import sys
+import os
 
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+# ▼▼▼ [오류 수정] 프로젝트 루트 폴더 경로 추가 ▼▼▼
+project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+if project_root not in sys.path:
+    sys.path.insert(0, project_root)
+# ▲▲▲ [오류 수정] ▲▲▲
 
+from analysis import indicator_calculator
 from analysis.confluence_engine import ConfluenceEngine
+from core.config_manager import config
 from analysis.data_fetcher import fetch_klines
-from core.config_manager import config # <--- config 임포트 추가
 from backtesting.performance_visualizer import create_performance_report
 
 class StrategyRunner(Strategy):
-    # 최적화할 파라미터들
     open_threshold = 12.0
     risk_reward_ratio = 2.5
-    trend_entry_confirm_count = 3 # 신호 품질 검증을 위한 파라미터
+    trend_entry_confirm_count = 3
 
     def init(self):
-        # 1. '두뇌'인 ConfluenceEngine을 생성합니다.
-        mock_client = Client("", "")
-        self.engine = ConfluenceEngine(mock_client)
-        
-        # 2. 최근 N개의 점수를 저장할 공간을 만듭니다.
+        # ConfluenceEngine은 순수 계산용으로만 사용 (API 호출 X)
+        self.engine = ConfluenceEngine(Client("", ""))
         self.recent_scores = deque(maxlen=self.trend_entry_confirm_count)
+        # 백테스팅 시작 시 모든 지표를 한 번만 미리 계산하여 성능 향상
+        self.indicators = indicator_calculator.calculate_all_indicators(self.data.df)
 
     def next(self):
-        # --- 1. 데이터 분석 ---
-        # 백테스팅 환경에서는 단일 타임프레임(1d)만 분석합니다.
-        analysis_result = self.engine.analyze_symbol(self.data.df.name)
-        if not analysis_result: return
+        # self.i는 현재 캔들(시간)의 인덱스를 가리킴
+        if self.i < self.trend_entry_confirm_count:
+            return
 
-        final_score, _, _, _, _, _ = analysis_result
+        # 현재 시점까지의 데이터로 점수 계산 (미리 계산된 지표 사용)
+        current_indicators = self.indicators.iloc[:self.i + 1]
+        if current_indicators.empty: return
+
+        final_score, _ = self.engine._calculate_tactical_score(current_indicators)
         self.recent_scores.append(final_score)
 
-        # --- 2. '두뇌'에게 최종 결정 요청 ---
-        # main.py와 동일하게 최근 점수 리스트를 전달합니다.
-        side, reason, context = self.engine.analyze_and_decide(self.data.df.name, list(self.recent_scores))
+        # 진입 결정 로직
+        avg_score = sum(self.recent_scores) / len(self.recent_scores)
+        side = None
+        if avg_score >= self.open_threshold:
+            side = "BUY"
+        elif avg_score <= -self.open_threshold:
+            side = "SELL"
 
-        # --- 3. 결정에 따라 주문 실행 ---
+        # 주문 실행
         if side and not self.position:
-            entry_price = self.data.Close[-1]
-            entry_atr = context.get('entry_atr', 0)
-            if entry_atr <= 0: return
+            last_row = self.indicators.iloc[self.i] # 현재 캔들의 지표
+            entry_atr = last_row.get("ATRr_14", last_row.get("ATR_14", 0))
+            if not entry_atr or entry_atr <= 0: return
 
             stop_loss_distance = entry_atr * config.sl_atr_multiplier
             take_profit_distance = stop_loss_distance * self.risk_reward_ratio
-            
+
             if side == "BUY":
-                sl_price = entry_price - stop_loss_distance
-                tp_price = entry_price + take_profit_distance
-                if sl_price > 0: self.buy(sl=sl_price, tp=tp_price, size=0.1)
+                self.buy(sl=self.data.Close[-1] - stop_loss_distance,
+                         tp=self.data.Close[-1] + take_profit_distance,
+                         size=0.1)
             elif side == "SELL":
-                sl_price = entry_price + stop_loss_distance
-                tp_price = entry_price - take_profit_distance
-                if tp_price > 0: self.sell(sl=sl_price, tp=tp_price, size=0.1)
+                self.sell(sl=self.data.Close[-1] + stop_loss_distance,
+                          tp=self.data.Close[-1] - take_profit_distance,
+                          size=0.1)
 
 if __name__ == '__main__':
-    # ... (상단 binance_client, symbol, klines_data 부분은 동일) ...
+    binance_client = Client(config.api_key, config.api_secret, testnet=config.is_testnet)
+    symbol = "ETHUSDT"
+    print(f"\n🚀 {symbol}에 대한 로컬 백테스팅을 시작합니다...")
+
+    klines_data = fetch_klines(binance_client, symbol, "1d", limit=500)
 
     if klines_data is not None and not klines_data.empty:
         klines_data.columns = [col.capitalize() for col in klines_data.columns]
         bt = Backtest(klines_data, StrategyRunner, cash=10_000, commission=.002)
 
-        # ▼▼▼ [개선] 결과물 저장 폴더 지정 ▼▼▼
-        results_folder = "backtesting/results"
-        os.makedirs(results_folder, exist_ok=True) # 폴더가 없으면 자동 생성
-
+        results_folder = os.path.join("backtesting", "results")
+        os.makedirs(results_folder, exist_ok=True)
         chart_filename = os.path.join(results_folder, f"{symbol}_performance_chart.png")
         report_filename = os.path.join(results_folder, f"{symbol}_backtest_report.html")
-        # ▲▲▲ [개선] ▲▲▲
 
-        stats = bt.optimize(
-            open_threshold=range(8, 15, 2),
-            risk_reward_ratio=[2.0, 2.5, 3.0],
-            maximize='Equity Final [$]'
-        )
-
-        print(f"\n--- [{symbol}] 최적화 결과 ---")
-        print("\n✅ 가장 성과가 좋았던 파라미터 조합:")
-        print(stats._strategy)
-
+        stats = bt.run()
+        print(f"\n--- [{symbol}] 백테스팅 결과 ---")
         report_text, chart_buffer = create_performance_report(stats)
-
         print("\n" + report_text)
 
         if chart_buffer:
-            with open(chart_filename, "wb") as f: # <--- 수정된 경로 사용
+            with open(chart_filename, "wb") as f:
                 f.write(chart_buffer.getbuffer())
-            print(f"\n📈 {chart_filename} 파일에 상세 차트가 저장되었습니다.") # <--- 수정된 경로 사용
+            print(f"\n📈 {chart_filename} 파일에 상세 차트가 저장되었습니다.")
 
-        bt.plot(filename=report_filename) # <--- 수정된 경로 사용
-        print(f"\n📄 {report_filename} 파일에 상세 리포트가 저장되었습니다.") # <--- 수정된 경로 사용
+        bt.plot(filename=report_filename)
+        print(f"\n📄 {report_filename} 파일에 상세 리포트가 저장되었습니다.")
