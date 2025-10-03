@@ -10,6 +10,7 @@ class ConfigManager:
         load_dotenv()
         print("환경 변수 파일(.env)을 로드했습니다.")
         
+        self.fred_api_key = os.getenv("FRED_API_KEY")
         # ▼▼▼ [시즌 2 추가] 전략 설정 파일 로드 ▼▼▼
         try:
             with open("strategies.json", "r", encoding="utf-8") as f:
