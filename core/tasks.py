@@ -392,6 +392,23 @@ class BackgroundTasks:
         if not self.config.exec_active:
             log_message += "자동매매 OFF 상태. 의사결정을 건너뜁니다."
         else:
+            try:
+                # ConfluenceEngine에 포함된 macro_analyzer를 통해 현재 시장 진단
+                current_macro_regime, macro_score, _ = self.confluence_engine.macro_analyzer.diagnose_macro_regime()
+                log_message += f"시장 진단: **{current_macro_regime.value}** (점수: {macro_score}) | "
+                
+                # 약세장에서는 모든 신규 진입 중단 (안정성 강화)
+                if current_macro_regime == MacroRegime.BEAR:
+                    log_message += "🚨 약세장 감지, 모든 신규 진입을 보수적으로 중단합니다."
+                    self.decision_log.insert(0, log_message)
+                    if len(self.decision_log) > 5: self.decision_log.pop()
+                    print(log_message)
+                    return # 함수 실행 종료
+            
+            except Exception as e:
+                current_macro_regime = MacroRegime.SIDEWAYS # 진단 실패 시 안전하게 횡보장으로 간주
+                log_message += f"⚠️ 거시 경제 분석 실패: {e}. 중립 상태로 진행 | "
+
             # ... (이하 기존 의사결정 로직은 모두 동일) ...
             if self.config.adaptive_aggr_enabled:
                 self.update_adaptive_aggression_level()
@@ -466,7 +483,7 @@ class BackgroundTasks:
             except Exception as e:
                 print(f"이벤트 핸들러 오류: {e}")
                 
-    async def manage_open_positions(self, session, open_trades):
+    async def manage_open_positions(self, session, open_trades, market_regime: str):
         """[Phase 1 최종] 분할 익절 및 추적 손절매 기능이 통합된 포지션 관리 로직입니다."""
         for trade in list(open_trades): # 안전한 순회를 위해 list로 복사
             try:
@@ -536,64 +553,50 @@ class BackgroundTasks:
                 print(f"🚨 포지션 관리 중 오류 ({trade.symbol}): {e}")
                 session.rollback()
 
-    async def find_new_entry_opportunities(self, session, open_positions_count, symbols_in_trade):
-        """[시즌 4] 모든 분석 대상의 신호를 수집한 뒤, 가장 점수가 높은 단 하나의 기회에만 진입합니다."""
+    async def find_new_entry_opportunities(self, session, open_positions_count, symbols_in_trade, market_regime: str):
         if open_positions_count >= self.config.max_open_positions:
             return f"슬롯 부족 ({open_positions_count}/{self.config.max_open_positions}). 관망."
 
-        # ▼▼▼ [시즌 4 수정] 모든 유효 신호를 저장할 리스트 생성 ▼▼▼
         valid_opportunities = []
-        # ▲▲▲ [시즌 4 수정] ▲▲▲
-
         for symbol in self.config.symbols:
             if symbol in symbols_in_trade:
                 continue
-
-            recent_signals = session.execute(
-                select(Signal).where(Signal.symbol == symbol).order_by(Signal.id.desc()).limit(self.config.trend_entry_confirm_count)
-            ).scalars().all()
-            if len(recent_signals) < self.config.trend_entry_confirm_count:
-                continue
-
+            
+            # ... (최근 신호 조회 로직은 동일) ...
+            recent_signals = session.execute(select(Signal).where(Signal.symbol == symbol).order_by(Signal.id.desc()).limit(self.config.trend_entry_confirm_count)).scalars().all()
+            if len(recent_signals) < self.config.trend_entry_confirm_count: continue
             recent_scores = [s.final_score for s in recent_signals]
-            side, reason, context = self.confluence_engine.analyze_and_decide(symbol, recent_scores)
-
-            # ▼▼▼ [시즌 4 수정] 신호가 유효하면 바로 주문하지 않고 리스트에 추가 ▼▼▼
+            
+            # ConfluenceEngine의 analyze_and_decide 호출 시 market_regime 전달
+            side, reason, context = self.confluence_engine.analyze_and_decide(symbol, recent_scores, market_regime)
+            
             if side and context:
                 opportunity = {
-                    "symbol": symbol,
-                    "side": side,
-                    "reason": reason,
-                    "context": context,
-                    "avg_score": context.get("avg_score", 0),
-                    "signal_id": recent_signals[0].id
+                    "symbol": symbol, "side": side, "reason": reason, "context": context,
+                    "avg_score": context.get("avg_score", 0), "signal_id": recent_signals[0].id
                 }
                 valid_opportunities.append(opportunity)
-        # ▲▲▲ [시즌 4 수정] ▲▲▲
 
-
-        # ▼▼▼ [시즌 4 수정] 수집된 모든 기회 중에서 최고의 기회를 선택하여 진입 ▼▼▼
         if not valid_opportunities:
             return "탐색 완료, 신규 진입 기회 없음."
-
-        # 'avg_score'의 절대값을 기준으로 가장 점수가 높은 순으로 정렬
+        
         best_opportunity = sorted(valid_opportunities, key=lambda x: abs(x["avg_score"]), reverse=True)[0]
-
-        symbol = best_opportunity["symbol"]
-        side = best_opportunity["side"]
-        context = best_opportunity["context"]
-        avg_score = best_opportunity["avg_score"]
-
-        leverage = self.position_sizer.get_leverage_for_symbol(symbol, self.current_aggr_level)
+        
+        # Position Sizer 호출 시에도 market_regime 전달
+        leverage = self.position_sizer.get_leverage_for_symbol(best_opportunity["symbol"], self.current_aggr_level)
         quantity = self.position_sizer.calculate_position_size(
-            symbol, context['entry_atr'], self.current_aggr_level, open_positions_count, avg_score
+            symbol=best_opportunity["symbol"], 
+            atr=best_opportunity["context"]['entry_atr'], 
+            aggr_level=self.current_aggr_level,
+            open_positions_count=open_positions_count,
+            average_score=best_opportunity["avg_score"],
+            market_regime=market_regime # market_regime 전달
         )
-
+        
         if quantity:
             context['signal_id'] = best_opportunity["signal_id"]
-            await self.trading_engine.place_order_with_bracket(symbol, side, quantity, leverage, context['entry_atr'], context)
-            # 다른 기회들을 포기하고 최고의 기회에 진입했다는 로그를 반환
-            return f"🏆 최고 점수 신호 선택: {best_opportunity['reason']} (다른 {len(valid_opportunities) - 1}개 기회는 보류)"
+            await self.trading_engine.place_order_with_bracket(best_opportunity["symbol"], best_opportunity["side"], quantity, leverage, context['entry_atr'], context)
+            return f"🏆 최고 점수 신호 선택: {best_opportunity['reason']}"
         else:
-            return f"[{symbol}]: 포지션 규모 계산 실패로 진입 보류."
+            return f"[{best_opportunity['symbol']}]: 포지션 규모 계산 실패로 진입 보류."
         # ▲▲▲ [시즌 4 수정] ▲▲▲
