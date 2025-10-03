@@ -12,6 +12,7 @@ from . import data_fetcher, indicator_calculator
 from .core_strategy import diagnose_market_regime, MarketRegime
 from .strategies.trend_strategy import TrendStrategy
 from .strategies.oscillator_strategy import OscillatorStrategy
+from .strategies.comprehensive_strategy import ComprehensiveStrategy
 # --- ▼▼▼ [Phase 2 수정] 신호 필터 전략 임포트 ▼▼▼ ---
 from .strategies.signal_filter_strategy import SignalFilterStrategy
 # --- ▲▲▲ [Phase 2 수정] ▲▲▲ ---
@@ -28,6 +29,7 @@ class ConfluenceEngine:
         strategy_classes = {
             "TrendStrategy": TrendStrategy,
             "OscillatorStrategy": OscillatorStrategy,
+            "BollingerStrategy": BollingerStrategy,
         }
 
         for name, cls in strategy_classes.items():
