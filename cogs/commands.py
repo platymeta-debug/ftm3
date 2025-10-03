@@ -4,6 +4,7 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 from sqlalchemy import select
+from binance.client import Client
 import asyncio
 
 # ▼▼▼ [오류 수정] 프로젝트 루트 폴더를 시스템 경로에 최우선으로 추가 ▼▼▼
@@ -34,68 +35,67 @@ class CommandCog(commands.Cog):
     @app_commands.describe(코인="백테스팅을 실행할 코인 심볼 (예: BTCUSDT)")
     async def run_backtest_kr(self, interaction: discord.Interaction, 코인: str):
         symbol = 코인.upper()
-        # 이 defer 응답이 thinking=True로 설정되어 "생각 중..." 상태를 표시합니다.
-        await interaction.response.defer(ephemeral=False, thinking=True)
-
+        
+        # ▼▼▼ [최종 수정] Defer 호출을 try 블록 안으로 이동 및 예외 처리 추가 ▼▼▼
         try:
-            # ▼▼▼ [진단 코드 추가] ▼▼▼
+            # 봇이 응답할 시간을 벌어줍니다.
+            await interaction.response.defer(ephemeral=False, thinking=True)
+            
             print(f"[/성과] 1. '{symbol}' 백테스팅 시작...")
             loop = asyncio.get_event_loop()
+
+            backtest_client = Client(self.bot.config.api_key, self.bot.config.api_secret, testnet=self.bot.config.is_testnet)
+            if self.bot.config.is_testnet:
+                backtest_client.FUTURES_URL = 'https://testnet.binancefuture.com'
             
             klines_data = await loop.run_in_executor(
-                None, fetch_klines, self.bot.binance_client, symbol, "1d", 500
+                None, fetch_klines, backtest_client, symbol, "1d", 500
             )
 
             if klines_data is None or klines_data.empty:
-                print(f"[/성과] 오류: '{symbol}'의 과거 데이터를 가져오지 못했습니다.") # 진단용 print
                 await interaction.followup.send(f"❌ `{symbol}`의 과거 데이터를 가져오는 데 실패했습니다.")
                 return
 
-            # ▼▼▼ [진단 코드 추가] ▼▼▼
             print(f"[/성과] 2. 데이터 로드 성공. (총 {len(klines_data)}개 캔들)")
-            
             klines_data.columns = [col.capitalize() for col in klines_data.columns]
 
             def run_bt():
+                # ... (run_bt 함수 내용은 이전과 동일) ...
                 print("[/성과] 3. 백테스팅 라이브러리 실행 직전...")
-
-                # ▼▼▼ [수정] 코인별로 다른 진입 점수를 사용하도록 동적 설정 ▼▼▼
                 strategy_params = self.bot.config.get_strategy_params(symbol)
                 StrategyRunner.open_threshold = strategy_params.get("open_th", 12.0)
                 print(f"[/성과] '{symbol}'의 진입 점수 임계값: {StrategyRunner.open_threshold}")
-                # ▲▲▲ [수정] ▲▲▲
-
-                bt = Backtest(klines_data, StrategyRunner, cash=10_000, commission=.002)
+                bt = Backtest(klines_data, StrategyRunner, cash=10_000, commission=.002, margin=1/5)
                 stats = bt.run()
                 print("[/성과] 4. 백테스팅 실행 완료.")
                 return stats
 
             stats = await loop.run_in_executor(None, run_bt)
             
-            # ▼▼▼ [진단 코드 추가] ▼▼▼
             print("[/성과] 5. 리포트 생성 시작...")
             report_text, chart_buffer = create_performance_report(stats)
             print("[/성과] 6. 리포트 생성 완료.")
-            # ▲▲▲ [진단 코드 추가] ▲▲▲
 
             if chart_buffer:
                 file = discord.File(chart_buffer, filename=f"{symbol}_performance.png")
-                # interaction.followup.send를 사용하여 "생각 중..." 메시지에 응답합니다.
                 await interaction.followup.send(content=report_text, file=file)
             else:
                 await interaction.followup.send(content=report_text)
             
-            print(f"[/성과] 7. '{symbol}' 결과 전송 완료.") # 진단용 print
+            print(f"[/성과] 7. '{symbol}' 결과 전송 완료.")
 
+        except discord.errors.NotFound:
+            # 타임아웃 오류가 발생하면 사용자에게 알리지 않고, 터미널에만 로그를 남깁니다.
+            # 백테스팅 계산은 이미 완료되었으므로 터미널에서 결과를 확인할 수 있습니다.
+            print("⚠️ DISCORD TIMEOUT: Interaction expired. Backtest results are available in the console.")
         except Exception as e:
-            # ▼▼▼ [진단 코드 추가] ▼▼▼
-            # traceback을 import 해야 합니다. 파일 상단에 import traceback 추가
             import traceback
             print(f"🚨 [/성과] 명령어 처리 중 심각한 예외 발생:")
-            traceback.print_exc() # 전체 오류 스택을 출력
-            # ▲▲▲ [진단 코드 추가] ▲▲▲
-            await interaction.followup.send(f"🚨 백테스팅 실행 중 오류가 발생했습니다: `{e}`")
-
+            traceback.print_exc()
+            # defer가 성공한 이후에 오류가 났을 경우 followup.send로 사용자에게 알립니다.
+            if interaction.response.is_done():
+                await interaction.followup.send(f"🚨 백테스팅 실행 중 오류가 발생했습니다: `{e}`")
+        # ▲▲▲ [최종 수정] ▲▲▲
 
     # ... (이하 다른 명령어들은 그대로 유지)
     @app_commands.command(name="패널", description="인터랙티브 제어실을 소환합니다.")
