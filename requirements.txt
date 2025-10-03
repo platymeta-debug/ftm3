@@ -9,3 +9,4 @@ Backtesting
 bokeh
 matplotlib
 pytest
+alembic
