@@ -7,6 +7,7 @@ from sqlalchemy import select
 from core.event_bus import event_bus
 import pandas as pd
 import requests
+import asyncio
 
 import pandas as pd
 import requests
@@ -324,34 +325,45 @@ class BackgroundTasks:
     @tasks.loop(minutes=1)
     async def data_collector_loop(self):
         print(f"\n--- [Data Collector] 분석 시작: {datetime.now().strftime('%H:%M:%S')} ---")
-        try:
-            with db_manager.get_session() as session:
-                for symbol in self.config.symbols:
-                    analysis_result = self.confluence_engine.analyze_symbol(symbol)
-                    if not analysis_result:
-                        self.latest_analysis_results.pop(symbol, None) # 데이터가 없으면 제거
-                        continue
-                    
-                    final_score, tf_scores, tf_rows, tf_breakdowns, fng, confluence = analysis_result
-                    
-                    daily_row = tf_rows.get("1d")
-                    four_hour_row = tf_rows.get("4h")
-                    market_regime = MarketRegime.SIDEWAYS
-                    if daily_row is not None and not daily_row.empty and four_hour_row is not None and not four_hour_row.empty:
-                        market_data = pd.Series({
-                            'adx_4h': four_hour_row.get('ADX_14'),
-                            'is_above_ema200_1d': daily_row.get('close') > daily_row.get('EMA_200') if pd.notna(daily_row.get('EMA_200')) else False
-                        })
-                        market_regime = diagnose_market_regime(market_data, self.config.market_regime_adx_th)
 
-                    self.latest_analysis_results[symbol] = {
-                        "final_score": final_score, "tf_rows": tf_rows,
-                        "tf_breakdowns": tf_breakdowns, "market_regime": market_regime,
-                        "fng_index": fng, "confluence": confluence
-                    }
-                session.commit()
-        except Exception as e:
-            print(f"🚨 데이터 수집 루프 중 오류: {e}")
+        # ▼▼▼ [최종 수정] 봇을 멈추게 하는 분석 로직을 별도 스레드에서 실행하도록 변경 ▼▼▼
+        def blocking_analysis():
+            results = {}
+            try:
+                with db_manager.get_session() as session:
+                    for symbol in self.config.symbols:
+                        analysis_result = self.confluence_engine.analyze_symbol(symbol)
+                        if not analysis_result:
+                            results.pop(symbol, None)
+                            continue
+                        
+                        final_score, tf_scores, tf_rows, tf_breakdowns, fng, confluence = analysis_result
+                        
+                        daily_row = tf_rows.get("1d")
+                        four_hour_row = tf_rows.get("4h")
+                        market_regime = MarketRegime.SIDEWAYS
+                        if daily_row is not None and not daily_row.empty and four_hour_row is not None and not four_hour_row.empty:
+                            market_data = pd.Series({
+                                'adx_4h': four_hour_row.get('ADX_14'),
+                                'is_above_ema200_1d': daily_row.get('close') > daily_row.get('EMA_200') if pd.notna(daily_row.get('EMA_200')) else False
+                            })
+                            market_regime = diagnose_market_regime(market_data, self.config.market_regime_adx_th)
+
+                        results[symbol] = {
+                            "final_score": final_score, "tf_rows": tf_rows,
+                            "tf_breakdowns": tf_breakdowns, "market_regime": market_regime,
+                            "fng_index": fng, "confluence": confluence
+                        }
+                    session.commit()
+                return results
+            except Exception as e:
+                print(f"🚨 데이터 수집 스레드 내부 오류: {e}")
+                return {}
+
+        loop = asyncio.get_event_loop()
+        analysis_results = await loop.run_in_executor(None, blocking_analysis)
+        self.latest_analysis_results.update(analysis_results)
+        # ▲▲▲ [최종 수정] ▲▲▲
 
         try:
             channel = self.bot.get_channel(self.config.analysis_channel_id)
