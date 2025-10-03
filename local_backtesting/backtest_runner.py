@@ -1,4 +1,4 @@
-# local_backtesting/backtest_runner.py (최종 수정본)
+# local_backtesting/backtest_runner.py (최종 진단 코드 포함)
 
 import pandas as pd
 from backtesting import Strategy, Backtest
@@ -37,31 +37,39 @@ class StrategyRunner(Strategy):
         print(f"[StrategyRunner] init() 완료. 지표 계산 완료. (총 {len(self.indicators)}개 데이터)")
 
     def next(self):
-        # [수정] 현재 데이터의 인덱스를 가져오는 올바른 방법으로 변경
         current_index = len(self.data) - 1
 
         if current_index < self.trend_entry_confirm_count:
             return
 
-        # 현재 시점까지의 데이터로 점수 계산
         current_indicators = self.indicators.iloc[:current_index + 1]
         if current_indicators.empty: return
 
         final_score, _ = self.engine._calculate_tactical_score(current_indicators)
         self.recent_scores.append(final_score)
 
-        # 진입 결정 로직
+        if len(self.recent_scores) < self.trend_entry_confirm_count:
+            return
+            
         avg_score = sum(self.recent_scores) / len(self.recent_scores)
+        
+        # ▼▼▼ [핵심 진단 코드] ▼▼▼
+        # 20일에 한 번씩 현재 점수 상황을 터미널에 출력합니다.
+        if current_index % 20 == 0:
+            print(f"[Backtest Log] Day {current_index} | Avg Score: {avg_score:.2f} | Threshold: {self.open_threshold}")
+        # ▲▲▲ [핵심 진단 코드] ▲▲▲
+
         side = None
         if avg_score >= self.open_threshold:
             side = "BUY"
+            print(f"✅✅✅ [Backtest Log] Day {current_index} - BUY SIGNAL! Avg Score: {avg_score:.2f} ✅✅✅")
         elif avg_score <= -self.open_threshold:
             side = "SELL"
+            print(f"❌❌❌ [Backtest Log] Day {current_index} - SELL SIGNAL! Avg Score: {avg_score:.2f} ❌❌❌")
 
-        # 주문 실행
         if side and not self.position:
-            last_row = self.indicators.iloc[current_index] # 현재 캔들의 지표
-            entry_atr = last_row.get("atrr_14", last_row.get("atr_14", 0)) # 컬럼명이 소문자로 통일되었을 가능성에 대비
+            last_row = self.indicators.iloc[current_index]
+            entry_atr = last_row.get("atrr_14", last_row.get("atr_14", 0))
             if not entry_atr or entry_atr <= 0: return
 
             stop_loss_distance = entry_atr * config.sl_atr_multiplier
