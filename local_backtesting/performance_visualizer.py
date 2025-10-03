@@ -1,5 +1,6 @@
 # 파일명: backtesting/performance_visualizer.py
-
+import matplotlib
+matplotlib.use('Agg')
 import pandas as pd
 import matplotlib.pyplot as plt
 import io
