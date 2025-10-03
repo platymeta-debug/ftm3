@@ -1,11 +1,9 @@
-# analysis/macro_analyzer.py (전문가 수준으로 업그레이드)
-
 import pandas as pd
 import yfinance as yf
 from fredapi import Fred
 from enum import Enum
 from datetime import datetime, timedelta
-from core.config_manager import config # config 임포트
+from core.config_manager import config
 
 class MacroRegime(Enum):
     BULL = "강세 국면 (Risk-On)"
@@ -29,39 +27,72 @@ class MacroAnalyzer:
                 print(f"🚨 FRED API 키 초기화 실패: {e}. 일부 데이터 조회가 제한됩니다.")
         else:
             print("⚠️ FRED_API_KEY가 .env 파일에 설정되지 않았습니다. 일부 데이터 조회가 제한됩니다.")
-        print("📈 거시 경제 분석기(v2.0 Expert)가 초기화되었습니다.")
+        print("📈 거시 경제 분석기(v2.4 Final)가 초기화되었습니다.")
 
-
-    def _get_data(self, ticker: str, period: str = "1y", interval: str = "1d") -> pd.DataFrame | None:
-        """yfinance를 통해 데이터를 가져오고 캐시합니다."""
-        now = datetime.now()
-        cache_key = f"{ticker}_{period}_{interval}"
-        if cache_key in self.cache and (now - self.cache[cache_key]['timestamp'] < self.cache_expiry):
-            return self.cache[cache_key]['data']
+    def _get_data(self, ticker: str, period: str = "3y", interval: str = "1d") -> pd.DataFrame | None:
         try:
-            data = yf.download(ticker, period=period, interval=interval, progress=False)
-            if data.empty: return None
-            self.cache[cache_key] = {'timestamp': now, 'data': data}
-            return data
+            data = yf.download(ticker, period=period, interval=interval, progress=False, auto_adjust=False)
+            return data if not data.empty else None
         except Exception as e:
             print(f"🚨 yfinance 데이터 다운로드 실패 ({ticker}): {e}")
             return None
 
     def _get_fred_data(self, series_id: str) -> pd.DataFrame | None:
-        """FRED를 통해 경제 데이터를 가져오고 캐시합니다."""
-        if self.fred is None: return None
-        now = datetime.now()
-        if series_id in self.cache and (now - self.cache[series_id]['timestamp'] < self.cache_expiry):
-            return self.cache[series_id]['data']
-        try:
-            start_date = (datetime.now() - timedelta(days=730)).strftime('%Y-%m-%d')
-            data = self.fred.get_series(series_id, start_date=start_date)
-            if data.empty: return None
-            self.cache[series_id] = {'timestamp': now, 'data': data}
-            return data
-        except Exception as e:
-            print(f"🚨 FRED 데이터 조회 실패 ({series_id}): {e}")
-            return None
+        if self.fred:
+            try:
+                return self.fred.get_series(series_id, start_date="2020-01-01")
+            except Exception as e:
+                print(f"🚨 FRED 데이터 조회 실패 ({series_id}): {e}")
+                return None
+        return None
+
+    def diagnose_macro_regime_for_date(self, analysis_date, macro_data: dict) -> tuple[MacroRegime, int, dict]:
+        scores = {}
+
+        def get_latest_row(df, date):
+            if df is None: return None
+            if df.index.tz is not None and getattr(date, 'tzinfo', None) is None:
+                date = pd.Timestamp(date).tz_localize(df.index.tz)
+            elif df.index.tz is None and getattr(date, 'tzinfo', None) is not None:
+                date = date.tz_convert(None).tz_localize(None)
+            subset = df.loc[:date]
+            return subset.iloc[-1] if not subset.empty else None
+
+        # --- ▼▼▼ [수정] 값의 존재 여부와 유효성을 명확히 분리하여 오류 해결 ---
+        
+        # 1. NASDAQ Analysis
+        scores["주도주(나스닥)"] = 0
+        nasdaq = macro_data.get('nasdaq')
+        nasdaq_row = get_latest_row(nasdaq, analysis_date)
+        if nasdaq_row is not None:
+            sma_val = nasdaq_row.get('SMA_200')
+            close_val = nasdaq_row.get('Close')
+            if pd.notna(sma_val) and pd.notna(close_val):
+                scores["주도주(나스닥)"] = 5 if close_val > sma_val else -5
+
+        # 2. VIX Analysis
+        scores["변동성(VIX)"] = 0
+        vix = macro_data.get('vix')
+        vix_row = get_latest_row(vix, analysis_date)
+        if vix_row is not None:
+            sma_val = vix_row.get('SMA_20')
+            close_val = vix_row.get('Close')
+            if pd.notna(sma_val) and pd.notna(close_val):
+                if close_val > 30:
+                    scores["변동성(VIX)"] = -5
+                elif close_val > 20 and close_val > sma_val:
+                    scores["변동성(VIX)"] = -3
+                elif close_val < 15:
+                    scores["변동성(VIX)"] = 3
+
+        final_score = sum(scores.values())
+
+        if final_score >= 5:
+            return MacroRegime.BULL, final_score, scores
+        elif final_score <= -5:
+            return MacroRegime.BEAR, final_score, scores
+        else:
+            return MacroRegime.SIDEWAYS, final_score, scores
 
     # --- 개별 지표 분석 함수들 ---
     def analyze_market_leader(self) -> (int, str):
@@ -146,3 +177,16 @@ class MacroAnalyzer:
             return MacroRegime.BEAR, final_score, scores
         else:
             return MacroRegime.SIDEWAYS, final_score, scores
+
+    def preload_all_macro_data(self):
+        """최적화 분석 속도 향상을 위해 모든 거시 경제 데이터를 미리 불러옵니다."""
+        print("...모든 거시 경제 데이터를 미리 불러옵니다...")
+        nasdaq = self._get_data("^IXIC")
+        if nasdaq is not None:
+            nasdaq['SMA_200'] = nasdaq['Close'].rolling(window=200).mean()
+
+        vix = self._get_data("^VIX")
+        if vix is not None:
+            vix['SMA_20'] = vix['Close'].rolling(window=20).mean()
+
+        return {"nasdaq": nasdaq, "vix": vix}
