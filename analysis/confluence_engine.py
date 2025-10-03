@@ -1,4 +1,4 @@
-ㅁ# 파일명: analysis/confluence_engine.py (Phase 2 - 필터 적용)
+# 파일명: analysis/confluence_engine.py (Phase 2 - 필터 적용)
 
 from __future__ import annotations
 import math
@@ -10,6 +10,7 @@ import statistics
 
 from . import data_fetcher, indicator_calculator
 from .core_strategy import diagnose_market_regime, MarketRegime
+from .macro_analyzer import MacroAnalyzer, MacroRegime as GlobalMacroRegime
 from .strategies.trend_strategy import TrendStrategy
 from .strategies.oscillator_strategy import OscillatorStrategy
 from .strategies.comprehensive_strategy import ComprehensiveStrategy
@@ -23,6 +24,7 @@ class ConfluenceEngine:
     def __init__(self, client: Client):
         self.client = client
         self.fear_and_greed_index = 50
+        self.macro_analyzer = MacroAnalyzer()
 
         # --- ▼▼▼ [시즌 2 수정] 설정 파일을 읽어 전략 인스턴스 생성 ▼▼▼ ---
         self.strategies = []
@@ -49,6 +51,8 @@ class ConfluenceEngine:
         analysis_result = self.analyze_symbol(symbol)
         if not analysis_result:
             return None, f"[{symbol}]: 데이터 분석 실패.", None
+
+        macro_regime, macro_score = self.macro_analyzer.diagnose_macro_regime()
 
         final_score, _, tf_rows, _, _, _ = analysis_result
         daily_row = tf_rows.get("1d")
