@@ -1,17 +1,12 @@
-# 파일명: analysis/indicator_calculator.py (데이터 소실 버그 해결을 위한 최종 버전)
+# analysis/indicator_calculator.py (모든 지표 계산 최종본)
 
 import pandas as pd
 import pandas_ta as ta
 
 def calculate_all_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    [V5.1 최종] 데이터 전달 과정에서 발생하는 컬럼 소실 버그를 해결하기 위해
-    가장 안정적인 데이터프레임 확장 방식을 사용하고, 최종 결과물을 출력하여 검증합니다.
-    """
     if not isinstance(df, pd.DataFrame) or df.empty:
         return pd.DataFrame()
 
-    # --- 1. 데이터 준비 및 정제 ---
     try:
         df_out = df.copy()
         df_out.columns = [col.lower() for col in df_out.columns]
@@ -24,40 +19,65 @@ def calculate_all_indicators(df: pd.DataFrame) -> pd.DataFrame:
         print(f"🚨 데이터 준비 과정 오류: {e}")
         return pd.DataFrame()
 
-    # --- 2. pandas-ta의 확장(extension) 기능을 사용하여 모든 지표를 순차적으로 추가 ---
-    # 이 방식이 가장 안정적이며 데이터프레임 내부 구조를 해치지 않습니다.
-    df_out.ta.ema(length=20, append=True)
-    df_out.ta.ema(length=50, append=True)
-    df_out.ta.ema(length=200, append=True)
-    df_out.ta.rsi(append=True)
-    df_out.ta.stoch(append=True)
-    df_out.ta.obv(append=True)
-    df_out.ta.mfi(append=True)
-    df_out.ta.atr(append=True)
-    df_out.ta.adx(append=True)
-    df_out.ta.macd(append=True)
-    
-    # --- 3. 여러 컬럼을 반환하는 지표는 별도로 안전하게 처리 ---
+    # ▼▼▼ [핵심] pandas-ta 라이브러리의 모든 주요 지표를 포함하는 전략 생성 ▼▼▼
+    AllIndicatorsStrategy = ta.Strategy(
+        name="Comprehensive Indicator Arsenal",
+        description="Calculates a vast array of indicators for ML and analysis",
+        ta=[
+            # Trend (추세)
+            {"kind": "ema", "length": 20},
+            {"kind": "ema", "length": 50},
+            {"kind": "ema", "length": 200},
+            {"kind": "macd"},
+            {"kind": "adx"},
+            {"kind": "ichimoku"},
+            {"kind": "psar"},
+            {"kind": "chop"},
+            {"kind": "vortex"}, # Vortex Indicator
+
+            # Momentum (모멘텀)
+            {"kind": "rsi"},
+            {"kind": "stoch"},
+            {"kind": "stochrsi"},
+            {"kind": "mfi"},
+            {"kind": "cci"},
+            {"kind": "roc"},
+            {"kind": "ppo"}, # Percentage Price Oscillator
+            {"kind": "trix"}, # Trix
+            {"kind": "cmo"}, # Chande Momentum Oscillator
+
+            # Volume (거래량)
+            {"kind": "obv"},
+            {"kind": "vwap"},
+            {"kind": "cmf"}, # Chaikin Money Flow
+            {"kind": "efi"}, # Elder's Force Index
+
+            # Volatility (변동성)
+            {"kind": "bbands"},
+            {"kind": "atr"},
+            {"kind": "true_range"},
+            {"kind": "donchian"}, # Donchian Channels
+            {"kind": "kc"}, # Keltner Channels
+
+            # Other (기타/사용자 정의)
+            # 예시: 특정 기간의 최고/최저가
+            {"kind": "highest", "length": 50},
+            {"kind": "lowest", "length": 50},
+        ]
+    )
+    # ▲▲▲ [핵심] ▲▲▲
+
     try:
-        # 볼린저 밴드
-        bbands_df = df_out.ta.bbands(length=20, std=2, append=False)
-        if bbands_df is not None:
-            df_out = pd.concat([df_out, bbands_df], axis=1)
-
-        # 이치모쿠
-        ichimoku_df, _ = df_out.ta.ichimoku(append=False)
-        if ichimoku_df is not None:
-            df_out = pd.concat([df_out, ichimoku_df], axis=1)
-            if "ISA_9" in df_out.columns: df_out["ISA_9"] = df_out["ISA_9"].shift(-25)
-            if "ISB_26" in df_out.columns: df_out["ISB_26"] = df_out["ISB_26"].shift(-25)
-
+        df_out.ta.strategy(AllIndicatorsStrategy)
     except Exception as e:
-        print(f"🚨 다중 컬럼 지표 병합 중 오류 발생: {e}")
-    
-    # --- 4. 최종 검증 단계 ---
-    # 이 함수가 반환하기 직전의 최종 컬럼 목록을 출력하여 데이터 존재 여부를 증명합니다.
-    print("--- [indicator_calculator] 최종 생성된 컬럼 목록 ---")
-    print(df_out.columns.to_list())
-    print("----------------------------------------------------")
+        print(f"🚨 pandas-ta 전략 실행 중 오류: {e}")
+
+    # 이치모쿠 후행 지표 이동
+    if "ISA_9" in df_out.columns and "ISB_26" in df_out.columns:
+        df_out["ISA_9"] = df_out["ISA_9"].shift(-25)
+        df_out["ISB_26"] = df_out["ISB_26"].shift(-25)
+
+    print(f"--- [indicator_calculator] 총 {len(df_out.columns)}개의 컬럼(지표 포함) 생성 완료 ---")
+    # print(df_out.columns.to_list()) # 너무 길어서 주석 처리
 
     return df_out
