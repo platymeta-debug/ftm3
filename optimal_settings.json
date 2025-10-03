@@ -1,0 +1,21 @@
+{
+  "BULL": {
+    "BTCUSDT": {
+      "OPEN_TH": 16,
+      "RR_RATIO": 3.0,
+      "SL_ATR_MULTIPLIER": 1.5,
+      "OPTIMIZED_METRIC": "Calmar Ratio",
+      "VALUE": 1.825
+    }
+  },
+  "BEAR": {
+    "BTCUSDT": {
+      "OPEN_TH": 10,
+      "RR_RATIO": 1.5,
+      "SL_ATR_MULTIPLIER": 2.0,
+      "OPTIMIZED_METRIC": "Calmar Ratio",
+      "VALUE": 0.987
+    }
+  },
+  "SIDEWAYS": {}
+}
