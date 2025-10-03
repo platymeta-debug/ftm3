@@ -1,4 +1,4 @@
-# 파일명: analysis/confluence_engine.py (Phase 2 - 필터 적용)
+ㅁ# 파일명: analysis/confluence_engine.py (Phase 2 - 필터 적용)
 
 from __future__ import annotations
 import math
@@ -26,10 +26,11 @@ class ConfluenceEngine:
 
         # --- ▼▼▼ [시즌 2 수정] 설정 파일을 읽어 전략 인스턴스 생성 ▼▼▼ ---
         self.strategies = []
+        # 이제 이 리스트만 수정하면 모든 전략을 관리할 수 있습니다.
         strategy_classes = {
             "TrendStrategy": TrendStrategy,
             "OscillatorStrategy": OscillatorStrategy,
-            "BollingerStrategy": BollingerStrategy,
+            "ComprehensiveStrategy": ComprehensiveStrategy, 
         }
 
         for name, cls in strategy_classes.items():
