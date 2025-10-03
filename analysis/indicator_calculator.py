@@ -14,6 +14,7 @@ def calculate_all_indicators(df: pd.DataFrame) -> pd.DataFrame:
     # --- 1. 데이터 준비 및 정제 ---
     try:
         df_out = df.copy()
+        df_out.columns = [col.lower() for col in df_out.columns]
         core_cols = ['open', 'high', 'low', 'close', 'volume']
         for col in core_cols:
             df_out[col] = pd.to_numeric(df_out[col], errors='coerce')
