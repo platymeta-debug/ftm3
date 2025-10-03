@@ -1,4 +1,4 @@
-# analysis/indicator_calculator.py (모든 지표 계산 최종 완성본)
+# analysis/indicator_calculator.py (호환성 문제 최종 해결)
 
 import pandas as pd
 import pandas_ta as ta
@@ -19,59 +19,37 @@ def calculate_all_indicators(df: pd.DataFrame) -> pd.DataFrame:
         print(f"🚨 데이터 준비 과정 오류: {e}")
         return pd.DataFrame()
 
-    # ▼▼▼ [핵심 수정] ComprehensiveStrategy에서 사용하는 모든 지표를 추가합니다. ▼▼▼
-    AllIndicatorsStrategy = ta.Strategy(
-        name="Comprehensive Indicator Arsenal",
-        description="Calculates a vast array of indicators for ML and analysis",
-        ta=[
-            # Trend (추세)
-            {"kind": "ema", "length": 20},
-            {"kind": "ema", "length": 50},
-            {"kind": "ema", "length": 200},
-            {"kind": "macd"},
-            {"kind": "adx"},
-            {"kind": "ichimoku"},
-            {"kind": "psar"},
-            {"kind": "chop"},
-            {"kind": "vortex"},
-            {"kind": "trix", "length": 30, "signal": 9}, # TRIX 추가
-
-            # Momentum (모멘텀)
-            {"kind": "rsi"},
-            {"kind": "stoch"},
-            {"kind": "stochrsi"}, # 스토캐스틱 RSI 추가
-            {"kind": "mfi"},
-            {"kind": "cci"},
-            {"kind": "roc"},
-            {"kind": "ppo"}, # PPO 추가
-            {"kind": "cmo"},
-
-            # Volume (거래량)
-            {"kind": "obv"},
-            {"kind": "vwap"},
-            {"kind": "cmf"},
-            {"kind": "efi"}, # 엘더의 힘 지수 추가
-
-            # Volatility (변동성)
-            {"kind": "bbands"},
-            {"kind": "atr"},
-            {"kind": "true_range"},
-            {"kind": "donchian"},
-            {"kind": "kc"}, # 켈트너 채널 추가
-        ]
-    )
-    # ▲▲▲ [핵심 수정] ▲▲▲
-
     try:
-        df_out.ta.strategy(AllIndicatorsStrategy)
-    except Exception as e:
-        print(f"🚨 pandas-ta 전략 실행 중 오류: {e}")
+        # --- ▼▼▼ [수정] 모든 버전에 호환되도록 개별 지표 직접 호출 방식으로 변경 ▼▼▼
+        df_out.ta.ema(length=20, append=True)
+        df_out.ta.ema(length=50, append=True)
+        df_out.ta.ema(length=200, append=True)
+        df_out.ta.rsi(append=True)
+        df_out.ta.macd(append=True)
+        df_out.ta.atr(append=True)
+        df_out.ta.bbands(append=True)
+        df_out.ta.adx(append=True)
+        df_out.ta.ichimoku(append=True)
+        df_out.ta.psar(append=True)
+        df_out.ta.chop(append=True)
+        df_out.ta.vortex(append=True)
+        df_out.ta.trix(append=True)
+        df_out.ta.stochrsi(append=True)
+        df_out.ta.mfi(append=True)
+        df_out.ta.cci(append=True)
+        df_out.ta.ppo(append=True)
+        df_out.ta.cmf(append=True)
+        df_out.ta.efi(append=True)
+        df_out.ta.kc(append=True)
+        # --- ▲▲▲ [수정] ---
 
-    # 이치모쿠 후행 지표 이동
-    if "ISA_9" in df_out.columns and "ISB_26" in df_out.columns:
-        df_out["ISA_9"] = df_out["ISA_9"].shift(-25)
-        df_out["ISB_26"] = df_out["ISB_26"].shift(-25)
+        # 이치모쿠 후행 지표 이동
+        if "ISA_9" in df_out.columns and "ISB_26" in df_out.columns:
+            df_out["ISA_9"] = df_out["ISA_9"].shift(-25)
+            df_out["ISB_26"] = df_out["ISB_26"].shift(-25)
+
+    except Exception as e:
+        print(f"🚨 pandas-ta 지표 계산 중 심각한 오류 발생: {e}")
 
     print(f"--- [indicator_calculator] 총 {len(df_out.columns)}개의 컬럼(지표 포함) 생성 완료 ---")
-
     return df_out
