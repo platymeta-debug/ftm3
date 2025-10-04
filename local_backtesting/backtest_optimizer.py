@@ -1,10 +1,20 @@
 # -*- coding: utf-8 -*-
 # local_backtesting/backtest_optimizer.py
+"""
+V5 — 실행정책(부분익절/타임스탑/트레일링)까지 최적화 + 백테스트 반영
+
+핵심 변경:
+- OptoRunner: 기존 단일 SL/TP 하드코딩 삭제 → 실행정책 시뮬레이션(멀티 TP/타임스탑/트레일링) 추가
+- 탐색공간에 실행정책 노브 추가(exec_partial, exec_time_stop_bars, exec_trailing_mode, exec_trailing_k)
+- optimal_settings.json에 실행정책 키까지 저장 → runner가 그대로 사용
+"""
+
 import multiprocessing
 from backtesting import backtesting
 backtesting.Pool = multiprocessing.Pool
 
 import pandas as pd
+import numpy as np
 import json
 from backtesting import Strategy
 from backtesting.lib import FractionalBacktest
@@ -14,41 +24,17 @@ import sys
 import os
 from tqdm import tqdm
 
-# numpy/pandas 값들을 파이썬 내장형으로 캐스팅해 JSON 직렬화 가능하게 변환
-def _to_jsonable_dict(d: dict) -> dict:
-    def conv(x):
-        # numpy 계열
-        try:
-            import numpy as np  # noqa
-            if isinstance(x, (np.integer,)):
-                return int(x)
-            if isinstance(x, (np.floating,)):
-                return float(x)
-            if isinstance(x, (np.bool_,)):
-                return bool(x)
-        except Exception:
-            pass
-        # pandas 계열
-        if isinstance(x, pd.Timestamp):
-            return x.isoformat()
-        # 기본형은 그대로
-        if isinstance(x, (int, float, bool, str)) or x is None:
-            return x
-        # 그 외는 문자열로 안전 변환
-        try:
-            return float(x)
-        except Exception:
-            try:
-                return int(x)
-            except Exception:
-                return str(x)
-    return {k: conv(v) for k, v in d.items()}
-
-
 # --- 프로젝트 경로 설정 ---
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 if project_root not in sys.path:
     sys.path.insert(0, project_root)
+
+# .env 로드 추가
+try:
+    from dotenv import load_dotenv
+    load_dotenv(os.path.join(project_root, ".env"))  # 프로젝트 루트의 .env
+except Exception:
+    pass
 
 from analysis import indicator_calculator, data_fetcher
 from analysis.confluence_engine import ConfluenceEngine
@@ -61,6 +47,32 @@ try:
     _HAS_OPTIMIZERS = True
 except Exception:
     _HAS_OPTIMIZERS = False
+
+
+def _to_jsonable_dict(d: dict) -> dict:
+    def conv(x):
+        try:
+            import numpy as np  # noqa
+            if isinstance(x, (np.integer,)):
+                return int(x)
+            if isinstance(x, (np.floating,)):
+                return float(x)
+            if isinstance(x, (np.bool_,)):
+                return bool(x)
+        except Exception:
+            pass
+        if isinstance(x, pd.Timestamp):
+            return x.isoformat()
+        if isinstance(x, (int, float, bool, str)) or x is None:
+            return x
+        try:
+            return float(x)
+        except Exception:
+            try:
+                return int(x)
+            except Exception:
+                return str(x)
+    return {k: conv(v) for k, v in d.items()}
 
 
 def segment_data_by_regime(klines_df: pd.DataFrame, macro_data: dict) -> dict:
@@ -84,22 +96,32 @@ def segment_data_by_regime(klines_df: pd.DataFrame, macro_data: dict) -> dict:
 
 
 class OptoRunner(Strategy):
-    # 1) 실행 조건
+    """
+    분석(ConfluenceEngine) + 실행정책 시뮬(부분익절/타임스탑/트레일링)
+    실행정책 파라미터는 bt.run(...) 인자로 주입된다.
+    """
+
+    # ====== 실행정책(기본값, bt.run으로 덮인다) ======
     open_threshold = 12.0
     risk_reward_ratio = 2.0
     sl_atr_multiplier = 1.5
     trend_entry_confirm_count = 3
-    # 2) Trend
+
+    # 실행정책 확장
+    exec_partial = "1.0"                # "1.0" 또는 "0.3,0.3,0.4"
+    exec_time_stop_bars = 0             # 0이면 비활성
+    exec_trailing_mode = "off"          # "off"|"atr"|"percent"
+    exec_trailing_k = 0.0               # atr배수 또는 percent
+
+    # ====== 분석 파라미터 ======
     ema_short = 20
     ema_long = 50
     score_strong_trend = 5
-    # 3) Oscillator(요지)
     rsi_period = 14
     rsi_oversold = 30
     rsi_overbought = 70
     score_oversold = 5
     score_overbought = -5
-    # 4) Comprehensive(요지)
     score_macd_cross_up = 2
     adx_threshold = 25
     score_adx_strong = 3
@@ -110,8 +132,18 @@ class OptoRunner(Strategy):
     symbol = "BTCUSDT"
     market_regime = "BULL"
 
+    # ====== 상태 ======
+    _recent_scores: deque
+    _in_pos: bool
+    _side: str
+    _entry_px: float
+    _entry_atr: float
+    _sl_px: float
+    _tp_plan: list
+    _bars_held: int
+
     def init(self):
-        # backtesting 파라미터 → 전략 Config 구성
+        # 분석 엔진 초기화
         strategy_configs = {
             "TrendStrategy": {
                 "enabled": True,
@@ -126,7 +158,6 @@ class OptoRunner(Strategy):
                 "rsi_overbought": int(self.rsi_overbought),
                 "score_oversold": int(self.score_oversold),
                 "score_overbought": int(self.score_overbought),
-                # 나머지는 기본값(최적화 속도)
                 "stoch_k": 14, "stoch_d": 3, "stoch_smooth_k": 3,
                 "mfi_period": 14, "obv_ema_period": 20,
                 "stoch_oversold": 20, "stoch_overbought": 80,
@@ -142,7 +173,6 @@ class OptoRunner(Strategy):
                 "score_bb_breakout_up": int(self.score_bb_breakout_up),
                 "score_bb_breakout_down": -int(self.score_bb_breakout_up),
                 "score_chop_trending": int(self.score_chop_trending),
-                # 나머지는 기본값
                 "score_ichimoku_bull": 4, "score_ichimoku_bear": -4,
                 "score_psar_bull": 3, "score_psar_bear": -3,
                 "score_vortex_bull": 2, "score_vortex_bear": -2,
@@ -161,54 +191,209 @@ class OptoRunner(Strategy):
             },
         }
         self.engine = ConfluenceEngine(Client("", ""), strategy_configs=strategy_configs)
-        self.indicators = indicator_calculator.calculate_all_indicators(self.data.df)
-        self.recent_scores = deque(maxlen=int(self.trend_entry_confirm_count))
 
+        # 지표 캐시
+        self.indicators = indicator_calculator.calculate_all_indicators(self.data.df)
+
+        # 점수 윈도우
+        self._recent_scores = deque(maxlen=int(self.trend_entry_confirm_count))
+
+        # 실행 상태
+        self._in_pos = False
+        self._side = None
+        self._entry_px = np.nan
+        self._entry_atr = np.nan
+        self._sl_px = np.nan
+        self._tp_plan = []  # [{"px":float,"qty":float,"done":False}, ...]
+        self._bars_held = 0
+
+        # exec_partial 파싱
+        if isinstance(self.exec_partial, str):
+            parts = [p.strip() for p in self.exec_partial.split(",") if p.strip()]
+            self._partials = [float(x) for x in parts] if parts else [1.0]
+        elif isinstance(self.exec_partial, (list, tuple)):
+            self._partials = [float(x) for x in self.exec_partial]
+        else:
+            self._partials = [1.0]
+
+    # ---- 내부 유틸 ----
+    def _maybe_enter(self, side: str):
+        if self._in_pos:
+            return
+        idx = len(self.data) - 1
+        cur = self.indicators.iloc[idx]
+        atr = cur.get("ATRr_14", 0) or cur.get("ATR_14", 0)
+        if not atr or np.isnan(atr) or atr <= 0:
+            return
+
+        px = float(self.data.Close[-1])
+        sl_d = float(atr) * float(self.sl_atr_multiplier)
+        rr = float(self.risk_reward_ratio)
+
+        if side == "BUY":
+            sl = px - sl_d
+            tp_base = px + sl_d * rr
+        else:
+            sl = px + sl_d
+            tp_base = px - sl_d * rr
+
+        # 포지션 진입 (기본 1.0 유닛; Runner가 size/cash를 정함)
+        if side == "BUY":
+            self.buy(size=1.0)  # sl/tp는 수동 관리
+        else:
+            self.sell(size=1.0)
+
+        # 상태 저장
+        self._in_pos = True
+        self._side = side
+        self._entry_px = px
+        self._entry_atr = atr
+        self._sl_px = sl
+        self._bars_held = 0
+
+        # 멀티 TP 계획
+        steps = [0.5, 1.0, 1.5] if len(self._partials) == 3 else [1.0] * len(self._partials)
+        self._tp_plan = []
+        for w, m in zip(self._partials, steps):
+            tp_px = self._scale_tp(px, tp_base, side, m)
+            self._tp_plan.append({"px": tp_px, "qty": float(w), "done": False})
+
+    def _maybe_exit_by_tp(self):
+        if not self._in_pos or not self._tp_plan:
+            return
+        last = float(self.data.Close[-1])
+        for item in self._tp_plan:
+            if item["done"]:
+                continue
+            hit = (last >= item["px"]) if self._side == "BUY" else (last <= item["px"])
+            if hit:
+                # 부분청산
+                if self._side == "BUY":
+                    self.sell(size=item["qty"])
+                else:
+                    self.buy(size=item["qty"])
+                item["done"] = True
+
+        # 모두 체결되면 포지션 종료 상태로 전환
+        if all(x["done"] for x in self._tp_plan):
+            self._reset_pos_state()
+
+    def _maybe_exit_by_sl(self):
+        if not self._in_pos:
+            return
+        last_low = float(self.data.Low[-1])
+        last_high = float(self.data.High[-1])
+        touched = (last_low <= self._sl_px) if self._side == "BUY" else (last_high >= self._sl_px)
+        if touched:
+            # 전량 청산
+            if self._side == "BUY":
+                self.position.close()  # 전량
+            else:
+                self.position.close()
+            self._reset_pos_state()
+
+    def _maybe_time_stop(self):
+        if not self._in_pos:
+            return
+        k = int(self.exec_time_stop_bars or 0)
+        if k > 0:
+            self._bars_held += 1
+            if self._bars_held >= k:
+                self.position.close()
+                self._reset_pos_state()
+
+    def _maybe_trailing(self):
+        if not self._in_pos:
+            return
+        mode = (self.exec_trailing_mode or "off").lower()
+        if mode == "off":
+            return
+        last = float(self.data.Close[-1])
+        if mode == "atr":
+            atr = float(self._entry_atr or 0)
+            k = float(self.exec_trailing_k or 0)
+            if atr <= 0 or k <= 0:
+                return
+            trail = atr * k
+        else:
+            k = float(self.exec_trailing_k or 0)
+            if k <= 0:
+                return
+            trail = last * (k / 100.0)
+
+        # 진입가 보호 + 트레일
+        if self._side == "BUY":
+            new_sl = max(self._entry_px, last - trail)
+            self._sl_px = max(self._sl_px, new_sl)
+        else:
+            new_sl = min(self._entry_px, last + trail)
+            self._sl_px = min(self._sl_px, new_sl)
+
+    def _reset_pos_state(self):
+        self._in_pos = False
+        self._side = None
+        self._entry_px = np.nan
+        self._entry_atr = np.nan
+        self._sl_px = np.nan
+        self._tp_plan = []
+        self._bars_held = 0
+
+    @staticmethod
+    def _scale_tp(entry_px: float, tp_base: float, side: str, mult: float) -> float:
+        if mult == 1.0:
+            return tp_base
+        if side == "BUY":
+            r = tp_base - entry_px
+            return entry_px + r * mult
+        else:
+            r = entry_px - tp_base
+            return entry_px - r * mult
+
+    # ---- 백테스트 루프 ----
     def next(self):
         idx = len(self.data) - 1
         cur = self.indicators.iloc[:idx + 1]
-        if len(cur) < self.trend_entry_confirm_count:
+        if len(cur) < int(self.trend_entry_confirm_count):
             return
 
         current_score, _ = self.engine._calculate_tactical_score(cur)
-        self.recent_scores.append(current_score)
-        if len(self.recent_scores) < self.trend_entry_confirm_count:
+        self._recent_scores.append(current_score)
+        if len(self._recent_scores) < int(self.trend_entry_confirm_count):
             return
 
-        avg_score = sum(self.recent_scores) / len(self.recent_scores)
+        avg_score = sum(self._recent_scores) / len(self._recent_scores)
+
+        # 진입 판단
         side = None
-        if self.market_regime == "BULL" and avg_score >= self.open_threshold:
+        if self.market_regime == "BULL" and avg_score >= float(self.open_threshold):
             side = "BUY"
-        elif self.market_regime == "BEAR" and avg_score <= -self.open_threshold:
+        elif self.market_regime == "BEAR" and avg_score <= -float(self.open_threshold):
             side = "SELL"
 
-        if side and not self.position:
-            atr = cur.iloc[-1].get("ATRr_14", 0)
-            if not atr or pd.isna(atr) or atr <= 0:
-                return
-            sl_d = atr * self.sl_atr_multiplier
-            tp_d = sl_d * self.risk_reward_ratio
-            price = self.data.Close[-1]
-            sl = price - sl_d if side == "BUY" else price + sl_d
-            tp = price + tp_d if side == "BUY" else price - tp_d
-            if sl <= 0 or tp <= 0:
-                return
-            if side == "BUY":
-                self.buy(sl=sl, tp=tp, size=0.5)
-            else:
-                self.sell(sl=sl, tp=tp, size=0.5)
+        if (not self._in_pos) and side:
+            self._maybe_enter(side)
+
+        # 보유 중 관리: TP/SL/타임스탑/트레일링
+        if self._in_pos:
+            self._maybe_trailing()
+            self._maybe_exit_by_tp()
+            self._maybe_exit_by_sl()
+            self._maybe_time_stop()
 
 
-# 결과 요약에 표시할 파라미터 키(중복 사용 방지)
+# 결과 요약에 표시할 파라미터 키
 BEST_PARAM_KEYS = [
+    # 실행정책(분석 임계 포함)
     "open_threshold","risk_reward_ratio","sl_atr_multiplier","trend_entry_confirm_count",
+    "exec_partial","exec_time_stop_bars","exec_trailing_mode","exec_trailing_k",
+    # 분석 파라미터
     "ema_short","ema_long","score_strong_trend",
     "rsi_period","rsi_oversold","score_oversold",
     "score_macd_cross_up","adx_threshold","score_adx_strong",
 ]
 
 
-# ---- 공통 유틸: 파라미터→백테스트 실행(최적화기 공용) ----
+# ---- 공통 유틸: 파라미터→백테스트 실행 ----
 def run_backtest_with_params(
     df_capitalized: pd.DataFrame,
     params: dict,
@@ -218,47 +403,37 @@ def run_backtest_with_params(
 ):
     """
     공통 목표함수용 백테스트 러너.
-    - 선호 지표: Calmar → Sharpe → Return
-    - 과대평가 방지용 가드:
-        * 최소 트레이드 수 미만이면 점수 대폭 감점
-        * MDD 분모 과소(≈0)에 따른 Calmar 폭주 시 Sharpe/Return으로 폴백
-    - 환경변수(.env)로 튜닝 가능:
-        OPT_MIN_TRADES=50
-        OPT_MDD_FLOOR_PCT=3.0
+    선호: Calmar → Sharpe → Return (가드 포함)
     """
     import os, math
 
-    # 전략 컨텍스트 주입
+    # 전략 컨텍스트
     OptoRunner.symbol = symbol
     OptoRunner.market_regime = regime
 
-    # ✅ finalize_trades 는 Backtest 생성자 인자
     bt = FractionalBacktest(
         df_capitalized,
         OptoRunner,
         cash=initial_cash,
         commission=.002,
         margin=1 / 10,
-        finalize_trades=True,   # ← 여기!
+        finalize_trades=True,
     )
-    stats = bt.run(**params)    # ← run()에는 넣지 않음
+    stats = bt.run(**params)
 
-    # ---- 안정화 가드 파라미터 ----
+    # 안정화 가드
     min_trades = int(os.getenv("OPT_MIN_TRADES", 50))
-    mdd_floor = float(os.getenv("OPT_MDD_FLOOR_PCT", 3.0))  # [%] 기준
+    mdd_floor = float(os.getenv("OPT_MDD_FLOOR_PCT", 3.0))
 
-    # ---- 숫자 파싱 유틸 ----
     def _f(x, default=float("nan")):
         try:
-            v = float(x)
-            return v
+            return float(x)
         except Exception:
             return default
 
     def _finite(x):
         return (x is not None) and not (isinstance(x, float) and (math.isnan(x) or math.isinf(x)))
 
-    # ---- 핵심 지표 추출 ----
     trades = int(stats.get("# Trades", 0) or 0)
     mdd = abs(_f(stats.get("Max. Drawdown [%]", 0), 0.0))
 
@@ -266,17 +441,14 @@ def run_backtest_with_params(
     sharpe = _f(stats.get("Sharpe Ratio"))
     retpct = _f(stats.get("Return [%]"), 0.0)
 
-    # ---- 가드 1: 트레이드 수 부족 시 강한 감점 ----
     if trades < min_trades:
         return stats, -1e12, f"Rejected: few trades (<{min_trades})"
 
-    # ---- 가드 2: MDD 분모 과소시 Calmar 왜곡 방지 → 폴백 ----
     if mdd < mdd_floor:
         if _finite(sharpe):
             return stats, float(sharpe), "Sharpe Ratio (fallback)"
         return stats, float(retpct), "Return [%] (fallback)"
 
-    # ---- 기본 선호: Calmar → Sharpe → Return ----
     if _finite(calmar):
         return stats, float(calmar), "Calmar Ratio"
     if _finite(sharpe):
@@ -285,29 +457,31 @@ def run_backtest_with_params(
 
 
 def get_param_spaces():
-    """
-    탐색공간(그리드/GA/베이지안 공통).
-    int/float/cat 타입 혼용 지원.
-    """
+    """탐색공간(그리드/GA/베이지안 공통)"""
     return {
-        "open_threshold":       {"type":"int",   "low": 8,   "high": 22, "choices":[10,12,14,16]},
-        "risk_reward_ratio":    {"type":"float", "low": 1.4, "high": 3.8, "choices":[1.8,2.0,2.5,3.0]},
-        "sl_atr_multiplier":    {"type":"float", "low": 1.0, "high": 3.0, "choices":[1.2,1.5,1.8,2.2]},
-        "trend_entry_confirm_count":{"type":"int","low": 1,   "high": 5,  "choices":[2,3,4]},
-        "ema_short":            {"type":"int",   "low": 8,   "high": 28, "choices":[12,16,20,24]},
-        "ema_long":             {"type":"int",   "low": 34,  "high":120, "choices":[40,50,60,80]},
-        "score_strong_trend":   {"type":"int",   "low": 2,   "high": 6,  "choices":[3,4,5]},
-        "rsi_period":           {"type":"int",   "low": 10,  "high": 20, "choices":[14]},
-        "rsi_oversold":         {"type":"int",   "low": 18,  "high": 35, "choices":[20,25,30]},
-        "score_oversold":       {"type":"int",   "low": 2,   "high": 6,  "choices":[3,4,5]},
-        "score_macd_cross_up":  {"type":"int",   "low": 1,   "high": 5,  "choices":[2,3,4]},
-        "adx_threshold":        {"type":"int",   "low": 15,  "high": 35, "choices":[18,22,25,28]},
-        "score_adx_strong":     {"type":"int",   "low": 1,   "high": 5,  "choices":[2,3,4]},
+        # 분석/임계
+        "open_threshold":       {"type":"int",   "choices":[10,12,14,16]},
+        "risk_reward_ratio":    {"type":"float", "choices":[1.8,2.0,2.5,3.0]},
+        "sl_atr_multiplier":    {"type":"float", "choices":[1.2,1.5,1.8,2.2]},
+        "trend_entry_confirm_count":{"type":"int","choices":[2,3,4]},
+        "ema_short":            {"type":"int",   "choices":[12,16,20,24]},
+        "ema_long":             {"type":"int",   "choices":[40,50,60,80]},
+        "score_strong_trend":   {"type":"int",   "choices":[3,4,5]},
+        "rsi_period":           {"type":"int",   "choices":[14]},
+        "rsi_oversold":         {"type":"int",   "choices":[20,25,30]},
+        "score_oversold":       {"type":"int",   "choices":[3,4,5]},
+        "score_macd_cross_up":  {"type":"int",   "choices":[2,3,4]},
+        "adx_threshold":        {"type":"int",   "choices":[18,22,25,28]},
+        "score_adx_strong":     {"type":"int",   "choices":[2,3,4]},
+        # 실행정책(신규)
+        "exec_partial":         {"type":"cat",   "choices":["1.0","0.3,0.3,0.4"]},
+        "exec_time_stop_bars":  {"type":"int",   "choices":[0,8,12,16]},
+        "exec_trailing_mode":   {"type":"cat",   "choices":["off","atr","percent"]},
+        "exec_trailing_k":      {"type":"float", "choices":[0.0,1.0,1.5,2.0]},
     }
 
 
 def grid_choice_count(param_spaces):
-    # choices가 있는 것만 카운트하여 grid 경우의 수 추정
     total = 1
     for s in param_spaces.values():
         ch = s.get("choices")
@@ -317,16 +491,12 @@ def grid_choice_count(param_spaces):
 
 
 def choose_method_auto(param_spaces):
-    # 환경변수로 강제 지정 가능
     env = os.getenv("OPT_METHOD", "auto").lower()
     if env in ("grid", "ga", "bayes"):
         return env
-
-    # 자동 판정
-    combos = grid_choice_count(param_spaces)  # 대략적 그리드 조합 수
+    combos = grid_choice_count(param_spaces)
     has_ga = _HAS_OPTIMIZERS
     has_bayes = _HAS_OPTIMIZERS
-
     if combos <= 3000:
         return "grid"
     if has_bayes:
@@ -341,7 +511,9 @@ if __name__ == '__main__':
 
     symbols_to_optimize = ["BTCUSDT", "ETHUSDT"]
     initial_cash = 10_000
-    binance_client = Client(config.api_key, config.api_secret)
+    # 최적화/백테스트는 인증키 불필요 → 빈 값으로 생성(공개 엔드포인트 사용)
+    binance_client = Client(getattr(config, "api_key", "") or "",
+                            getattr(config, "api_secret", "") or "")
 
     # 결과 파일
     optimal_settings_file = os.path.join(project_root, "optimal_settings.json")
@@ -375,7 +547,48 @@ if __name__ == '__main__':
             continue
 
         segmented = segment_data_by_regime(klines, preloaded_macro_data)
+        
+        # ⚠️ BEAR가 비면 기술적 폴백으로 생성 (Close<EMA200 & MACD<0 등)
+        if segmented.get("BEAR") is not None and len(segmented["BEAR"]) == 0:
+            df = klines.copy()
+            # 컬럼 표준화 (소문자 → 대문자 변환 주의)
+            close = df["Close"] if "Close" in df.columns else df["close"]
+            ema200 = close.ewm(span=200, adjust=False).mean()
+            # 간단 MACD (12-26)
+            ema12 = close.ewm(span=12, adjust=False).mean()
+            ema26 = close.ewm(span=26, adjust=False).mean()
+            macd = ema12 - ema26
 
+            bear_mask = (close < ema200) & (macd < 0)
+            bear_df = df[bear_mask]
+            # 최소 샘플 보장: 200개 미만이면 가장 약한 200개를 보강
+            if len(bear_df) < 200 and len(df) >= 200:
+                extra = df.sort_values(by="Close").head(max(0, 200 - len(bear_df)))
+                bear_df = pd.concat([bear_df, extra]).sort_index().drop_duplicates()
+
+            if len(bear_df) > 0:
+                segmented["BEAR"] = bear_df
+                # SIDEWAYS에서 겹치는 부분 제거
+                if "SIDEWAYS" in segmented and segmented["SIDEWAYS"] is not None and len(segmented["SIDEWAYS"]) > 0:
+                    side = segmented["SIDEWAYS"].copy()
+                    side = side.loc[~side.index.isin(bear_df.index)]
+                    segmented["SIDEWAYS"] = side
+                print(f"🛡️ 기술 폴백 적용: BEAR 캔들 {len(segmented['BEAR'])}개 생성 (EMA200 & MACD)")
+            else:
+                print("🛡️ 기술 폴백 실패: BEAR 조건에 해당 캔들이 충분치 않습니다.")
+
+        # 🔁 폴백: 전부 SIDEWAYS면 가격 기반 레짐으로 임시 분할
+        if len(segmented.get("BULL", [])) == 0 and len(segmented.get("BEAR", [])) == 0:
+            df = klines.copy()
+            df["ema200"] = df["close"].ewm(span=200, adjust=False).mean()
+            bull = df[df["close"] > df["ema200"]]
+            bear = df[df["close"] < df["ema200"]]
+            segmented = {
+                "BULL": bull,
+                "BEAR": bear,
+                "SIDEWAYS": df.iloc[0:0]
+            }
+            print("⚠️ 매크로 세그멘트 폴백 적용: EMA200 기준으로 임시 강/약세 분할")
         for regime in ["BULL", "BEAR"]:
             print(f"\n--- 🔬 [{symbol}] '{regime}' 구간 최적화 ---")
             df = segmented.get(regime)
@@ -383,13 +596,10 @@ if __name__ == '__main__':
                 print(f"[SKIP] '{regime}' 구간 데이터 부족")
                 continue
 
-            # Backtesting 표준 컬럼명
             df = df.copy()
             df.columns = [c.capitalize() for c in df.columns]
 
-            # --- 방법 분기 ---
             if method == "grid":
-                # Backtest 생성 시 finalize_trades 활성화
                 OptoRunner.symbol = symbol
                 OptoRunner.market_regime = regime
                 bt = FractionalBacktest(
@@ -399,6 +609,7 @@ if __name__ == '__main__':
                 )
 
                 stats = bt.optimize(
+                    # 분석/임계
                     open_threshold=[10, 12, 14, 16],
                     risk_reward_ratio=[1.8, 2.0, 2.5, 3.0],
                     sl_atr_multiplier=[1.2, 1.5, 1.8, 2.2],
@@ -412,6 +623,11 @@ if __name__ == '__main__':
                     score_macd_cross_up=[2, 3, 4],
                     adx_threshold=[18, 22, 25, 28],
                     score_adx_strong=[2, 3, 4],
+                    # 실행정책(신규)
+                    exec_partial=["1.0", "0.3,0.3,0.4"],
+                    exec_time_stop_bars=[0, 8, 12, 16],
+                    exec_trailing_mode=["off", "atr", "percent"],
+                    exec_trailing_k=[0.0, 1.0, 1.5, 2.0],
                     maximize='Calmar Ratio',
                     constraint=lambda p: p.ema_short < p.ema_long and p.risk_reward_ratio > p.sl_atr_multiplier
                 )
@@ -420,21 +636,18 @@ if __name__ == '__main__':
                 metric_value = float(stats[metric_name]) if metric_name in stats and pd.notna(stats[metric_name]) else 0.0
 
             elif method in ("ga", "bayes") and _HAS_OPTIMIZERS:
-                # 공통 objective
                 def objective(eval_params: dict) -> float:
                     snapped = {}
                     for k, s in param_spaces.items():
                         v = eval_params.get(k)
-                        if s.get("choices"):
-                            ch = s["choices"]
-                            v = min(ch, key=lambda z: abs(z - v)) if isinstance(ch[0], (int, float)) else (v if v in ch else ch[0])
+                        ch = s.get("choices")
+                        if ch:
+                            v = v if v in ch else ch[0]
                         snapped[k] = v
-                    # 제약
                     if snapped.get("ema_short", 0) >= snapped.get("ema_long", 1):
                         return -1e12
                     if snapped.get("risk_reward_ratio", 0) <= snapped.get("sl_atr_multiplier", 0):
                         return -1e12
-
                     _, score, _ = run_backtest_with_params(df, snapped, initial_cash, symbol, regime)
                     return score
 
@@ -447,10 +660,9 @@ if __name__ == '__main__':
                 best_params_obj = _Wrap()
                 for k, v in best_params_dict.items():
                     setattr(best_params_obj, k, v)
-                best_params = best_params_obj  # 통일
+                best_params = best_params_obj
                 best_kv = {k: getattr(best_params, k) for k in BEST_PARAM_KEYS if hasattr(best_params, k)}
 
-                # 리포트용 재실행 + HTML 저장 (생성자에 finalize_trades)
                 REPORT_HTML = os.getenv("REPORT_HTML", "on").lower() in ("1","true","on","yes")
                 if REPORT_HTML:
                     rpt_params = dict(best_kv)
@@ -471,7 +683,7 @@ if __name__ == '__main__':
                     except Exception as e:
                         print(f"   [WARN] HTML plot failed: {e}")
 
-                metric_name = "Calmar Ratio"  # 표시상 통일
+                metric_name = "Calmar Ratio"
 
             else:
                 # 폴백: grid
@@ -496,6 +708,10 @@ if __name__ == '__main__':
                     score_macd_cross_up=[2, 3, 4],
                     adx_threshold=[18, 22, 25, 28],
                     score_adx_strong=[2, 3, 4],
+                    exec_partial=["1.0", "0.3,0.3,0.4"],
+                    exec_time_stop_bars=[0, 8, 12, 16],
+                    exec_trailing_mode=["off", "atr", "percent"],
+                    exec_trailing_k=[0.0, 1.0, 1.5, 2.0],
                     maximize='Calmar Ratio',
                     constraint=lambda p: p.ema_short < p.ema_long and p.risk_reward_ratio > p.sl_atr_multiplier
                 )
@@ -523,7 +739,7 @@ if __name__ == '__main__':
                     print(f"   [WARN] HTML plot failed: {e}")
 
             # ===== 결과 저장 =====
-            # (1) 실행 파라미터 저장
+            # (1) 실행 파라미터(+실행정책) 저장 — 레짐/심볼별
             if regime not in all_settings:
                 all_settings[regime] = {}
             all_settings[regime][symbol] = {
@@ -531,6 +747,11 @@ if __name__ == '__main__':
                 "RR_RATIO": float(getattr(best_params, "risk_reward_ratio")),
                 "SL_ATR_MULTIPLIER": float(getattr(best_params, "sl_atr_multiplier")),
                 "TREND_ENTRY_CONFIRM_COUNT": int(getattr(best_params, "trend_entry_confirm_count")),
+                # 실행정책(신규)
+                "exec_partial": getattr(best_params, "exec_partial", "1.0"),
+                "exec_time_stop_bars": int(getattr(best_params, "exec_time_stop_bars", 0)),
+                "exec_trailing_mode": getattr(best_params, "exec_trailing_mode", "off"),
+                "exec_trailing_k": float(getattr(best_params, "exec_trailing_k", 0.0)),
                 "OPTIMIZED_METRIC": metric_name,
                 "VALUE": float(round(metric_value, 4)) if not pd.isna(metric_value) else 0.0
             }
