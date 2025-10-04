@@ -1,9 +1,12 @@
 # -*- coding: utf-8 -*-
 # local_backtesting/backtest_optimizer.py
 """
-V6 — 리스크 기반 포지션 사이징(상대 크기) + 실행정책(부분익절/타임스탑/트레일링) 최적화
-- 진입 size를 risk_per_trade·margin·SL거리(ATR*배수)로 계산
-- 탐색공간에 risk_per_trade, max_exposure_frac 추가
+V7 — 2018년부터 MacroAnalyzer 레짐 에피소드별 최적화
+- 2018-01-01부터 4h 전구간 수집
+- MacroAnalyzer 기준으로 BULL/BEAR 연속 구간(period) 도출
+- 에피소드별로 최적화/재평가/리포트 저장
+- Bayes 최소화 부호 보정, 동적 min_trades
+- backtesting size 규칙 강제(sanitize)
 """
 
 import multiprocessing
@@ -21,13 +24,17 @@ import sys
 import os
 import math
 from tqdm import tqdm
+from datetime import datetime
+# 한글 라벨
+SYMBOL_NAME = {"BTCUSDT": "비트코인", "ETHUSDT": "이더리움"}
+REGIME_NAME = {"BULL": "강세장(불장)", "BEAR": "약세장(하락장)", "SIDEWAYS": "횡보장"}
 
-# --- 프로젝트 경로 설정 ---
+# --- 경로 설정 ---
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 if project_root not in sys.path:
     sys.path.insert(0, project_root)
 
-# .env 로드
+# .env 로드(있으면)
 try:
     from dotenv import load_dotenv
     load_dotenv(os.path.join(project_root, ".env"))
@@ -47,23 +54,17 @@ try:
 except Exception:
     _HAS_OPTIMIZERS = False
 
+
 # ---- 안전 폴백: 전략 설정 읽기 ----
 def get_strategy_configs_safe(regime: str):
     """
     ConfigManager가 get_strategy_configs를 제공하지 않는 경우를 대비한 안전 래퍼.
-    우선 순위:
-      1) config.get_strategy_configs(regime)
-      2) config.strategy_configs[regime]
-      3) config.get("strategies", {}).get(regime)
-      4) 빈 디폴트 스텁
     """
-    # 1) 메서드가 있으면 그대로 사용
     if hasattr(config, "get_strategy_configs"):
         try:
             return config.get_strategy_configs(regime)
         except Exception:
             pass
-    # 2) 속성 dict 형태 지원
     for attr in ("strategy_configs", "strategies", "strategy", "configs"):
         try:
             store = getattr(config, attr)
@@ -73,7 +74,6 @@ def get_strategy_configs_safe(regime: str):
                     return val
         except Exception:
             pass
-    # 3) dict-like get 지원
     try:
         if hasattr(config, "get"):
             store = config.get("strategies", {})
@@ -83,12 +83,12 @@ def get_strategy_configs_safe(regime: str):
                     return val
     except Exception:
         pass
-    # 4) 최종 디폴트
     return {
         "TrendStrategy": {},
         "OscillatorStrategy": {},
         "ComprehensiveStrategy": {},
     }
+
 
 def _to_jsonable_dict(d: dict) -> dict:
     def conv(x):
@@ -116,7 +116,77 @@ def _to_jsonable_dict(d: dict) -> dict:
     return {k: conv(v) for k, v in d.items()}
 
 
+# === 신규: 2018-01-01부터 4h 전구간 수집 ===
+def fetch_klines_since_2018(binance_client: Client, symbol: str, interval: str = "4h") -> pd.DataFrame:
+    """
+    Binance SDK의 get_historical_klines로 2018-01-01 UTC부터 전구간 수집.
+    """
+    start_str = "1 Jan, 2018"
+    raw = binance_client.get_historical_klines(symbol, interval, start_str)
+    if not raw:
+        return pd.DataFrame()
+
+    cols = ["Open time","Open","High","Low","Close","Volume","Close time",
+            "Quote asset volume","Number of trades","Taker buy base asset volume",
+            "Taker buy quote asset volume","Ignore"]
+    df = pd.DataFrame(raw, columns=cols)
+    df["Open time"] = pd.to_datetime(df["Open time"], unit="ms", utc=True)
+    df.set_index("Open time", inplace=True)
+    for c in ["Open","High","Low","Close","Volume"]:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+    df = df[["Open","High","Low","Close","Volume"]].dropna()
+    # 컬럼 대문자 정규화 (이미 대문자이지만 일관성 유지)
+    df.columns = [c.capitalize() for c in df.columns]
+    return df
+
+
+# === 신규: MacroAnalyzer 레짐을 연속 구간으로 압축 ===
+def collapse_regimes_to_periods(df: pd.DataFrame, macro_data: dict) -> dict:
+    """
+    df(index: DatetimeIndex, cols: Open/High/Low/Close/Volume)에 대해
+    MacroAnalyzer로 시점별 레짐을 계산하고 동일 레짐 연속 구간을 (start,end)로 압축.
+    너무 짧은 구간(4h 300봉 ≈ 50일) 제거.
+    """
+    ma = MacroAnalyzer()
+    regimes = []
+    for ts in tqdm(df.index, desc="레짐 레이블링"):
+        regime, _, _ = ma.diagnose_macro_regime_for_date(ts, macro_data)
+        regimes.append(regime.name if isinstance(regime, MacroRegime) else str(regime))
+    ser = pd.Series(regimes, index=df.index, name="Regime")
+
+    periods = {"BULL": [], "BEAR": [], "SIDEWAYS": []}
+    if ser.empty:
+        return periods
+
+    prev = ser.iloc[0]
+    run_start = ser.index[0]
+    # 연속 구간 찾기
+    for i in range(1, len(ser)):
+        t = ser.index[i]
+        r = ser.iloc[i]
+        if r != prev:
+            periods.setdefault(prev, []).append({"start": run_start, "end": ser.index[i-1]})
+            run_start = t
+            prev = r
+    periods.setdefault(prev, []).append({"start": run_start, "end": ser.index[-1]})
+
+    # 최소 길이 필터
+    MIN_BARS = 300
+    cleaned = {"BULL": [], "BEAR": [], "SIDEWAYS": []}
+    for k, lst in periods.items():
+        for p in lst:
+            mask = (df.index >= p["start"]) & (df.index <= p["end"])
+            if mask.sum() >= MIN_BARS:
+                cleaned[k].append(p)
+    return cleaned
+
+
 def segment_data_by_regime(klines_df: pd.DataFrame, macro_data: dict) -> dict:
+    """
+    (참고용) 전체 시계열에 대해 일자별 레짐을 라벨링한 뒤 단순 필터링으로 분할.
+    - 이번 버전에서는 collapse_regimes_to_periods로 에피소드별 운용이 기본이지만,
+      폴백/디버깅용으로 남겨둠.
+    """
     print("\n...과거 데이터 전체에 대한 거시 경제 분석을 시작합니다...")
     ma = MacroAnalyzer()
     regimes = []
@@ -156,10 +226,8 @@ class OptoRunner(Strategy):
     exec_trailing_k = 0.0               # atr배수 또는 percent
 
     # ====== 리스크 사이징(상대 크기) ======
-    # - backtesting.py에서 size∈(0,1)은 "자본 비율"로 해석(상대 크기)
-    # - 마진(=1/레버리지) 반영하여 SL 도달시 손실이 risk_per_trade*equity가 되도록 산출
-    risk_per_trade = 0.01              # 자본 1%
-    max_exposure_frac = 0.30           # 자본 대비 최대 상대 노출(마진 전)
+    risk_per_trade = 0.01               # 자본 1%
+    max_exposure_frac = 0.30            # 자본 대비 최대 상대 노출(마진 전)
 
     # ====== 분석 파라미터 ======
     ema_short = 20
@@ -285,14 +353,15 @@ class OptoRunner(Strategy):
         self._tp_plan = []
         self._bars_held = 0
 
-    # === 추가: backtesting 규칙을 만족시키는 size 정규화 ===
+
+    # === backtesting 규칙을 만족시키는 size 정규화 ===
     @staticmethod
     def _sanitize_size(qty):
         """
         backtesting Assertion:
           - 0 < size < 1  (지분 비율)
           - 또는 round(size) == size >= 1  (정수 유닛)
-        위반/비정상(qty<=0, NaN, inf)은 None 반환하여 호출부에서 스킵.
+        위반/비정상(qty<=0, NaN, inf)은 None → 스킵.
         """
         if not isinstance(qty, (int, float, np.floating)) or not np.isfinite(qty):
             return None
@@ -324,8 +393,6 @@ class OptoRunner(Strategy):
             tp_base = px - sl_d * rr
 
         # ===== 리스크 기반 '상대 크기' 계산 =====
-        # backtesting 브로커: size∈(0,1) → equity의 비율, margin으로 레버리지 처리
-        # SL 도달 손실 ≈ risk_per_trade * equity 가 되도록 size 설정
         try:
             equity = float(self._broker.equity)
         except Exception:
@@ -340,17 +407,14 @@ class OptoRunner(Strategy):
             risk_per_trade=float(self.risk_per_trade),
             max_exposure_frac=float(self.max_exposure_frac),
             margin=margin,
-            # 백테스트에선 거래소 필터가 없으니 보수적 기본값 사용
-            min_notional=5.0,   # 최소 주문가치 USDT
-            qty_step=1e-6,      # 수량 스텝
-            min_qty=1e-6,       # 최소 수량
+            min_notional=5.0,
+            qty_step=1e-6,
+            min_qty=1e-6,
         )
-        # >>> 변경: size 정규화 및 검증 <<<
         safe_qty = self._sanitize_size(qty)
         if safe_qty is None:
             return
 
-        # 진입 (규칙을 만족하는 size로 주문)
         if side == "BUY":
             self.buy(size=safe_qty)
         else:
@@ -364,7 +428,7 @@ class OptoRunner(Strategy):
         self._sl_px = sl
         self._bars_held = 0
 
-        # 멀티 TP 계획 (분할 비중을 유지하되, 실제 체결 시점에 size 정규화 적용)
+        # 멀티 TP 계획
         steps = [0.5, 1.0, 1.5] if len(self._partials) == 3 else [1.0] * len(self._partials)
         self._tp_plan = []
         remain = float(qty)
@@ -373,7 +437,7 @@ class OptoRunner(Strategy):
             if i < len(self._partials) - 1:
                 sub_qty = float(qty * float(w))
             else:
-                sub_qty = float(remain)  # 마지막은 잔량 몰아주기
+                sub_qty = float(remain)
             remain -= sub_qty
             self._tp_plan.append({"px": tp_px, "qty": sub_qty, "done": False})
 
@@ -386,14 +450,13 @@ class OptoRunner(Strategy):
                 continue
             hit = (last >= item["px"]) if self._side == "BUY" else (last <= item["px"])
             if hit:
-                # >>> 변경: 부분청산 size도 규칙에 맞게 정규화 <<<
                 safe_qty = self._sanitize_size(item["qty"])
                 if safe_qty is None:
-                    item["done"] = True  # 너무 작거나 비정상이면 스킵 처리
+                    item["done"] = True
                     continue
-                if self._side == "BUY": 
+                if self._side == "BUY":
                     self.sell(size=safe_qty)
-                else: 
+                else:
                     self.buy(size=safe_qty)
                 item["done"] = True
 
@@ -515,8 +578,12 @@ def run_backtest_with_params(
     )
     stats = bt.run(**params)
 
-    # 안정화 가드
-    min_trades = int(os.getenv("OPT_MIN_TRADES", 50))
+    # === 동적 min_trades 완화 ===
+    min_trades_env = int(os.getenv("OPT_MIN_TRADES", 50))
+    dataset_len = len(df_capitalized) if hasattr(df_capitalized, "__len__") else 0
+    min_trades_dyn = max(10, dataset_len // 100)  # 대략 100봉당 1건, 하한 10
+    min_trades = min(min_trades_env, min_trades_dyn)
+
     mdd_floor = float(os.getenv("OPT_MDD_FLOOR_PCT", 3.0))
 
     def _f(x, default=float("nan")):
@@ -603,7 +670,7 @@ if __name__ == '__main__':
     symbols_to_optimize = ["BTCUSDT", "ETHUSDT"]
     initial_cash = 10_000
 
-    # 최적화/백테스트는 인증키 불필요 → 빈 값으로 생성(공개 엔드포인트 사용)
+    # Binance 클라이언트 (공개엔드포인트)
     binance_client = Client(
         getattr(config, "api_key", "") or "",
         getattr(config, "api_secret", "") or ""
@@ -625,227 +692,322 @@ if __name__ == '__main__':
     except (FileNotFoundError, json.JSONDecodeError):
         all_strategies = {"BULL": {}, "BEAR": {}, "SIDEWAYS": {}}
 
+    # 매크로 데이터 프리로드
     ma = MacroAnalyzer()
     macro_preloaded = ma.preload_all_macro_data()
 
+    # 최적화 방법 결정
     param_spaces = get_param_spaces()
     method = choose_method_auto(param_spaces)
     print(f"\n[OPT] 선택된 최적화 알고리즘: {method.upper()}  "
           f"(ENV OPT_METHOD={os.getenv('OPT_METHOD','auto')})")
 
     for symbol in symbols_to_optimize:
-        print(f"\n\n{'='*56}\n🚀 {symbol} 자동 최적화 시작...\n{'='*56}")
-        klines = data_fetcher.fetch_klines(binance_client, symbol, "4h", limit=1500)
-        if klines is None or len(klines) < 200:
+        print(f"\n\n{'='*68}\n📦 전체 데이터 로드: {symbol} (since 2018-01-01)\n{'='*68}")
+        # 2018년부터 전구간 캔들 확보
+        klines = fetch_klines_since_2018(binance_client, symbol, "4h")
+        if klines is None or len(klines) < 500:
             print(f"[SKIP] {symbol} 데이터 부족")
             continue
 
-        segmented = segment_data_by_regime(klines, macro_preloaded)
+        # 레짐을 연속 구간으로 압축
+        periods_by_regime = collapse_regimes_to_periods(klines, macro_preloaded)
 
-        # 🛡️ BEAR 폴백 (없으면 EMA200 & MACD<0)
-        if segmented.get("BEAR") is not None and len(segmented["BEAR"]) == 0:
-            df = klines.copy()
-            close = df["Close"] if "Close" in df.columns else df["close"]
-            ema200 = close.ewm(span=200, adjust=False).mean()
-            ema12 = close.ewm(span=12, adjust=False).mean()
-            ema26 = close.ewm(span=26, adjust=False).mean()
+        # 폴백: 매크로 비어있으면 EMA200/MACD
+        if not periods_by_regime["BULL"] and not periods_by_regime["BEAR"]:
+            print("⚠️ 매크로 periods 비어있음 → EMA200/MACD 폴백으로 구간 작성")
+            df_tmp = klines.copy()
+            ema200 = df_tmp["Close"].ewm(span=200, adjust=False).mean()
+            ema12 = df_tmp["Close"].ewm(span=12, adjust=False).mean()
+            ema26 = df_tmp["Close"].ewm(span=26, adjust=False).mean()
             macd = ema12 - ema26
-            bear = df[(close < ema200) & (macd < 0)]
-            if len(bear) > 0:
-                segmented["BEAR"] = bear
-                print(f"🛡️ 기술 폴백 적용: BEAR 캔들 {len(bear)}개 생성 (EMA200 & MACD)")
 
-        # 🔁 폴백: 전부 SIDEWAYS면 가격 기반 레짐으로 임시 분할
-        if len(segmented.get("BULL", [])) == 0 and len(segmented.get("BEAR", [])) == 0:
-            df = klines.copy()
-            df["ema200"] = df["close"].ewm(span=200, adjust=False).mean()
-            bull = df[df["close"] > df["ema200"]]
-            bear = df[df["close"] < df["ema200"]]
-            segmented = {"BULL": bull, "BEAR": bear, "SIDEWAYS": df.iloc[0:0]}
-            print("⚠️ 매크로 폴백 적용: EMA200 기준 임시 강/약세 분할")
+            def _mask_to_periods(mask_ser):
+                periods = []
+                run = None
+                prev_t = None
+                for t, m in mask_ser.items():
+                    if m and run is None:
+                        run = {"start": t}
+                    if (not m) and run is not None:
+                        run["end"] = prev_t
+                        periods.append(run)
+                        run = None
+                    prev_t = t
+                if run is not None:
+                    run["end"] = mask_ser.index[-1]
+                    periods.append(run)
+                # 최소 길이 필터(300 bars)
+                out = []
+                MIN_BARS = 300
+                for p in periods:
+                    mask = (mask_ser.index >= p["start"]) & (mask_ser.index <= p["end"])
+                    if mask.sum() >= MIN_BARS:
+                        out.append(p)
+                return out
 
+            mask_bull = (df_tmp["Close"] > ema200) & (macd > 0)
+            periods_by_regime["BULL"] = _mask_to_periods(mask_bull)
+            periods_by_regime["BEAR"] = _mask_to_periods(~mask_bull)
+
+        # 에피소드별 최적화
         for regime in ["BULL", "BEAR"]:
-            print(f"\n--- 🔬 [{symbol}] '{regime}' 구간 최적화 ---")
-            df = segmented.get(regime)
-            if df is None or len(df) < 100:
-                print(f"[SKIP] '{regime}' 구간 데이터 부족")
+            episodes = periods_by_regime.get(regime, [])
+            if not episodes:
+                print(f"[SKIP] {symbol}/{regime}: 매크로 에피소드가 없습니다.")
                 continue
 
-            df = df.copy()
-            df.columns = [c.capitalize() for c in df.columns]
+            print(f"\n--- 🔬 [{symbol}] '{regime}' 에피소드 {len(episodes)}개 최적화 ---")
+            for ep_idx, ep in enumerate(episodes, start=1):
+                s_ts = pd.to_datetime(ep["start"])
+                e_ts = pd.to_datetime(ep["end"])
+                mask = (klines.index >= s_ts) & (klines.index <= e_ts)
+                df = klines.loc[mask]
+                if df is None or len(df) < 300:
+                    print(f"[SKIP] '{regime}' 에피소드#{ep_idx} 데이터 부족 ({s_ts.date()}~{e_ts.date()})")
+                    continue
 
-            if method == "grid":
-                OptoRunner.symbol = symbol
-                OptoRunner.market_regime = regime
-                bt = FractionalBacktest(
-                    df, OptoRunner,
-                    cash=initial_cash, commission=.002, margin=1/10,
-                    finalize_trades=True
+                df = df.copy()
+                df.columns = [c.capitalize() for c in df.columns]
+
+                print(
+                    f"\n{'-'*60}\n"
+                    f"⏱️ [{symbol} | {SYMBOL_NAME.get(symbol, symbol)}] "
+                    f"{REGIME_NAME.get(regime, regime)} 에피소드 #{ep_idx}\n"
+                    f"    기간: {s_ts.date()} → {e_ts.date()}  |  캔들 수: {len(df)}\n"
+                    f"{'-'*60}"
                 )
-                stats = bt.optimize(
-                    # 분석/임계
-                    open_threshold=[10, 12, 14, 16],
-                    risk_reward_ratio=[1.8, 2.0, 2.5, 3.0],
-                    sl_atr_multiplier=[1.2, 1.5, 1.8, 2.2],
-                    trend_entry_confirm_count=[2, 3, 4],
-                    ema_short=[12, 16, 20, 24],
-                    ema_long=[40, 50, 60, 80],
-                    score_strong_trend=[3, 4, 5],
-                    rsi_oversold=[20, 25, 30],
-                    score_oversold=[3, 4, 5],
-                    rsi_period=[14],
-                    score_macd_cross_up=[2, 3, 4],
-                    adx_threshold=[18, 22, 25, 28],
-                    score_adx_strong=[2, 3, 4],
-                    # 실행정책
-                    exec_partial=["1.0", "0.3,0.3,0.4"],
-                    exec_time_stop_bars=[0, 8, 12, 16],
-                    exec_trailing_mode=["off", "atr", "percent"],
-                    exec_trailing_k=[0.0, 1.0, 1.5, 2.0],
-                    # 리스크 사이징
-                    risk_per_trade=[0.005, 0.01, 0.015, 0.02],
-                    max_exposure_frac=[0.2, 0.3, 0.4],
-                    maximize='Calmar Ratio',
-                    constraint=lambda p: p.ema_short < p.ema_long and p.risk_reward_ratio > p.sl_atr_multiplier
-                )
-                best_params = stats._strategy
-                metric_name = 'Calmar Ratio'
-                metric_value = float(stats[metric_name]) if metric_name in stats and pd.notna(stats[metric_name]) else 0.0
 
-            elif method in ("ga", "bayes") and _HAS_OPTIMIZERS:
-                param_spaces = get_param_spaces()
+                # === 최적화 분기 ===
+                if method == "grid":
+                    OptoRunner.symbol = symbol
+                    OptoRunner.market_regime = regime
+                    bt = FractionalBacktest(
+                        df, OptoRunner,
+                        cash=initial_cash, commission=.002, margin=1/10,
+                        finalize_trades=True
+                    )
+                    stats = bt.optimize(
+                        # 분석/임계
+                        open_threshold=[10, 12, 14, 16],
+                        risk_reward_ratio=[1.8, 2.0, 2.5, 3.0],
+                        sl_atr_multiplier=[1.2, 1.5, 1.8, 2.2],
+                        trend_entry_confirm_count=[2, 3, 4],
+                        ema_short=[12, 16, 20, 24],
+                        ema_long=[40, 50, 60, 80],
+                        score_strong_trend=[3, 4, 5],
+                        rsi_oversold=[20, 25, 30],
+                        score_oversold=[3, 4, 5],
+                        rsi_period=[14],
+                        score_macd_cross_up=[2, 3, 4],
+                        adx_threshold=[18, 22, 25, 28],
+                        score_adx_strong=[2, 3, 4],
+                        # 실행정책
+                        exec_partial=["1.0", "0.3,0.3,0.4"],
+                        exec_time_stop_bars=[0, 8, 12, 16],
+                        exec_trailing_mode=["off", "atr", "percent"],
+                        exec_trailing_k=[0.0, 1.0, 1.5, 2.0],
+                        # 리스크 사이징
+                        risk_per_trade=[0.005, 0.01, 0.015, 0.02],
+                        max_exposure_frac=[0.2, 0.3, 0.4],
+                        maximize='Calmar Ratio',
+                        constraint=lambda p: p.ema_short < p.ema_long and p.risk_reward_ratio > p.sl_atr_multiplier
+                    )
+                    best_params = stats._strategy
+                    metric_name = 'Calmar Ratio'
+                    metric_value = float(stats[metric_name]) if metric_name in stats and pd.notna(stats[metric_name]) else 0.0
 
-                def objective(eval_params: dict) -> float:
-                    # 스냅 & 제약
-                    snapped = {}
-                    for k, s in param_spaces.items():
-                        v = eval_params.get(k)
-                        ch = s.get("choices")
-                        if ch:
-                            v = v if v in ch else ch[0]
-                        snapped[k] = v
-                    if snapped.get("ema_short", 0) >= snapped.get("ema_long", 1):
-                        return -1e12
-                    if snapped.get("risk_reward_ratio", 0) <= snapped.get("sl_atr_multiplier", 0):
-                        return -1e12
-                    _, score, _ = run_backtest_with_params(df, snapped, initial_cash, symbol, regime)
-                    return score
+                elif method in ("ga", "bayes") and _HAS_OPTIMIZERS:
+                    param_spaces = get_param_spaces()
+                    def objective(eval_params: dict) -> float:
+                        snapped = {}
+                        for k, s in param_spaces.items():
+                            v = eval_params.get(k)
+                            ch = s.get("choices")
+                            if ch:
+                                v = v if v in ch else ch[0]
+                            snapped[k] = v
+                        if snapped.get("ema_short", 0) >= snapped.get("ema_long", 1):
+                            return -1e12
+                        if snapped.get("risk_reward_ratio", 0) <= snapped.get("sl_atr_multiplier", 0):
+                            return -1e12
+                        _, score, _ = run_backtest_with_params(df, snapped, initial_cash, symbol, regime)
+                        return score  # 큰 값이 좋음
 
-                if method == "ga":
-                    best_params_dict, metric_value = run_ga(objective, param_spaces)
+                    if method == "ga":
+                        best_params_dict, metric_value = run_ga(objective, param_spaces)
+                    else:
+                        import numpy as _np
+                        def objective_min(eval_params: dict) -> float:
+                            s = objective(eval_params)
+                            return -float(s) if (s is not None and _np.isfinite(s)) else 1e12
+                        best_params_dict, metric_value_min = run_bayes(objective_min, param_spaces)
+                        metric_value = -float(metric_value_min)
+
+                    class _Wrap: ...
+                    best_params = _Wrap()
+                    for k, v in best_params_dict.items():
+                        setattr(best_params, k, v)
+                    metric_name = "Objective"
+
                 else:
-                    best_params_dict, metric_value = run_bayes(objective, param_spaces)
+                    # 폴백: grid
+                    OptoRunner.symbol = symbol
+                    OptoRunner.market_regime = regime
+                    bt = FractionalBacktest(
+                        df, OptoRunner,
+                        cash=initial_cash, commission=.002, margin=1/10,
+                        finalize_trades=True
+                    )
+                    stats = bt.optimize(
+                        open_threshold=[10, 12, 14, 16],
+                        risk_reward_ratio=[1.8, 2.0, 2.5, 3.0],
+                        sl_atr_multiplier=[1.2, 1.5, 1.8, 2.2],
+                        trend_entry_confirm_count=[2, 3, 4],
+                        ema_short=[12, 16, 20, 24],
+                        ema_long=[40, 50, 60, 80],
+                        score_strong_trend=[3, 4, 5],
+                        rsi_oversold=[20, 25, 30],
+                        score_oversold=[3, 4, 5],
+                        rsi_period=[14],
+                        score_macd_cross_up=[2, 3, 4],
+                        adx_threshold=[18, 22, 25, 28],
+                        score_adx_strong=[2, 3, 4],
+                        exec_partial=["1.0", "0.3,0.3,0.4"],
+                        exec_time_stop_bars=[0, 8, 12, 16],
+                        exec_trailing_mode=["off", "atr", "percent"],
+                        exec_trailing_k=[0.0, 1.0, 1.5, 2.0],
+                        risk_per_trade=[0.005, 0.01, 0.015, 0.02],
+                        max_exposure_frac=[0.2, 0.3, 0.4],
+                        maximize='Calmar Ratio',
+                        constraint=lambda p: p.ema_short < p.ema_long and p.risk_reward_ratio > p.sl_atr_multiplier
+                    )
+                    best_params = stats._strategy
+                    metric_name = 'Calmar Ratio'
+                    metric_value = float(stats[metric_name]) if metric_name in stats and pd.notna(stats[metric_name]) else 0.0
 
-                class _Wrap: ...
-                best_params = _Wrap()
-                for k, v in best_params_dict.items():
-                    setattr(best_params, k, v)
-                metric_name = "Objective"
+                print(
+                    f"\n--- ✅ [{symbol} | {SYMBOL_NAME.get(symbol, symbol)}] "
+                    f"{REGIME_NAME.get(regime, regime)} 에피소드 #{ep_idx} 최적화 완료! "
+                    f"(평가지표: {metric_name} = {metric_value:.3f}) ---"
+                )
 
-            else:
-                # 폴백: grid
-                OptoRunner.symbol = symbol
-                OptoRunner.market_regime = regime
-                bt = FractionalBacktest(
+                # === 공통: 베스트 파라미터 재평가 + 리포트/로그 + 저장 ===
+                best_kv = {k: getattr(best_params, k) for k in BEST_PARAM_KEYS if hasattr(best_params, k)}
+                print("   📊 Best Params:", json.dumps(_to_jsonable_dict(best_kv), ensure_ascii=False))
+                print(f"   🏆 {metric_name}: {metric_value:.4f}")
+
+                # 재평가
+                bt_eval = FractionalBacktest(
                     df, OptoRunner,
                     cash=initial_cash, commission=.002, margin=1/10,
                     finalize_trades=True
                 )
-                stats = bt.optimize(
-                    open_threshold=[10, 12, 14, 16],
-                    risk_reward_ratio=[1.8, 2.0, 2.5, 3.0],
-                    sl_atr_multiplier=[1.2, 1.5, 1.8, 2.2],
-                    trend_entry_confirm_count=[2, 3, 4],
-                    ema_short=[12, 16, 20, 24],
-                    ema_long=[40, 50, 60, 80],
-                    score_strong_trend=[3, 4, 5],
-                    rsi_oversold=[20, 25, 30],
-                    score_oversold=[3, 4, 5],
-                    rsi_period=[14],
-                    score_macd_cross_up=[2, 3, 4],
-                    adx_threshold=[18, 22, 25, 28],
-                    score_adx_strong=[2, 3, 4],
-                    exec_partial=["1.0", "0.3,0.3,0.4"],
-                    exec_time_stop_bars=[0, 8, 12, 16],
-                    exec_trailing_mode=["off", "atr", "percent"],
-                    exec_trailing_k=[0.0, 1.0, 1.5, 2.0],
-                    risk_per_trade=[0.005, 0.01, 0.015, 0.02],
-                    max_exposure_frac=[0.2, 0.3, 0.4],
-                    maximize='Calmar Ratio',
-                    constraint=lambda p: p.ema_short < p.ema_long and p.risk_reward_ratio > p.sl_atr_multiplier
+                best_kwargs = {k: getattr(best_params, k) for k in BEST_PARAM_KEYS if hasattr(best_params, k)}
+                stats_eval = bt_eval.run(**best_kwargs)
+
+                def _g(name, default=0.0):
+                    try:
+                        v = stats_eval.get(name, default)
+                        return float(v) if v is not None else default
+                    except Exception:
+                        return default
+
+                trades = int(stats_eval.get("# Trades", 0) or 0)
+                wins = int(stats_eval.get("# Winning Trades", 0) or 0)
+                winrate = (wins / trades * 100.0) if trades else 0.0
+                ret_pct = _g("Return [%]")
+                cagr = _g("Return (Ann.) [%]")
+                mdd = _g("Max. Drawdown [%]")
+                pf = _g("Profit Factor")
+                exposure = _g("Exposure Time [%]")
+                calmar = stats_eval.get("Calmar Ratio", None)
+                sharpe = stats_eval.get("Sharpe Ratio", None)
+
+                print(
+                    f"   ── 성과 요약 (재평가) │ {symbol} {SYMBOL_NAME.get(symbol, symbol)} │ "
+                    f"{REGIME_NAME.get(regime, regime)} ─────────────"
                 )
-                best_params = stats._strategy
-                metric_name = 'Calmar Ratio'
-                metric_value = float(stats[metric_name]) if metric_name in stats and pd.notna(stats[metric_name]) else 0.0
+                print(f"   • 총수익률: {ret_pct:.2f}%  |  연환산수익률: {cagr:.2f}%  |  최대낙폭: {mdd:.2f}%")
+                print(f"   • 승률: {winrate:.2f}%       |  수익요인(PF): {pf:.3f}     |  거래수: {trades}")
+                print(f"   • 노출시간: {exposure:.2f}% |  칼마비율: {calmar}        |  샤프지수: {sharpe}")
 
-            print(f"\n--- ✅ [{symbol}/{regime}] 최적화 완료! (결과: {metric_name}={metric_value:.3f}) ---")
-
-            # === 요약 출력 ===
-            best_kv = {k: getattr(best_params, k) for k in BEST_PARAM_KEYS if hasattr(best_params, k)}
-            print("   📊 Best Params:", json.dumps(_to_jsonable_dict(best_kv), ensure_ascii=False))
-            print(f"   🏆 {metric_name}: {metric_value:.4f}")
-
-            # === HTML 리포트 (grid 분기 전용) ===
-            REPORT_HTML = os.getenv("REPORT_HTML", "on").lower() in ("1","true","on","yes")
-            if REPORT_HTML and method == "grid":
-                out_dir = os.path.join(project_root, "reports", symbol)
-                os.makedirs(out_dir, exist_ok=True)
-                html_path = os.path.join(out_dir, f"{symbol}_{regime}_report.html")
+                # === HTML 리포트 저장 (local_backtesting/results/<SYMBOL>/...) ===
+                results_root = os.path.join(os.path.dirname(__file__), "results", symbol)
+                os.makedirs(results_root, exist_ok=True)
+                tag = f"{s_ts.date()}_{e_ts.date()}"
+                html_path = os.path.join(results_root, f"{symbol}_{regime}_{tag}_best.html")
                 try:
-                    bt.plot(open_browser=False, filename=html_path)
-                    print(f"   🧾 HTML report saved → {html_path}")
+                    bt_eval.plot(open_browser=False, filename=html_path)
+                    print(
+                        f"   🧾 리포트 저장 완료: {html_path}  "
+                        f"({symbol} {SYMBOL_NAME.get(symbol, symbol)} | {REGIME_NAME.get(regime, regime)} | 에피소드 #{ep_idx})"
+                    )
+
                 except Exception as e:
                     print(f"   [WARN] HTML plot failed: {e}")
 
-            # ===== 결과 저장 =====
-            # (1) 실행 파라미터(+실행정책/리스크) 저장 — 레짐/심볼별
-            if regime not in all_settings:
-                all_settings[regime] = {}
-            all_settings[regime][symbol] = {
-                "OPEN_TH": int(getattr(best_params, "open_threshold")),
-                "RR_RATIO": float(getattr(best_params, "risk_reward_ratio")),
-                "SL_ATR_MULTIPLIER": float(getattr(best_params, "sl_atr_multiplier")),
-                "TREND_ENTRY_CONFIRM_COUNT": int(getattr(best_params, "trend_entry_confirm_count")),
-                # 실행정책
-                "exec_partial": getattr(best_params, "exec_partial", "1.0"),
-                "exec_time_stop_bars": int(getattr(best_params, "exec_time_stop_bars", 0)),
-                "exec_trailing_mode": getattr(best_params, "exec_trailing_mode", "off"),
-                "exec_trailing_k": float(getattr(best_params, "exec_trailing_k", 0.0)),
-                # 리스크 사이징
-                "risk_per_trade": float(getattr(best_params, "risk_per_trade", 0.01)),
-                "max_exposure_frac": float(getattr(best_params, "max_exposure_frac", 0.30)),
-                "OPTIMIZED_METRIC": metric_name,
-                "VALUE": float(round(metric_value or 0.0, 4)),
-            }
-            with open(optimal_settings_file, 'w', encoding='utf-8') as f:
-                json.dump(all_settings, f, indent=4, ensure_ascii=False)
+                # ===== 결과 저장(JSON) =====
+                all_settings.setdefault(f"{regime}", {}).setdefault(symbol, {})
+                all_settings[regime][symbol][tag] = {
+                    **{
+                        "OPEN_TH": int(getattr(best_params, "open_threshold")),
+                        "RR_RATIO": float(getattr(best_params, "risk_reward_ratio")),
+                        "SL_ATR_MULTIPLIER": float(getattr(best_params, "sl_atr_multiplier")),
+                        "TREND_ENTRY_CONFIRM_COUNT": int(getattr(best_params, "trend_entry_confirm_count")),
+                        # 실행정책
+                        "exec_partial": getattr(best_params, "exec_partial", "1.0"),
+                        "exec_time_stop_bars": int(getattr(best_params, "exec_time_stop_bars", 0)),
+                        "exec_trailing_mode": getattr(best_params, "exec_trailing_mode", "off"),
+                        "exec_trailing_k": float(getattr(best_params, "exec_trailing_k", 0.0)),
+                        # 리스크 사이징
+                        "risk_per_trade": float(getattr(best_params, "risk_per_trade", 0.01)),
+                        "max_exposure_frac": float(getattr(best_params, "max_exposure_frac", 0.30)),
+                        "OPTIMIZED_METRIC": metric_name,
+                        "VALUE": float(round(metric_value or 0.0, 4)),
+                    },
+                    "SUMMARY": {
+                        "Return_%": round(ret_pct, 4),
+                        "CAGR_%": round(cagr, 4),
+                        "MaxDD_%": round(mdd, 4),
+                        "WinRate_%": round(winrate, 4),
+                        "ProfitFactor": round(pf, 4),
+                        "Exposure_%": round(exposure, 4),
+                        "Calmar": None if (calmar is None or (isinstance(calmar,float) and (math.isnan(calmar) or math.isinf(calmar)))) else round(float(calmar), 4),
+                        "Sharpe": None if (sharpe is None or (isinstance(sharpe,float) and (math.isnan(sharpe) or math.isinf(sharpe)))) else round(float(sharpe), 4),
+                        "Trades": trades,
+                        "Period": {"start": s_ts.isoformat(), "end": e_ts.isoformat()}
+                    }
+                }
+                with open(optimal_settings_file, 'w', encoding='utf-8') as f:
+                    json.dump(all_settings, f, indent=4, ensure_ascii=False)
 
-            # (2) 전략 점수/지표 파라미터 저장
-            base_strategies = get_strategy_configs_safe(regime)
-            base_strategies = json.loads(json.dumps(base_strategies))  # deep copy
-            base_strategies.setdefault("TrendStrategy", {})
-            base_strategies.setdefault("OscillatorStrategy", {})
-            base_strategies.setdefault("ComprehensiveStrategy", {})
+                # (2) 전략 점수/지표 파라미터 저장
+                base_strategies = get_strategy_configs_safe(regime)
+                base_strategies = json.loads(json.dumps(base_strategies))  # deep copy
+                base_strategies.setdefault("TrendStrategy", {})
+                base_strategies.setdefault("OscillatorStrategy", {})
+                base_strategies.setdefault("ComprehensiveStrategy", {})
 
-            base_strategies["TrendStrategy"]["ema_short"] = int(getattr(best_params, "ema_short"))
-            base_strategies["TrendStrategy"]["ema_long"] = int(getattr(best_params, "ema_long"))
-            base_strategies["TrendStrategy"]["score_strong_trend"] = int(getattr(best_params, "score_strong_trend"))
+                base_strategies["TrendStrategy"]["ema_short"] = int(getattr(best_params, "ema_short"))
+                base_strategies["TrendStrategy"]["ema_long"] = int(getattr(best_params, "ema_long"))
+                base_strategies["TrendStrategy"]["score_strong_trend"] = int(getattr(best_params, "score_strong_trend"))
 
-            base_strategies["OscillatorStrategy"]["rsi_period"] = int(getattr(best_params, "rsi_period"))
-            rsi_os = int(getattr(best_params, "rsi_oversold"))
-            base_strategies["OscillatorStrategy"]["rsi_oversold"] = rsi_os
-            base_strategies["OscillatorStrategy"]["rsi_overbought"] = 100 - rsi_os
-            soc_os = int(getattr(best_params, "score_oversold"))
-            base_strategies["OscillatorStrategy"]["score_oversold"] = soc_os
-            base_strategies["OscillatorStrategy"]["score_overbought"] = -soc_os
+                base_strategies["OscillatorStrategy"]["rsi_period"] = int(getattr(best_params, "rsi_period"))
+                rsi_os = int(getattr(best_params, "rsi_oversold"))
+                base_strategies["OscillatorStrategy"]["rsi_oversold"] = rsi_os
+                base_strategies["OscillatorStrategy"]["rsi_overbought"] = 100 - rsi_os
+                soc_os = int(getattr(best_params, "score_oversold"))
+                base_strategies["OscillatorStrategy"]["score_oversold"] = soc_os
+                base_strategies["OscillatorStrategy"]["score_overbought"] = -soc_os
 
-            base_strategies["ComprehensiveStrategy"]["score_macd_cross_up"] = int(getattr(best_params, "score_macd_cross_up"))
-            base_strategies["ComprehensiveStrategy"]["score_macd_cross_down"] = -int(getattr(best_params, "score_macd_cross_up"))
-            base_strategies["ComprehensiveStrategy"]["adx_threshold"] = int(getattr(best_params, "adx_threshold"))
-            base_strategies["ComprehensiveStrategy"]["score_adx_strong"] = int(getattr(best_params, "score_adx_strong"))
+                base_strategies["ComprehensiveStrategy"]["score_macd_cross_up"] = int(getattr(best_params, "score_macd_cross_up"))
+                base_strategies["ComprehensiveStrategy"]["score_macd_cross_down"] = -int(getattr(best_params, "score_macd_cross_up"))
+                base_strategies["ComprehensiveStrategy"]["adx_threshold"] = int(getattr(best_params, "adx_threshold"))
+                base_strategies["ComprehensiveStrategy"]["score_adx_strong"] = int(getattr(best_params, "score_adx_strong"))
 
-            all_strategies[regime] = base_strategies or {}
-            with open(strategies_optimized_file, 'w', encoding='utf-8') as f:
-                json.dump(all_strategies, f, indent=2, ensure_ascii=False)
+                all_strategies[regime] = base_strategies or {}
+                with open(strategies_optimized_file, 'w', encoding='utf-8') as f:
+                    json.dump(all_strategies, f, indent=2, ensure_ascii=False)
 
-            print(f"   💾 저장 완료 → {optimal_settings_file}, {strategies_optimized_file}")
+                print(f"   💾 저장 완료 → {optimal_settings_file}, {strategies_optimized_file}")
