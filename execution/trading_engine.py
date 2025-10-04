@@ -1,9 +1,13 @@
-# 파일명: execution/trading_engine.py (V4.2 — 단일 실행정책 + JSON 기반 설정)
+# 파일명: execution/trading_engine.py
+# V5.0 — 공통 리스크 사이징(calc_order_qty) 통합 + JSON 기반 실행정책 + 브래킷(멀티TP/SL/트레일/타임스탑)
+# - quantity 미지정 시 calc_order_qty()로 절대 수량 자동 계산 (하드코딩 제거)
+# - 레버리지→margin(=1/leverage) 반영, 거래소 필터(minNotional/stepSize/minQty) 준수
+# - 기존 DB/이벤트/브래킷/트레일링/타임스탑 로직은 유지
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional, Dict, List
+from typing import Optional, Dict, List, Any
 from datetime import datetime, timezone
 
 from binance.client import Client
@@ -14,6 +18,10 @@ from core.config_manager import config        # ▶ 옵티마이저가 만든 JS
 from core.event_bus import event_bus
 from database.manager import db_manager
 from database.models import Signal, Trade
+
+# 공통 리스크 사이징 유틸
+from analysis.risk_sizing import calc_order_qty
+
 
 # -----------------------------------------------------------------------------
 # 실행 정책 설정 (모든 값은 config에서만 읽는다 — ENV 사용 안 함)
@@ -28,14 +36,19 @@ class ExecPolicy:
     time_stop_bars: int = 0               # 0이면 비활성
     trailing_mode: str = "off"            # "off" | "atr" | "percent"
     trailing_k: float = 0.0               # atr 배수 또는 percent 값
+    # 리스크 사이징(절대 수량 계산용)
+    risk_per_trade: float = 0.01          # 자본 1%
+    max_exposure_frac: float = 0.30       # 총노출 = 자본의 30% (레버리지 전 기준)
 
     @staticmethod
     def from_config(symbol: str) -> "ExecPolicy":
         """
         config에서 해당 심볼의 실행정책을 불러온다.
-        - 기대 키: sl_atr_multiplier, risk_reward_ratio, exec_partial, exec_time_stop_bars,
-                  exec_trailing_mode, exec_trailing_k
-        - 모두 없으면 안전한 기본값 사용
+        기대 키:
+          - sl_atr_multiplier, risk_reward_ratio
+          - exec_partial, exec_time_stop_bars, exec_trailing_mode, exec_trailing_k
+          - risk_per_trade, max_exposure_frac
+        모두 없으면 안전한 기본값 사용
         """
         p = config.get_exec_policy(symbol) if hasattr(config, "get_exec_policy") else {}
         # 과거 설정 키와 호환
@@ -47,6 +60,9 @@ class ExecPolicy:
         time_stop = int(p.get("exec_time_stop_bars", 0))
         trailing_mode = p.get("exec_trailing_mode", "off")
         trailing_k = float(p.get("exec_trailing_k", 0.0))
+        # 리스크 사이징
+        rpt = float(p.get("risk_per_trade", getattr(config, "risk_per_trade", 0.01)))
+        mef = float(p.get("max_exposure_frac", getattr(config, "max_exposure_frac", 0.30)))
         return ExecPolicy(
             sl_atr_mult=float(sl_mult),
             rr=float(rr),
@@ -54,7 +70,10 @@ class ExecPolicy:
             time_stop_bars=time_stop,
             trailing_mode=trailing_mode,
             trailing_k=trailing_k,
+            risk_per_trade=rpt,
+            max_exposure_frac=mef,
         )
+
 
 # -----------------------------------------------------------------------------
 # TradingEngine — 단일 소스: 멀티 TP, 트레일링, 타임스탑, 브래킷 동기화
@@ -67,12 +86,17 @@ class TradingEngine:
     - 트레일링: SL 주문을 '취소 후 재발행' 방식으로 끌어올림/내림
     - 타임스탑: 보유 봉수 k 이상이면 전량 마켓 청산
     - 모든 수치/토글은 config(JSON)에서 공급 (ENV 미사용)
+    - quantity가 미지정이면 calc_order_qty()로 **절대 수량** 자동 계산
     """
 
     def __init__(self, client: Client):
         self.client = client
-        self._live_brackets: Dict[str, Dict] = {}  # symbol -> {sl_id, tp_ids[], entry_price, side, bars_held}
-        print("🚚 [V4.2] 트레이딩 엔진 초기화(멀티TP/트레일/타임스탑 통합, JSON 설정).")
+        self._live_brackets: Dict[str, Dict] = {}  # symbol -> {sl_id, tp_ids[], entry_price, side, bars_held, quantity}
+        # 레버리지 맵(심볼별), 기본 10x
+        self._leverage_by_symbol: Dict[str, float] = {}
+        # 거래소 심볼 필터 캐시
+        self._filters_cache: Dict[str, Dict[str, float]] = {}
+        print("🚚 [V5.0] 트레이딩 엔진 초기화(리스크 사이징 통합, 멀티TP/트레일/타임스탑, JSON 설정).")
 
     # -------------------------------------------------------------------------
     # 외부에서 호출: 신규 진입 + 브래킷 자동 부착
@@ -80,22 +104,57 @@ class TradingEngine:
     def open_with_bracket(
         self,
         symbol: str,
-        side: str,                 # "BUY" | "SELL"
-        quantity: float,
+        side: str,                      # "BUY" | "SELL"
         entry_atr: float,
-        entry_type: str = "MARKET",  # "MARKET"|"LIMIT"
+        quantity: Optional[float] = None,   # None 또는 <=0이면 calc_order_qty()로 자동 계산
+        entry_type: str = "MARKET",         # "MARKET"|"LIMIT"
         entry_price: Optional[float] = None,
         client_order_id_prefix: Optional[str] = None,
         extra: Optional[dict] = None,
     ) -> Optional[dict]:
         """
-        1) 진입 주문
-        2) 체결 기준가(entry_price) 확보
-        3) SL/TP 브래킷 부착(부분익절 가능)
-        4) DB 기록/이벤트 발행
+        1) (필요 시) 리스크 기반 절대 수량 계산
+        2) 진입 주문
+        3) 체결 기준가(entry_price) 확보
+        4) SL/TP 브래킷 부착(부분익절 가능)
+        5) DB 기록/이벤트 발행
         """
         policy = ExecPolicy.from_config(symbol)
+        side = side.upper()
         close_side = "BUY" if side == "SELL" else "SELL"
+
+        # --- 0) 리스크 기반 수량 계산 (quantity가 없거나 ≤0일 때만) -------------------------
+        qty = float(quantity or 0.0)
+        if qty <= 0:
+            # 필수 값 체크
+            if entry_atr is None or float(entry_atr) <= 0:
+                print(f"⚠️ {symbol} 리스크 사이징 실패: entry_atr가 필요합니다.")
+                return None
+            last_px = self._fetch_last_price(symbol) if entry_type != "LIMIT" or not entry_price else float(entry_price)
+            if last_px <= 0:
+                print(f"⚠️ {symbol} 리스크 사이징 실패: 참조 가격이 유효하지 않음.")
+                return None
+
+            filt = self._get_symbol_filters(symbol)
+            equity = self.get_equity_usdt()
+            lev = self._get_leverage(symbol)
+            margin = 1.0 / max(1.0, lev)
+
+            qty = calc_order_qty(
+                price=float(last_px),
+                atr=float(entry_atr),
+                sl_atr_mult=float(policy.sl_atr_mult),
+                equity=float(equity),
+                risk_per_trade=float(policy.risk_per_trade),
+                max_exposure_frac=float(policy.max_exposure_frac),
+                margin=float(margin),
+                min_notional=float(filt["min_notional"]),
+                qty_step=float(filt["qty_step"]),
+                min_qty=float(filt["min_qty"]),
+            )
+            if qty <= 0:
+                print(f"⚠️ {symbol} sizing=0 → 진입 스킵 (equity={equity:.2f}, price={last_px:.4f})")
+                return None
 
         # --- 1) 진입 주문 ----------------------------------------------------------------
         try:
@@ -103,28 +162,27 @@ class TradingEngine:
                 assert entry_price is not None and entry_price > 0
                 entry = self.client.futures_create_order(
                     symbol=symbol, side=side, type="LIMIT",
-                    price=round(float(entry_price), 4),
-                    quantity=quantity, timeInForce="GTC",
+                    price=round(float(entry_price), 6),
+                    quantity=qty, timeInForce="GTC",
                     newClientOrderId=self._cid(symbol, client_order_id_prefix, "ENTRYL")
                 )
             else:
                 entry = self.client.futures_create_order(
                     symbol=symbol, side=side, type="MARKET",
-                    quantity=quantity,
+                    quantity=qty,
                     newClientOrderId=self._cid(symbol, client_order_id_prefix, "ENTRYM")
                 )
-            print(f"➡️  {symbol} {side} {quantity} 진입 전송 OK")
+            print(f"➡️  {symbol} {side} {qty} 진입 전송 OK")
         except BinanceAPIException as e:
-            print(f"🚨 진입 주문 실패: {symbol} {side} x{quantity} — {e}")
+            print(f"🚨 진입 주문 실패: {symbol} {side} x{qty} — {e}")
             return None
 
         # --- 2) 체결가 산정 --------------------------------------------------------------
         try:
-            # 평균 체결가를 응답에서 우선 읽고, 없으면 최근 가격 조회
             avg_px = float(entry.get("avgPrice") or 0) or self._fetch_last_price(symbol)
-            entry_px = round(avg_px, 4)
+            entry_px = round(avg_px, 6)
         except Exception:
-            entry_px = round(self._fetch_last_price(symbol), 4)
+            entry_px = round(self._fetch_last_price(symbol), 6)
 
         # --- 3) SL/TP 계산 및 주문 전송 ---------------------------------------------------
         sl_d = float(entry_atr) * policy.sl_atr_mult
@@ -133,11 +191,11 @@ class TradingEngine:
             return entry
 
         if side == "BUY":
-            sl_px = round(entry_px - sl_d, 4)
-            tp_base = round(entry_px + (sl_d * policy.rr), 4)
+            sl_px = round(entry_px - sl_d, 6)
+            tp_base = round(entry_px + (sl_d * policy.rr), 6)
         else:
-            sl_px = round(entry_px + sl_d, 4)
-            tp_base = round(entry_px - (sl_d * policy.rr), 4)
+            sl_px = round(entry_px + sl_d, 6)
+            tp_base = round(entry_px - (sl_d * policy.rr), 6)
 
         # 3-1) SL(손절): reduceOnly + 수량 지정
         try:
@@ -147,7 +205,7 @@ class TradingEngine:
                 type="STOP_MARKET",
                 stopPrice=sl_px,
                 reduceOnly=True,
-                quantity=quantity,
+                quantity=qty,
                 newClientOrderId=self._cid(symbol, client_order_id_prefix, "SL")
             )
         except BinanceAPIException as e:
@@ -164,7 +222,7 @@ class TradingEngine:
                     type="TAKE_PROFIT_MARKET",
                     stopPrice=tp_base,
                     reduceOnly=True,
-                    quantity=quantity,
+                    quantity=qty,
                     newClientOrderId=self._cid(symbol, client_order_id_prefix, "TP")
                 )
                 if "orderId" in tp_single:
@@ -172,9 +230,13 @@ class TradingEngine:
             else:
                 # 멀티 TP: 0.5R/1.0R/1.5R 스텝 — 비중은 policy.partial에 따름
                 steps = [0.5, 1.0, 1.5] if len(policy.partial) == 3 else [1.0] * len(policy.partial)
-                remain = quantity
-                for w, m in zip(policy.partial, steps):
-                    sub_qty = round(quantity * float(w), 6)
+                # 수량 분할: 마지막 조각은 잔량 보정
+                remain = qty
+                for i, (w, m) in enumerate(zip(policy.partial, steps)):
+                    if i < len(policy.partial) - 1:
+                        sub_qty = round(qty * float(w), 6)
+                    else:
+                        sub_qty = round(remain, 6)  # 잔량 모두
                     remain -= sub_qty
                     sub_tp = self._scale_tp(entry_px, tp_base, side, mult=m)
                     tp = self.client.futures_create_order(
@@ -188,7 +250,6 @@ class TradingEngine:
                     )
                     if "orderId" in tp:
                         tp_ids.append(str(tp["orderId"]))
-                # 남은 잔량 보정이 필요하면 마지막 TP에 합쳐도 됨(상황에 따라)
         except BinanceAPIException as e:
             print(f"🚨 TP 주문 실패: {e}")
 
@@ -199,13 +260,13 @@ class TradingEngine:
             "entry_price": entry_px,
             "side": side,
             "bars_held": 0,
-            "quantity": quantity,
+            "quantity": float(qty),
         }
 
         # --- 4) DB / 이벤트 --------------------------------------------------------------
-        self._record_trade_open(symbol, side, entry_px, quantity, extra)
+        self._record_trade_open(symbol, side, entry_px, float(qty), extra)
         event_bus.safe_publish("ORDER_OPEN_SUCCESS", {
-            "symbol": symbol, "side": side, "qty": quantity, "entry": entry_px,
+            "symbol": symbol, "side": side, "qty": float(qty), "entry": entry_px,
             "sl": sl_px, "tp": tp_base, "tp_ids": tp_ids
         })
         return entry
@@ -285,7 +346,6 @@ class TradingEngine:
                 if policy.trailing_mode == "atr":
                     atr = float(last_atr or 0.0)
                     if atr <= 0:
-                        # 필요한 경우 외부 지표 캐시에서 가져오도록 구성 가능
                         return
                     trail = atr * max(0.0, policy.trailing_k)
                 else:
@@ -303,9 +363,9 @@ class TradingEngine:
                         pass
 
                 if side == "BUY":
-                    new_sl = round(max(entry, float(last_price) - trail), 4)  # BE 보호
+                    new_sl = round(max(entry, float(last_price) - trail), 6)  # BE 보호
                 else:
-                    new_sl = round(min(entry, float(last_price) + trail), 4)
+                    new_sl = round(min(entry, float(last_price) + trail), 6)
 
                 # 현재 보유 수량
                 pos = self._fetch_position(symbol)
@@ -323,6 +383,69 @@ class TradingEngine:
                 print(f"🚨 트레일링 실패: {e}")
 
     # -------------------------------------------------------------------------
+    # 레버리지/심볼 필터/자산 평가
+    # -------------------------------------------------------------------------
+    def set_leverage(self, symbol: str, leverage: float):
+        try:
+            lev = max(1.0, float(leverage))
+        except Exception:
+            lev = 10.0
+        self._leverage_by_symbol[symbol] = lev
+        try:
+            self.client.futures_change_leverage(symbol=symbol, leverage=int(round(lev)))
+        except Exception:
+            # 권한 없거나 현물계정이면 무시
+            pass
+
+    def _get_leverage(self, symbol: str) -> float:
+        return float(self._leverage_by_symbol.get(symbol, 10.0))
+
+    def _get_symbol_filters(self, symbol: str) -> Dict[str, float]:
+        """
+        거래소 심볼 필터(최소 주문가치, 스텝, 최소수량)를 캐싱하여 리턴.
+        """
+        if symbol in self._filters_cache:
+            return self._filters_cache[symbol]
+
+        min_notional = 5.0
+        qty_step = 1e-6
+        min_qty = 1e-6
+        try:
+            info = self.client.get_symbol_info(symbol)
+            for flt in info.get("filters", []):
+                t = flt.get("filterType")
+                if t in ("NOTIONAL", "MIN_NOTIONAL"):
+                    mn = flt.get("minNotional") or flt.get("notional")
+                    if mn is not None:
+                        min_notional = float(mn)
+                if t == "LOT_SIZE":
+                    if flt.get("stepSize"): qty_step = float(flt["stepSize"])
+                    if flt.get("minQty"):   min_qty  = float(flt["minQty"])
+        except Exception as e:
+            print(f"[{symbol}] 심볼 필터 조회 실패: {e} → 기본값 사용")
+
+        self._filters_cache[symbol] = {
+            "min_notional": min_notional,
+            "qty_step": qty_step,
+            "min_qty": min_qty,
+        }
+        return self._filters_cache[symbol]
+
+    def get_equity_usdt(self) -> float:
+        """
+        계좌 평가금액(USDT). 거래소 API에 맞게 구현하세요.
+        (바이낸스 선물 예시)
+        """
+        try:
+            bal = self.client.futures_account_balance()
+            for b in bal:
+                if (b.get("asset") or "").upper() in ("USDT", "BUSD", "USDC", "FDUSD", "TUSD"):
+                    return float(b.get("balance", 0) or 0.0)
+        except Exception:
+            pass
+        return 0.0
+
+    # -------------------------------------------------------------------------
     # 내부 유틸
     # -------------------------------------------------------------------------
     def _cid(self, symbol: str, prefix: Optional[str], tag: str) -> str:
@@ -337,10 +460,10 @@ class TradingEngine:
             return tp_base
         if side == "BUY":
             r_unit = tp_base - entry_px
-            return round(entry_px + r_unit * mult, 4)
+            return round(entry_px + r_unit * mult, 6)
         else:
             r_unit = entry_px - tp_base
-            return round(entry_px - r_unit * mult, 4)
+            return round(entry_px - r_unit * mult, 6)
 
     def _cancel_brackets(self, symbol: str):
         st = self._live_brackets.pop(symbol, None)
