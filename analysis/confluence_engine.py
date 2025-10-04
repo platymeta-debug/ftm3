@@ -21,11 +21,11 @@ class ConfluenceEngine:
     """
     기술적 분석, 거시 경제 분석, 동적 파라미터를 통합하여 최종 결정을 내리는 '두뇌' 모듈.
     """
-    def __init__(self, client: Client):
+    def __init__(self, client: Client, strategy_configs: dict | None = None):
         self.client = client
         self.fear_and_greed_index = 50
         self.macro_analyzer = MacroAnalyzer()
-
+        self.strategy_configs = strategy_configs or {}
         # --- ▼▼▼ [수정] strategies.json 의존성 제거 및 전략 직접 초기화 ▼▼▼ ---
         # 이제 ConfluenceEngine은 외부 설정 파일 없이 스스로 모든 전략을 관리합니다.
         self.strategies = []
@@ -36,10 +36,14 @@ class ConfluenceEngine:
         }
 
         for name, cls in strategy_classes.items():
-            # config 객체를 통해 strategies.json 파일의 내용을 가져옴
-            strategy_config = config.strategy_configs.get(name, {})
-            if strategy_config.get("enabled", True): # 기본적으로 활성화
-                # 해당 전략 클래스를 초기화할 때, 파라미터를 전달
+            if self.strategy_configs:
+                # backtest_optimizer.py 에서 넘겨준 값 사용
+                strategy_config = self.strategy_configs.get(name, {})
+            else:
+                # ConfigManager 의 메서드 사용 (BULL/BEAR/SIDEWAYS 중 하나)
+                strategy_config = config.get_strategy_configs("BULL").get(name, {})
+            
+            if strategy_config.get("enabled", True):
                 self.strategies.append(cls(params=strategy_config))
         self.filter = SignalFilterStrategy()
         print(f"✅ [최종] {len(self.strategies)}개 분석 전략, 1개 신호 필터, 1개 거시 분석기가 로드되었습니다.")
