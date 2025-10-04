@@ -1,180 +1,177 @@
+# analysis/macro_analyzer.py
+# v2.7 — 일자 정규화로 BULL/BEAR 세그멘트 복구 + 키 로딩 원복(ENV는 폴백만)
+
+from __future__ import annotations
+
+import os
+from enum import Enum
+from dataclasses import dataclass
+from typing import Optional, Dict, Any, Tuple
+
 import pandas as pd
 import yfinance as yf
-from fredapi import Fred
-from enum import Enum
-from datetime import datetime, timedelta
+
+try:
+    from fredapi import Fred  # type: ignore
+except Exception:
+    Fred = None  # type: ignore
+
 from core.config_manager import config
+
 
 class MacroRegime(Enum):
     BULL = "강세 국면 (Risk-On)"
     BEAR = "약세 국면 (Risk-Off)"
     SIDEWAYS = "중립/혼돈 국면"
 
-class MacroAnalyzer:
-    """
-    다양한 거시 경제 지표와 그 상관관계를 분석하여 시장의 체질을
-    전문가 수준으로 진단하고, 위험 자산에 대한 투자 적합도를 점수화합니다.
-    """
-    def __init__(self):
-        self.cache = {}
-        self.cache_expiry = timedelta(hours=4)
-        self.fred = None
-        if config.fred_api_key:
-            try:
-                self.fred = Fred(api_key=config.fred_api_key)
-                print("✅ FRED API 클라이언트가 성공적으로 초기화되었습니다.")
-            except Exception as e:
-                print(f"🚨 FRED API 키 초기화 실패: {e}. 일부 데이터 조회가 제한됩니다.")
-        else:
-            print("⚠️ FRED_API_KEY가 .env 파일에 설정되지 않았습니다. 일부 데이터 조회가 제한됩니다.")
-        print("📈 거시 경제 분석기(v2.4 Final)가 초기화되었습니다.")
 
-    def _get_data(self, ticker: str, period: str = "3y", interval: str = "1d") -> pd.DataFrame | None:
+@dataclass
+class MacroKeys:
+    fred: str = ""
+
+
+class MacroAnalyzer:
+    def __init__(self):
+        # ✅ ENV만 사용 (config 무시)
+        # Windows PowerShell 예시:  $env:FRED_API_KEY="YOUR_FRED_KEY"
+        # 시스템 영구등록:          setx FRED_API_KEY "YOUR_FRED_KEY" ; 새 터미널 열기
+        def _get_env(*names):
+            import os
+            for n in names:
+                v = os.getenv(n, "")
+                if isinstance(v, str) and v.strip():
+                    return v.strip()
+            return ""
+
+        fred_key = _get_env("FRED_API_KEY", "FREDAPI_KEY", "FRED_TOKEN")
+
+        # 민감정보는 출력하지 않되, 감지 여부/길이만 로깅
+        def _mask(s: str) -> str:
+            return f"{len(s)} chars" if s else "empty"
+
+        print(f"🔑 ENV check — FRED_API_KEY: {('found ' + _mask(fred_key)) if fred_key else 'not found'}")
+
+        # fredapi 초기화 (패키지 없으면 무시)
+        self.fred = None
         try:
-            data = yf.download(ticker, period=period, interval=interval, progress=False, auto_adjust=False)
-            return data if not data.empty else None
+            from fredapi import Fred  # noqa
+            if fred_key:
+                try:
+                    self.fred = Fred(api_key=fred_key)
+                    print("✅ FRED API 초기화 완료.")
+                except Exception as e:
+                    print(f"⚠️ FRED 초기화 실패: {e} → FRED 지표 비활성.")
+            else:
+                print("ℹ️ FRED_API_KEY가 ENV에 없습니다. FRED 지표 비활성.")
+        except Exception:
+            print("ℹ️ fredapi 패키지가 설치되어 있지 않습니다. FRED 지표 비활성.")
+
+        print("📈 MacroAnalyzer ready (ENV-only mode).")
+
+    # -------------------- 공통: 일자 정규화 --------------------
+    @staticmethod
+    def _normalize_daily_index(df: pd.DataFrame) -> pd.DataFrame:
+        if df is None or df.empty:
+            return df
+        out = df.copy()
+        out.index = pd.to_datetime(out.index)
+        # 타임존 제거 + 자정으로 내림 → 일자 인덱스
+        out.index = out.index.tz_localize(None)
+        out.index = out.index.normalize()
+        out.index.name = "Date"
+        return out
+
+    @staticmethod
+    def _normalize_daily_series(s: pd.Series) -> pd.Series:
+        if s is None or len(s) == 0:
+            return s
+        out = pd.Series(s.copy())
+        out.index = pd.to_datetime(out.index)
+        out.index = out.index.tz_localize(None)
+        out.index = out.index.normalize()
+        out.name = getattr(s, "name", out.name)
+        return out
+
+    # -------------------- 데이터 취득 --------------------
+    def _get_yf(self, ticker: str, period: str = "5y", interval: str = "1d") -> Optional[pd.DataFrame]:
+        try:
+            df = yf.download(ticker, period=period, interval=interval, progress=False, auto_adjust=False)
+            if df is None or df.empty:
+                return None
+            return self._normalize_daily_index(df)
         except Exception as e:
-            print(f"🚨 yfinance 데이터 다운로드 실패 ({ticker}): {e}")
+            print(f"🚨 yfinance 실패({ticker}): {e}")
             return None
 
-    def _get_fred_data(self, series_id: str) -> pd.DataFrame | None:
-        if self.fred:
-            try:
-                return self.fred.get_series(series_id, start_date="2020-01-01")
-            except Exception as e:
-                print(f"🚨 FRED 데이터 조회 실패 ({series_id}): {e}")
+    def _get_fred_series(self, series_id: str, start: str = "2000-01-01") -> Optional[pd.Series]:
+        if self.fred is None:
+            return None
+        try:
+            s = self.fred.get_series(series_id, start_date=start)
+            if s is None or len(s) == 0:
                 return None
-        return None
-    
-    
-    def diagnose_macro_regime_for_date(self, analysis_date, macro_data: dict) -> tuple[MacroRegime, int, dict]:
-        scores = {}
+            return self._normalize_daily_series(s)
+        except Exception as e:
+            print(f"🚨 FRED 조회 실패({series_id}): {e}")
+            return None
 
-        def get_latest_row(df, date):
-            if df is None: return None
-            # Timezone handling for robust date comparison
-            if df.index.tz is not None and getattr(date, 'tzinfo', None) is None:
-                date = pd.Timestamp(date).tz_localize(df.index.tz)
-            elif df.index.tz is None and getattr(date, 'tzinfo', None) is not None:
-                date = date.tz_convert(None).tz_localize(None)
-            
-            subset = df.loc[:date]
-            return subset.iloc[-1] if not subset.empty else None
-
-        # --- ▼▼▼ [수정] 값의 존재 여부와 유효성을 명확히 분리하여 오류 해결 ---
-        
-        # 1. NASDAQ Analysis
-        scores["주도주(나스닥)"] = 0
-        nasdaq = macro_data.get('nasdaq')
-        nasdaq_row = get_latest_row(nasdaq, analysis_date)
-        if nasdaq_row is not None:
-            sma_val = nasdaq_row.get('SMA_200')
-            close_val = nasdaq_row.get('Close')
-            
-            # AMBIGUITY FIX: Ensure values are scalars before comparison
-            if isinstance(sma_val, pd.Series): sma_val = sma_val.iloc[-1]
-            if isinstance(close_val, pd.Series): close_val = close_val.iloc[-1]
-
-            if pd.notna(sma_val) and pd.notna(close_val):
-                scores["주도주(나스닥)"] = 5 if close_val > sma_val else -5
-
-        # 2. VIX Analysis
-        scores["변동성(VIX)"] = 0
-        vix = macro_data.get('vix')
-        vix_row = get_latest_row(vix, analysis_date)
-        if vix_row is not None:
-            sma_val = vix_row.get('SMA_20')
-            close_val = vix_row.get('Close')
-            
-            # AMBIGUITY FIX: Ensure values are scalars before comparison
-            if isinstance(sma_val, pd.Series): sma_val = sma_val.iloc[-1]
-            if isinstance(close_val, pd.Series): close_val = close_val.iloc[-1]
-
-            if pd.notna(sma_val) and pd.notna(close_val):
-                if close_val > 30:
-                    scores["변동성(VIX)"] = -5
-                elif close_val > 20 and close_val > sma_val:
-                    scores["변동성(VIX)"] = -3
-                elif close_val < 15:
-                    scores["변동성(VIX)"] = 3
-        # --- ▲▲▲ [수정] ---
-
-        final_score = sum(scores.values())
-
-        if final_score >= 5:
-            return MacroRegime.BULL, final_score, scores
-        elif final_score <= -5:
-            return MacroRegime.BEAR, final_score, scores
-        else:
-            return MacroRegime.SIDEWAYS, final_score, scores
-
-    # --- 개별 지표 분석 함수들 ---
-    def analyze_market_leader(self) -> (int, str):
-        """[주도주] 나스닥 지수(^IXIC)와 200일 이평선을 비교합니다."""
-        data = self._get_data("^IXIC")
-        if data is None or len(data) < 200: return 0, "데이터 부족"
-        data['SMA_200'] = data['Close'].rolling(window=200).mean()
+    # -------------------- 개별 지표 --------------------
+    def analyze_market_leader(self) -> Tuple[int, str]:
+        data = self._get_yf("^IXIC")
+        if data is None or len(data) < 200:
+            return 0, "데이터 부족"
+        data["SMA_200"] = data["Close"].rolling(200).mean()
         last = data.iloc[-1]
-        if last['Close'] > last['SMA_200']: return 5, "강세"
-        return -5, "약세"
+        return (5, "강세") if last["Close"] > last["SMA_200"] else (-5, "약세")
 
-    def analyze_market_volatility(self) -> (int, str):
-        """[변동성] VIX 지수(^VIX)의 절대 레벨과 추세를 분석합니다."""
-        data = self._get_data("^VIX")
-        if data is None or len(data) < 20: return 0, "데이터 부족"
-        data['SMA_20'] = data['Close'].rolling(window=20).mean()
+    def analyze_market_volatility(self) -> Tuple[int, str]:
+        data = self._get_yf("^VIX")
+        if data is None or len(data) < 20:
+            return 0, "데이터 부족"
+        data["SMA_20"] = data["Close"].rolling(20).mean()
         last = data.iloc[-1]
-        if last['Close'] > 30: return -5, "극심한 공포" # 시장 패닉
-        if last['Close'] > 20 and last['Close'] > last['SMA_20']: return -3, "공포 확산" # 위험 회피
-        if last['Close'] < 15: return 3, "시장 안정" # 위험 선호
+        if last["Close"] > 30:
+            return -5, "극심한 공포"
+        if last["Close"] > 20 and last["Close"] > data["SMA_20"].iloc[-1]:
+            return -3, "공포 확산"
+        if last["Close"] < 15:
+            return 3, "시장 안정"
         return 0, "중립"
 
-    def analyze_credit_risk(self) -> (int, str):
-        """[신용위험] 미국 하이일드 채권 스프레드(BAMLH0A0HYM2)를 분석합니다."""
-        data = self._get_fred_data("BAMLH0A0HYM2")
-        if data is None or len(data) < 50: return 0, "데이터 부족"
-        data_sma50 = data.rolling(50).mean()
-        # 스프레드가 확대(위험 증가)되면 암호화폐 시장에 악재
-        if data.iloc[-1] > data_sma50.iloc[-1]: return -5, "신용 경색"
-        return 3, "자금 원활"
+    def analyze_credit_risk(self) -> Tuple[int, str]:
+        s = self._get_fred_series("BAMLH0A0HYM2")
+        if s is None or len(s) < 50:
+            return 0, "데이터 부족 또는 FRED 비활성"
+        sma50 = s.rolling(50).mean()
+        return (-5, "신용 경색") if s.iloc[-1] > sma50.iloc[-1] else (3, "자금 원활")
 
-    def analyze_liquidity(self) -> (int, str):
-        """[유동성] 달러 인덱스(DX-Y.NYB) 추세를 분석합니다."""
-        data = self._get_data("DX-Y.NYB")
-        if data is None or len(data) < 50: return 0, "데이터 부족"
-        data['SMA_50'] = data['Close'].rolling(window=50).mean()
-        # 달러 약세는 위험자산 선호 심리 강화
-        if data.iloc[-1]['Close'] < data.iloc[-1]['SMA_50']: return 4, "달러 약세"
-        return -4, "달러 강세"
+    def analyze_liquidity(self) -> Tuple[int, str]:
+        data = self._get_yf("DX-Y.NYB") or self._get_yf("DXY")
+        if data is None or len(data) < 50:
+            return 0, "데이터 부족"
+        data["SMA_50"] = data["Close"].rolling(50).mean()
+        return (4, "달러 약세") if data.iloc[-1]["Close"] < data.iloc[-1]["SMA_50"] else (-4, "달러 강세")
 
-    def analyze_inflation_proxy(self) -> (int, str):
-        """[인플레이션] 국제 유가(CL=F) 추세를 분석합니다."""
-        data = self._get_data("CL=F")
-        if data is None or len(data) < 50: return 0, "데이터 부족"
-        data['SMA_50'] = data['Close'].rolling(window=50).mean()
-        # 유가 상승은 인플레이션 헤지 자산(BTC)에 긍정적일 수 있음
-        if data.iloc[-1]['Close'] > data.iloc[-1]['SMA_50']: return 2, "상승"
-        return -2, "하락"
+    def analyze_inflation_proxy(self) -> Tuple[int, str]:
+        data = self._get_yf("CL=F")
+        if data is None or len(data) < 50:
+            return 0, "데이터 부족"
+        data["SMA_50"] = data["Close"].rolling(50).mean()
+        return (2, "상승") if data.iloc[-1]["Close"] > data.iloc[-1]["SMA_50"] else (-2, "하락")
 
-    def analyze_yield_curve(self) -> (int, str):
-        """[경기침체] 미국 10년물-2년물 국채 금리차를 분석합니다."""
-        data = self._get_fred_data("T10Y2Y") # FRED에서 장단기 금리차 데이터 조회
-        if data is None or data.empty: return 0, "데이터 부족"
-
-        # 금리차가 0 아래로 내려가면(역전되면) 경기 침체 우려, 강력한 약세 신호
-        if data.iloc[-1] < 0:
+    def analyze_yield_curve(self) -> Tuple[int, str]:
+        s = self._get_fred_series("T10Y2Y")
+        if s is None or len(s) == 0:
+            return 0, "데이터 부족 또는 FRED 비활성"
+        val = float(s.iloc[-1])
+        if val < 0:
             return -7, "금리 역전 (침체 신호)"
-        elif data.iloc[-1] < 0.25:
+        if val < 0.25:
             return -3, "금리차 축소 (위험)"
-
         return 2, "정상"
-    
-     # --- 종합 진단 로직 ---
-    def diagnose_macro_regime(self) -> tuple[MacroRegime, int, dict]:
-        """
-        모든 거시 지표를 종합하고, 상관관계를 고려하여 최종 시장 체제를 진단합니다.
-        :return: (시장 체제 Enum, 최종 점수, 상세 점수 딕셔셔너리)
-        """
+
+    # -------------------- 종합 진단 --------------------
+    def diagnose_macro_regime(self) -> Tuple[MacroRegime, int, Dict[str, int]]:
         scores = {
             "주도주(나스닥)": self.analyze_market_leader()[0],
             "변동성(VIX)": self.analyze_market_volatility()[0],
@@ -183,38 +180,95 @@ class MacroAnalyzer:
             "인플레이션(유가)": self.analyze_inflation_proxy()[0],
             "경기침체(금리차)": self.analyze_yield_curve()[0],
         }
-        base_score = sum(scores.values())
-        final_score = base_score
+        final = sum(scores.values())
+        if final >= 7:
+            return MacroRegime.BULL, final, scores
+        if final <= -7:
+            return MacroRegime.BEAR, final, scores
+        return MacroRegime.SIDEWAYS, final, scores
 
-        # === 상관관계 분석 및 점수 조정 (전문가 로직) ===
-        # 1. 'Flight to Safety' 시나리오: 주도주 약세 + 신용위험 증가는 매우 강력한 약세 신호
-        if scores["주도주(나스닥)"] < 0 and scores["신용위험(회사채)"] < 0:
-            final_score -= 5 # 패널티 강화
-            scores["상관관계 조정"] = -5
-
-        # 2. 'Risk-On' 시나리오: 주도주 강세 + 변동성 안정 + 달러 약세는 매우 강력한 강세 신호
-        if scores["주도주(나스닥)"] > 0 and scores["변동성(VIX)"] > 0 and scores["유동성(달러)"] > 0:
-            final_score += 5 # 보너스 강화
-            scores["상관관계 조정"] = 5
-
-        print(f"📊 거시 경제 진단: 기본점수={base_score}, 최종점수={final_score} | 상세: {scores}")
-
-        if final_score >= 7:
-            return MacroRegime.BULL, final_score, scores
-        elif final_score <= -7:
-            return MacroRegime.BEAR, final_score, scores
-        else:
-            return MacroRegime.SIDEWAYS, final_score, scores
-
-    def preload_all_macro_data(self):
-        """최적화 분석 속도 향상을 위해 모든 거시 경제 데이터를 미리 불러옵니다."""
-        print("...모든 거시 경제 데이터를 미리 불러옵니다...")
-        nasdaq = self._get_data("^IXIC")
+    # -------------------- 프리로드(세그멘트용) --------------------
+    def preload_all_macro_data(self) -> Dict[str, Any]:
+        """
+        NASDAQ, VIX는 항상 프리로드(일자 인덱스).
+        FRED 키가 있으면 HY 스프레드/T10Y2Y도 추가.
+        """
+        print("… 거시 데이터 프리로드 중 …")
+        nasdaq = self._get_yf("^IXIC")
         if nasdaq is not None:
-            nasdaq['SMA_200'] = nasdaq['Close'].rolling(window=200).mean()
-
-        vix = self._get_data("^VIX")
+            nasdaq["SMA_200"] = nasdaq["Close"].rolling(200).mean()
+        vix = self._get_yf("^VIX")
         if vix is not None:
-            vix['SMA_20'] = vix['Close'].rolling(window=20).mean()
+            vix["SMA_20"] = vix["Close"].rolling(20).mean()
 
-        return {"nasdaq": nasdaq, "vix": vix}
+        out: Dict[str, Any] = {"nasdaq": nasdaq, "vix": vix}
+
+        if self.fred is not None:
+            hy = self._get_fred_series("BAMLH0A0HYM2")
+            yc = self._get_fred_series("T10Y2Y")
+            if hy is not None:
+                out["hy_spread"] = hy
+            if yc is not None:
+                out["t10y2y"] = yc
+        return out
+
+    # -------------------- 날짜별 진단(세그멘트 핵심) --------------------
+    def diagnose_macro_regime_for_date(self, analysis_date, macro_data: dict) -> Tuple[MacroRegime, int, Dict[str, int]]:
+        """
+        4H 캔들 타임스탬프 → '일자'로 내리고, 그 날짜 '이하'의 마지막 값으로 판단.
+        (인덱스는 이미 normalize 되어 있으므로 단순하고 빠름)
+        """
+        day = pd.Timestamp(analysis_date).tz_localize(None).normalize()
+
+        def last_le(df_or_s, d):
+            if df_or_s is None or len(df_or_s) == 0:
+                return None
+            try:
+                return df_or_s.loc[:d].iloc[-1]
+            except Exception:
+                return None
+
+        scores: Dict[str, int] = {}
+
+        nd = macro_data.get("nasdaq")
+        nd_row = last_le(nd, day)
+        scores["주도주(나스닥)"] = 0
+        if isinstance(nd_row, pd.Series) and {"Close", "SMA_200"}.issubset(nd_row.index):
+            scores["주도주(나스닥)"] = 5 if nd_row["Close"] > nd_row["SMA_200"] else -5
+
+        vx = macro_data.get("vix")
+        vx_row = last_le(vx, day)
+        scores["변동성(VIX)"] = 0
+        if isinstance(vx_row, pd.Series) and {"Close", "SMA_20"}.issubset(vx_row.index):
+            if vx_row["Close"] > 30:
+                scores["변동성(VIX)"] = -5
+            elif vx_row["Close"] > 20 and vx_row["Close"] > vx_row["SMA_20"]:
+                scores["변동성(VIX)"] = -3
+            elif vx_row["Close"] < 15:
+                scores["변동성(VIX)"] = 3
+
+        hy = macro_data.get("hy_spread")
+        if isinstance(hy, pd.Series) and len(hy) >= 50:
+            hy_row = last_le(hy, day)
+            if hy_row is not None:
+                hy50 = hy.loc[:day].rolling(50).mean().iloc[-1]
+                scores["신용위험(회사채)"] = -5 if float(hy_row) > float(hy50) else 3
+
+        yc = macro_data.get("t10y2y")
+        if isinstance(yc, pd.Series) and len(yc) > 0:
+            yc_row = last_le(yc, day)
+            if yc_row is not None:
+                val = float(yc_row)
+                if val < 0:
+                    scores["경기침체(금리차)"] = -7
+                elif val < 0.25:
+                    scores["경기침체(금리차)"] = -3
+                else:
+                    scores["경기침체(금리차)"] = 2
+
+        total = sum(scores.values())
+        if total >= 5:
+            return MacroRegime.BULL, total, scores
+        if total <= -5:
+            return MacroRegime.BEAR, total, scores
+        return MacroRegime.SIDEWAYS, total, scores
