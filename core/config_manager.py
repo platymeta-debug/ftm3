@@ -46,22 +46,26 @@ class ConfigManager:
         self.trend_entry_confirm_count = 3
         self.market_regime_adx_th = 20.0 # ADX 기반 기술적 추세 판단 기준
 
-        self.strategy_configs = {}
+        self.optimized_strategy_configs = {}
         try:
-            with open("strategies.json", "r", encoding="utf-8") as f:
-                self.strategy_configs = json.load(f)
-            print("✅ strategies.json 지표 설정 파일을 성공적으로 로드했습니다.")
+            with open("strategies_optimized.json", "r", encoding="utf-8") as f:
+                self.optimized_strategy_configs = json.load(f)
+            print("✅ strategies_optimized.json 최적화 지표 설정 파일을 성공적으로 로드했습니다.")
         except (FileNotFoundError, json.JSONDecodeError):
-            print("⚠️ strategies.json 파일을 찾을 수 없습니다. 지표 분석이 기본값으로 실행됩니다.")
-
-        # --- 3. optimal_settings.json에서 '최적화된 전략' 로드 ---
-        self.optimal_settings = {}
-        try:
-            with open("optimal_settings.json", "r", encoding="utf-8") as f:
-                self.optimal_settings = json.load(f)
-            print("✅ optimal_settings.json 최적화 설정 파일을 성공적으로 로드했습니다.")
-        except (FileNotFoundError, json.JSONDecodeError):
-            print("⚠️ optimal_settings.json을 찾을 수 없거나 형식이 잘못되었습니다. 기본값으로 실행됩니다.")
+            print("⚠️ strategies_optimized.json을 찾을 수 없어 기본 strategies.json을 사용합니다.")
+            try:
+                with open("strategies.json", "r", encoding="utf-8") as f:
+                    # fallback으로 기본 strategies.json을 BULL/BEAR/SIDEWAYS 구조로 변환
+                    base_config = json.load(f)
+                    self.optimized_strategy_configs = {
+                        "BULL": base_config,
+                        "BEAR": base_config,
+                        "SIDEWAYS": base_config
+                    }
+                print("✅ 기본 strategies.json 파일을 로드했습니다.")
+            except (FileNotFoundError, json.JSONDecodeError):
+                 print("🚨 어떤 strategies 파일도 찾을 수 없습니다. 지표 분석이 기본값으로 실행됩니다.")
+                 self.optimized_strategy_configs = {"BULL": {}, "BEAR": {}, "SIDEWAYS": {}}
 
         # --- 4. 안전장치: '최적화된 전략'이 없을 경우 사용할 기본값(Fallback) ---
         self.default_strategy_params = {
@@ -92,6 +96,15 @@ class ConfigManager:
         else:
             print(f"⚠️ [{regime_upper}/{symbol}] 최적화된 설정값이 없습니다. 안전을 위해 기본값을 사용합니다.")
             return self.default_strategy_params
-
+        
+    def get_strategy_configs(self, market_regime: str) -> Dict:
+        """
+        주어진 시장 상황(BULL, BEAR, SIDEWAYS)에 맞는 최적화된 지표 파라미터 묶음을 반환합니다.
+        값이 없으면 BULL 마켓 설정을 기본값(Fallback)으로 사용합니다.
+        """
+        regime_upper = market_regime.upper()
+        # 해당 시장의 설정이 있으면 그것을, 없으면 BULL 마켓 설정을, 그것도 없으면 빈 딕셔너리를 반환
+        return self.optimized_strategy_configs.get(regime_upper, self.optimized_strategy_configs.get("BULL", {}))
+    
 # 단일 ConfigManager 인스턴스 생성
 config = ConfigManager()
