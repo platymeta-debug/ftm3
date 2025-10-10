@@ -14,7 +14,7 @@ from binance.client import Client
 from binance.exceptions import BinanceAPIException
 
 # 프로젝트 컴포넌트
-from core.config_manager import config        # ▶ 옵티마이저가 만든 JSON을 여기서 로드
+from core.config_manager import ConfigManager      
 from core.event_bus import event_bus
 from database.manager import db_manager
 from database.models import Signal, Trade
@@ -50,10 +50,9 @@ class ExecPolicy:
           - risk_per_trade, max_exposure_frac
         모두 없으면 안전한 기본값 사용
         """
-        p = config.get_exec_policy(symbol) if hasattr(config, "get_exec_policy") else {}
-        # 과거 설정 키와 호환
-        sl_mult = p.get("sl_atr_multiplier", getattr(config, "sl_atr_multiplier", 1.5))
-        rr = p.get("risk_reward_ratio", getattr(config, "risk_reward_ratio", 2.0))
+        p = self.config.get_exec_policy(symbol) if hasattr(self.config, "get_exec_policy") else {}
+        sl_mult = p.get("sl_atr_multiplier", getattr(self.config, "sl_atr_multiplier", 1.5))
+        rr = p.get("risk_reward_ratio", getattr(self.config, "risk_reward_ratio", 2.0))
         partial = p.get("exec_partial", [])
         if isinstance(partial, str):
             partial = [float(x) for x in partial.split(",") if x.strip()]
@@ -89,12 +88,11 @@ class TradingEngine:
     - quantity가 미지정이면 calc_order_qty()로 **절대 수량** 자동 계산
     """
 
-    def __init__(self, client: Client):
+    def __init__(self, client: Client, config: ConfigManager):
         self.client = client
-        self._live_brackets: Dict[str, Dict] = {}  # symbol -> {sl_id, tp_ids[], entry_price, side, bars_held, quantity}
-        # 레버리지 맵(심볼별), 기본 10x
+        self.config = config # config 객체를 인스턴스 변수로 저장
+        self._live_brackets: Dict[str, Dict] = {}
         self._leverage_by_symbol: Dict[str, float] = {}
-        # 거래소 심볼 필터 캐시
         self._filters_cache: Dict[str, Dict[str, float]] = {}
         print("🚚 [V5.0] 트레이딩 엔진 초기화(리스크 사이징 통합, 멀티TP/트레일/타임스탑, JSON 설정).")
 
@@ -119,7 +117,7 @@ class TradingEngine:
         4) SL/TP 브래킷 부착(부분익절 가능)
         5) DB 기록/이벤트 발행
         """
-        policy = ExecPolicy.from_config(symbol)
+        policy = self.from_config(symbol)
         side = side.upper()
         close_side = "BUY" if side == "SELL" else "SELL"
 
