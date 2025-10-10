@@ -564,6 +564,8 @@ BEST_PARAM_KEYS = [
 
 
 # ---- 공통 유틸: 파라미터→백테스트 실행 ----
+# 덮어 쓸 함수: run_backtest_with_params
+
 def run_backtest_with_params(
     df_capitalized: pd.DataFrame,
     params: dict,
@@ -574,7 +576,6 @@ def run_backtest_with_params(
     """
     강화된 평가 로직: Calmar 우선, 최소 거래 횟수, 수익 곡선 안정성 평가.
     """
-    # 전략 컨텍스트 설정
     OptoRunner.symbol = symbol
     OptoRunner.market_regime = regime
 
@@ -584,33 +585,28 @@ def run_backtest_with_params(
         cash=initial_cash,
         commission=.002,
         margin=1 / 10,
+        finalize_trades=True  # <-- 이 옵션이 추가되었습니다!
     )
     stats = bt.run(**params)
 
-    # 1. 최소 거래 횟수 검증 (데이터 길이에 따라 동적 조절)
-    min_trades = max(30, len(df_capitalized) // 200) # 200봉당 1회, 최소 30회
+    # (이하 함수 내용은 기존과 동일)
+    min_trades = max(30, len(df_capitalized) // 200)
     trades = int(stats.get("# Trades", 0) or 0)
     if trades < min_trades:
-        # 거래 횟수 미달 시, 횟수만큼 점수를 깎아 페널티 부여
         return stats, -1e9 + trades, f"거래 부족(>{min_trades}회)"
 
-    # 2. 핵심 지표 추출
     calmar = float(stats.get("Calmar Ratio", 0) or 0)
     sharpe = float(stats.get("Sharpe Ratio", 0) or 0)
     
-    # 3. 수익 곡선 안정성 평가 (선형 회귀 기울기)
     equity_curve = stats.get("_equity_curve", {}).get("Equity", pd.Series(dtype=float))
     if not equity_curve.empty and len(equity_curve) > 1:
         x = np.arange(len(equity_curve))
         y = equity_curve.values
-        # polyfit으로 기울기 계산
         slope, _ = np.polyfit(x, y, 1)
-        # 기울기를 점수화하여 안정성 보너스로 반영
         stability_bonus = (slope / initial_cash) * 1000
     else:
         stability_bonus = 0
 
-    # 4. 최종 점수 계산 (Calmar 우선, Sharpe는 50% 가중치, 안정성 보너스 추가)
     primary_metric = calmar if not pd.isna(calmar) and calmar > 0 else (sharpe * 0.5)
     final_score = primary_metric + stability_bonus
 
@@ -671,25 +667,20 @@ def choose_method_auto(param_spaces):
 # 덮어 쓸 코드 블록: if __name__ == '__main__':
 
 if __name__ == '__main__':
-    from core.config_manager import ConfigManager
     config = ConfigManager()
-    
     backtesting.Pool = multiprocessing.Pool
 
     symbols_to_optimize = ["BTCUSDT", "ETHUSDT"]
     initial_cash = 10_000
 
-    # Binance 클라이언트 (공개엔드포인트)
     binance_client = Client(
         getattr(config, "api_key", "") or "",
         getattr(config, "api_secret", "") or ""
     )
-
-    # 결과 파일 경로 설정
+    
     optimal_settings_file = os.path.join(project_root, "optimal_settings.json")
     strategies_optimized_file = os.path.join(project_root, "strategies_optimized.json")
 
-    # 기존 설정 파일 로드
     try:
         with open(optimal_settings_file, 'r', encoding='utf-8') as f: all_settings = json.load(f)
     except (FileNotFoundError, json.JSONDecodeError): all_settings = {}
@@ -697,27 +688,19 @@ if __name__ == '__main__':
         with open(strategies_optimized_file, 'r', encoding='utf-8') as f: all_strategies = json.load(f)
     except (FileNotFoundError, json.JSONDecodeError): all_strategies = {"BULL": {}, "BEAR": {}, "SIDEWAYS": {}}
 
-    # --- ▼▼▼ [수정] MacroAnalyzer 생성 시 config 전달 ▼▼▼ ---
     ma = MacroAnalyzer(config)
     macro_preloaded = ma.preload_all_macro_data()
-    # --- ▲▲▲ [수정] ---
-
-    # 최적화 방법 결정
     param_spaces = get_param_spaces()
     method = "bayes" if _HAS_OPTIMIZERS else "grid"
     print(f"\n[OPT] 선택된 최적화 알고리즘: {method.upper()}")
 
     for symbol in symbols_to_optimize:
         print(f"\n\n{'='*70}\n📦 전체 데이터 로드 및 구간 분석: {symbol}\n{'='*70}")
-        
         klines = fetch_klines_since_2018(binance_client, symbol, "4h")
         if klines is None or len(klines) < 500:
             print(f"[SKIP] {symbol} 데이터 부족")
             continue
-        
-        # --- ▼▼▼ [수정] collapse_regimes_to_periods 호출 시 config 전달 ▼▼▼ ---
         periods_by_regime = collapse_regimes_to_periods(klines, macro_preloaded, config)
-        # --- ▲▲▲ [수정] ---
 
         for regime in ["BULL", "BEAR"]:
             episodes = periods_by_regime.get(regime, [])
@@ -725,7 +708,6 @@ if __name__ == '__main__':
                 print(f"\n[SKIP] {symbol}/{regime}: 분석할 데이터 구간이 없습니다.")
                 continue
 
-            # 통합 데이터셋 생성
             all_dfs = [klines.loc[ep["start"]:ep["end"]] for ep in episodes]
             if not all_dfs: continue
             
@@ -736,7 +718,6 @@ if __name__ == '__main__':
             print(f"\n--- 🔬 [{symbol}] '{REGIME_NAME.get(regime, regime)}' 통합 데이터 최적화 시작 ---")
             print(f"    총 데이터 기간: {df.index.min().date()} ~ {df.index.max().date()}  |  캔들 수: {len(df)}")
             
-            # 최적화 실행
             def objective_min(eval_params: dict) -> float:
                 if eval_params.get("ema_short", 99) >= eval_params.get("ema_long", 0): return 1e9
                 if eval_params.get("risk_reward_ratio", 0) <= eval_params.get("sl_atr_multiplier", 99): return 1e9
@@ -748,8 +729,7 @@ if __name__ == '__main__':
 
             print(f"\n--- ✅ [{symbol}] '{REGIME_NAME.get(regime, regime)}' 최적화 완료! (종합점수: {metric_value:.3f}) ---")
             
-            # 최종 재평가 및 결과 출력/저장... (이하 로직은 기존과 동일)
-            final_bt = FractionalBacktest(df, OptoRunner, cash=initial_cash, commission=.002, margin=1/10)
+            final_bt = FractionalBacktest(df, OptoRunner, cash=initial_cash, commission=.002, margin=1/10, finalize_trades=True)
             stats_eval = final_bt.run(**best_params_dict)
 
             print(f"   📊 Best Params: {json.dumps(_to_jsonable_dict(best_params_dict), ensure_ascii=False, indent=2)}")
@@ -768,11 +748,7 @@ if __name__ == '__main__':
                 print(f"   [WARN] HTML 리포트 생성 실패: {e}")
 
             all_settings.setdefault(regime, {})[symbol] = {
-                "OPEN_TH": int(best_params_dict.get("open_threshold")),
-                "RR_RATIO": float(best_params_dict.get("risk_reward_ratio")),
-                "SL_ATR_MULTIPLIER": float(best_params_dict.get("sl_atr_multiplier")),
-                "TREND_ENTRY_CONFIRM_COUNT": int(best_params_dict.get("trend_entry_confirm_count")),
-                "risk_per_trade": float(best_params_dict.get("risk_per_trade")),
+                "OPEN_TH": int(best_params_dict.get("open_threshold")), "RR_RATIO": float(best_params_dict.get("risk_reward_ratio")), "SL_ATR_MULTIPLIER": float(best_params_dict.get("sl_atr_multiplier")), "TREND_ENTRY_CONFIRM_COUNT": int(best_params_dict.get("trend_entry_confirm_count")), "risk_per_trade": float(best_params_dict.get("risk_per_trade")),
                 "OPTIMIZED_METRIC_SCORE": round(metric_value, 4),
                 "SUMMARY": {k: v for k, v in _to_jsonable_dict(stats_eval.to_dict()).items() if isinstance(v, (int, float, bool, str, type(None)))}
             }
@@ -781,18 +757,19 @@ if __name__ == '__main__':
 
             base_strategies = { "TrendStrategy": {}, "OscillatorStrategy": {}, "ComprehensiveStrategy": {} }
             for k, v in best_params_dict.items():
-                if k in ["ema_short", "ema_long", "score_strong_trend"]:
-                    base_strategies["TrendStrategy"][k] = v
-                elif k in ["rsi_period", "rsi_oversold", "score_oversold"]:
-                    base_strategies["OscillatorStrategy"][k] = v
+                if k in ["ema_short", "ema_long", "score_strong_trend"]: base_strategies["TrendStrategy"][k] = v
+                elif k in ["rsi_period", "rsi_oversold", "score_oversold"]: base_strategies["OscillatorStrategy"][k] = v
                 elif k not in ["open_threshold", "risk_reward_ratio", "sl_atr_multiplier", "trend_entry_confirm_count", "risk_per_trade"]:
                      base_strategies["ComprehensiveStrategy"][k] = v
             
             if "rsi_oversold" in base_strategies["OscillatorStrategy"]:
                 base_strategies["OscillatorStrategy"]["rsi_overbought"] = 100 - base_strategies["OscillatorStrategy"]["rsi_oversold"]
-
             all_strategies[regime] = base_strategies
+
+            # --- ▼▼▼ [핵심 수정] JSON 저장 전, 데이터 타입을 표준 타입으로 변환합니다. ▼▼▼ ---
+            all_strategies_serializable = _to_jsonable_dict(all_strategies)
             with open(strategies_optimized_file, 'w', encoding='utf-8') as f:
-                json.dump(all_strategies, f, indent=2, ensure_ascii=False)
+                json.dump(all_strategies_serializable, f, indent=2, ensure_ascii=False)
+            # --- ▲▲▲ [핵심 수정] ---
             
             print(f"   💾 저장 완료 → {optimal_settings_file}, {strategies_optimized_file}")
