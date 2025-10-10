@@ -1,4 +1,4 @@
-# analysis/confluence_engine.py (V8 업그레이드)
+# analysis/confluence_engine.py (V11 수정)
 
 from __future__ import annotations
 import math
@@ -17,20 +17,28 @@ from .strategies.oscillator_strategy import OscillatorStrategy
 from .strategies.comprehensive_strategy import ComprehensiveStrategy
 from .strategies.signal_filter_strategy import SignalFilterStrategy
 from .strategies.volatility_strategy import VolatilityStrategy
+from .strategies.counter_trend_strategy import CounterTrendStrategy
+from .strategies.momentum_strategy import MomentumStrategy
+from .strategies.order_block_strategy import OrderBlockStrategy
 
 
 class ConfluenceEngine:
     """
     기술적 분석, 거시 경제 분석, 동적 파라미터를 통합하여 최종 결정을 내리는 '두뇌' 모듈.
-    V8: 시장 국면에 따라 동적으로 전략 인스턴스를 생성하고 캐싱하여 분석합니다.
+    V11: __init__ 메소드가 strategy_configs를 인자로 받을 수 있도록 수정.
     """
-    def __init__(self, client: Client, config: any):
+    # ▼▼▼ [핵심 수정] __init__ 생성자에 strategy_configs 인자 추가 ▼▼▼
+    def __init__(self, client: Client, config: any, strategy_configs: dict | None = None):
         self.client = client
         self.config = config
         self.fear_and_greed_index = 50
         self.macro_analyzer = MacroAnalyzer(self.config)
         self._strategy_cache: Dict[str, List[BaseStrategy]] = {}
         self.filter = SignalFilterStrategy(self.config)
+        
+        # backtest_optimizer에서 직접 전략 설정을 주입할 경우를 위한 로직
+        self._external_strategy_configs = strategy_configs
+        
         print(f"✅ ConfluenceEngine: 동적 전략 로딩 모드로 초기화되었습니다.")
 
     def _get_strategies_for_regime(self, market_regime: str) -> List[BaseStrategy]:
@@ -45,23 +53,33 @@ class ConfluenceEngine:
             "TrendStrategy": TrendStrategy,
             "OscillatorStrategy": OscillatorStrategy,
             "ComprehensiveStrategy": ComprehensiveStrategy,
-            "VolatilityStrategy": VolatilityStrategy, # <-- 신규 전략 추가
+            "VolatilityStrategy": VolatilityStrategy,
+            "CounterTrendStrategy": CounterTrendStrategy,
+            "MomentumStrategy": MomentumStrategy,
+            "OrderBlockStrategy": OrderBlockStrategy,
         }
         
-        # 설정 파일에서 해당 국면의 설정을 가져오고, 없으면 BULL을 기본값으로 사용
-        strategy_configs = self.config.get_strategy_configs(regime_upper)
-        if not strategy_configs:
-            strategy_configs = self.config.get_strategy_configs("BULL")
+        # 최적화 프로그램에서 설정을 직접 주입했는지 확인
+        if self._external_strategy_configs:
+            current_strategy_configs = self._external_strategy_configs
+        else:
+            # 그렇지 않으면 config 파일에서 로드
+            current_strategy_configs = self.config.get_strategy_configs(regime_upper)
+            if not current_strategy_configs:
+                current_strategy_configs = self.config.get_strategy_configs("BULL")
 
         created_strategies = []
         for name, cls in strategy_classes.items():
-            strategy_config = strategy_configs.get(name, {})
+            # config 파일 기반이든, 외부 주입이든, 해당 전략의 설정값을 찾음
+            strategy_config = current_strategy_configs.get(name, {})
+            # enabled 키가 없거나 True일 경우에만 전략을 활성화
             if strategy_config.get("enabled", True):
                 created_strategies.append(cls(params=strategy_config))
         
         self._strategy_cache[regime_upper] = created_strategies
         print(f"📈 [{regime_upper}] 국면 전략 생성 및 캐싱 완료 ({len(created_strategies)}개)")
         return created_strategies
+    # ▲▲▲ [핵심 수정] ▲▲▲
 
     def _calculate_tactical_score(self, df: pd.DataFrame, strategies: List[BaseStrategy]) -> Tuple[int, Dict[str, int]]:
         """전략 리스트를 인자로 받아 점수를 계산합니다."""
@@ -81,7 +99,6 @@ class ConfluenceEngine:
             tf_data = {tf: self.get_full_data(symbol, tf) for tf in self.config.analysis_timeframes}
             if not any(df is not None and not df.empty for df in tf_data.values()): return None
 
-            # 각 타임프레임에 대해 동일한 (국면에 맞는) 전략 세트를 적용하여 점수 계산
             tf_scores = {tf: self._calculate_tactical_score(data, strategies)[0] for tf, data in tf_data.items() if data is not None}
             tf_score_breakdowns = {tf: self._calculate_tactical_score(data, strategies)[1] for tf, data in tf_data.items() if data is not None}
             tf_rows = {tf: data.iloc[-1] for tf, data in tf_data.items() if data is not None}
@@ -123,13 +140,12 @@ class ConfluenceEngine:
         open_threshold = params.get('open_th', 12.0)
 
         side = None
-        # 횡보장에서는 avg_score 대신 마지막 점수를 사용하고, 문턱값을 낮춤
         if market_regime == "SIDEWAYS":
             last_score = recent_scores[-1]
-            sideways_th = 8.0 # 횡보장 전용 문턱값
+            sideways_th = 8.0
             if last_score >= sideways_th: side = "BUY"
             elif last_score <= -sideways_th: side = "SELL"
-        else: # 추세장 (BULL, BEAR)
+        else:
             if technical_regime == TechnicalRegime.BULL_TREND and avg_score >= open_threshold and std_dev <= 3.0:
                 side = "BUY"
             elif technical_regime == TechnicalRegime.BEAR_TREND and abs(avg_score) >= open_threshold and std_dev <= 3.0:
