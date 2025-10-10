@@ -16,7 +16,7 @@ try:
 except Exception:
     Fred = None  # type: ignore
 
-from core.config_manager import config
+
 
 
 class MacroRegime(Enum):
@@ -31,42 +31,30 @@ class MacroKeys:
 
 
 class MacroAnalyzer:
-    def __init__(self):
-        # ✅ ENV만 사용 (config 무시)
-        # Windows PowerShell 예시:  $env:FRED_API_KEY="YOUR_FRED_KEY"
-        # 시스템 영구등록:          setx FRED_API_KEY "YOUR_FRED_KEY" ; 새 터미널 열기
-        def _get_env(*names):
-            import os
-            for n in names:
-                v = os.getenv(n, "")
-                if isinstance(v, str) and v.strip():
-                    return v.strip()
-            return ""
+    # --- ▼▼▼ [핵심 수정] 생성자에서 config 객체를 주입받도록 변경 ▼▼▼ ---
+    def __init__(self, config):
+        self.config = config
+        # config 객체에서 FRED API 키를 우선적으로 가져오고, 없으면 환경 변수를 확인합니다.
+        fred_key = getattr(self.config, 'fred_api_key', None) or os.getenv("FRED_API_KEY")
 
-        fred_key = _get_env("FRED_API_KEY", "FREDAPI_KEY", "FRED_TOKEN")
-
-        # 민감정보는 출력하지 않되, 감지 여부/길이만 로깅
         def _mask(s: str) -> str:
             return f"{len(s)} chars" if s else "empty"
+        
+        print(f"🔑 FRED API Key Check: {('found ' + _mask(fred_key)) if fred_key else 'not found'}")
 
-        print(f"🔑 ENV check — FRED_API_KEY: {('found ' + _mask(fred_key)) if fred_key else 'not found'}")
-
-        # fredapi 초기화 (패키지 없으면 무시)
         self.fred = None
-        try:
-            from fredapi import Fred  # noqa
-            if fred_key:
-                try:
-                    self.fred = Fred(api_key=fred_key)
-                    print("✅ FRED API 초기화 완료.")
-                except Exception as e:
-                    print(f"⚠️ FRED 초기화 실패: {e} → FRED 지표 비활성.")
-            else:
-                print("ℹ️ FRED_API_KEY가 ENV에 없습니다. FRED 지표 비활성.")
-        except Exception:
+        if Fred is not None and fred_key:
+            try:
+                self.fred = Fred(api_key=fred_key)
+                print("✅ FRED API 초기화 완료.")
+            except Exception as e:
+                print(f"⚠️ FRED 초기화 실패: {e} → FRED 지표 비활성.")
+        elif Fred is None:
             print("ℹ️ fredapi 패키지가 설치되어 있지 않습니다. FRED 지표 비활성.")
-
-        print("📈 MacroAnalyzer ready (ENV-only mode).")
+        else:
+            print("ℹ️ FRED API 키가 없어 FRED 지표가 비활성 상태입니다.")
+        
+        print("📈 MacroAnalyzer ready.")
 
     # -------------------- 공통: 일자 정규화 --------------------
     @staticmethod
@@ -74,21 +62,16 @@ class MacroAnalyzer:
         if df is None or df.empty:
             return df
         out = df.copy()
-        out.index = pd.to_datetime(out.index)
-        # 타임존 제거 + 자정으로 내림 → 일자 인덱스
-        out.index = out.index.tz_localize(None)
-        out.index = out.index.normalize()
+        out.index = pd.to_datetime(out.index).tz_localize(None).normalize()
         out.index.name = "Date"
         return out
 
     @staticmethod
     def _normalize_daily_series(s: pd.Series) -> pd.Series:
-        if s is None or len(s) == 0:
+        if s is None or s.empty:
             return s
-        out = pd.Series(s.copy())
-        out.index = pd.to_datetime(out.index)
-        out.index = out.index.tz_localize(None)
-        out.index = out.index.normalize()
+        out = s.copy()
+        out.index = pd.to_datetime(out.index).tz_localize(None).normalize()
         out.name = getattr(s, "name", out.name)
         return out
 
