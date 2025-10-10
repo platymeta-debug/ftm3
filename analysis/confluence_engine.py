@@ -35,8 +35,12 @@ class ConfluenceEngine:
             "ComprehensiveStrategy": ComprehensiveStrategy,
         }
 
-        # get_strategy_configs는 ConfigManager에 있으므로 self.config에서 호출
-        current_strategy_configs = self.config.get_strategy_configs("BULL")
+        # 1. 만약 외부에서 strategy_configs를 전달했다면 (최적화 프로그램처럼), 그것을 사용합니다.
+        if self.strategy_configs:
+            current_strategy_configs = self.strategy_configs
+        # 2. 그렇지 않다면 (실제 봇이 실행될 때처럼), 설정 파일에서 불러옵니다.
+        else:
+            current_strategy_configs = self.config.get_strategy_configs("BULL")
 
         for name, cls in strategy_classes.items():
             strategy_config = current_strategy_configs.get(name, {})
