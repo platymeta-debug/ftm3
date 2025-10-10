@@ -6,6 +6,8 @@ from discord.ext import commands
 from sqlalchemy import select
 from binance.client import Client
 import asyncio
+import time  # <-- 'time' 모듈 임포트 추가
+import traceback  # <-- 'traceback' 모듈 임포트 추가
 
 # ▼▼▼ [수정] 프로젝트 경로 설정 및 FractionalBacktest 임포트 ▼▼▼
 import sys
@@ -15,13 +17,18 @@ if project_root not in sys.path:
     sys.path.insert(0, project_root)
 
 from backtesting.lib import FractionalBacktest
-# 'StrategyRunner'는 backtest_optimizer.py에 'OptoRunner'로 정의되어 있습니다.
 from local_backtesting.backtest_optimizer import OptoRunner as StrategyRunner
 from local_backtesting.performance_visualizer import create_performance_report
 from analysis.data_fetcher import fetch_klines
 from database.models import Trade
 from execution.trading_engine import TradingEngine
 from ui.views import ConfirmView
+
+class CommandCog(commands.Cog):
+    def __init__(self, bot: commands.Bot):
+        self.bot = bot
+        # __init__ 메서드에서 trading_engine을 직접 참조하도록 수정
+        self.trading_engine = bot.trading_engine
 
 class CommandCog(commands.Cog):
     def __init__(self, bot: commands.Bot, trading_engine: TradingEngine):
@@ -33,24 +40,38 @@ class CommandCog(commands.Cog):
     async def run_backtest_kr(self, interaction: discord.Interaction, 코인: str):
         symbol = 코인.upper()
         
+        # --- ▼▼▼ [수정] try...except 블록 구조 전체 수정 ▼▼▼ ---
         try:
             await interaction.response.defer(ephemeral=False, thinking=True)
             
-            print(f"[/성과] 1. '{symbol}' 백테스팅 시작... 현재 계좌 잔고 조회 중...")
+            print(f"[/성과] 1. '{symbol}' 백테스팅 시작...")
+
+            # 바이낸스 클라이언트 생성 및 시간 동기화
+            backtest_client = Client(
+                self.bot.config.api_key,
+                self.bot.config.api_secret,
+                testnet=self.bot.config.is_testnet
+            )
+            if self.bot.config.is_testnet:
+                backtest_client.FUTURES_URL = 'https://testnet.binancefuture.com'
+            
+            backtest_client.recv_window = 60000
+            server_time = backtest_client.get_server_time()['serverTime']
+            time_offset = server_time - int(time.time() * 1000)
+            backtest_client.timestamp_offset = time_offset
+            print(f"[/성과] 백테스팅 클라이언트 시간 동기화 완료 (Offset: {time_offset}ms)")
+
+            # 계좌 정보 조회 (실패 시 기본값 사용)
             try:
-                account_info = self.bot.binance_client.futures_account()
+                account_info = backtest_client.futures_account()
                 initial_cash = float(account_info.get('totalWalletBalance', 10000))
                 print(f"[/성과] 현재 총 자산: ${initial_cash:,.2f}")
             except Exception as e:
                 print(f"⚠️ 계좌 정보 조회 실패: {e}. 기본 자본금($10,000)으로 시작합니다.")
                 initial_cash = 10_000
 
+            # 데이터 로드
             loop = asyncio.get_event_loop()
-
-            backtest_client = Client(self.bot.config.api_key, self.bot.config.api_secret, testnet=self.bot.config.is_testnet)
-            if self.bot.config.is_testnet:
-                backtest_client.FUTURES_URL = 'https://testnet.binancefuture.com'
-            
             klines_data = await loop.run_in_executor(
                 None, fetch_klines, backtest_client, symbol, "1d", 500
             )
@@ -62,30 +83,28 @@ class CommandCog(commands.Cog):
             print(f"[/성과] 2. 데이터 로드 성공. (총 {len(klines_data)}개 캔들)")
             klines_data.columns = [col.capitalize() for col in klines_data.columns]
 
+            # 백테스팅 실행 함수 정의
             def run_bt():
                 print("[/성과] 3. 백테스팅 라이브러리 실행 직전...")
                 strategy_params = self.bot.config.get_strategy_params(symbol)
                 StrategyRunner.open_threshold = strategy_params.get("open_th", 12.0)
                 StrategyRunner.risk_reward_ratio = strategy_params.get("risk_reward_ratio")
-                StrategyRunner.symbol = symbol # 심볼 전달
+                StrategyRunner.symbol = symbol
                 print(f"[/성과] '{symbol}' 테스트 파라미터: Threshold={StrategyRunner.open_threshold}, R/R Ratio={StrategyRunner.risk_reward_ratio}")
                 
-                # ▼▼▼ [수정] FractionalBacktest 사용 및 레버리지 적용 ▼▼▼
                 bt = FractionalBacktest(klines_data, StrategyRunner, cash=initial_cash, commission=.002, margin=1/10)
-                # ▲▲▲ [수정] ▲▲▲
-                
                 stats = bt.run()
                 print("[/성과] 4. 백테스팅 실행 완료.")
                 return stats
 
+            # 백테스팅 실행
             stats = await loop.run_in_executor(None, run_bt)
             
             print("[/성과] 5. 리포트 생성 시작...")
-            # ▼▼▼ [수정] create_performance_report에 initial_cash 전달 ▼▼▼
             report_text, chart_buffer = create_performance_report(stats, initial_cash)
-            # ▲▲▲ [수정] ▲▲▲
             print("[/성과] 6. 리포트 생성 완료.")
 
+            # 결과 전송
             if chart_buffer:
                 file = discord.File(chart_buffer, filename=f"{symbol}_performance.png")
                 await interaction.followup.send(content=report_text, file=file)
@@ -95,12 +114,13 @@ class CommandCog(commands.Cog):
             print(f"[/성과] 7. '{symbol}' 결과 전송 완료.")
 
         except Exception as e:
-            import traceback
             print(f"🚨 [/성과] 명령어 처리 중 심각한 예외 발생:")
             traceback.print_exc()
-            if interaction.response.is_done():
+            if not interaction.response.is_done():
+                await interaction.response.send_message(f"🚨 백테스팅 실행 중 오류가 발생했습니다: `{e}`", ephemeral=True)
+            else:
                 await interaction.followup.send(f"🚨 백테스팅 실행 중 오류가 발생했습니다: `{e}`")
-        # ▲▲▲ [최종 수정] ▲▲▲
+        # --- ▲▲▲ [수정] ---
 
     # ... (이하 다른 명령어들은 그대로 유지)
     @app_commands.command(name="패널", description="인터랙티브 제어실을 소환합니다.")
