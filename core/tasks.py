@@ -85,7 +85,7 @@ class BackgroundTasks:
                         self.current_aggr_level = base_aggr_level
                     return
 
-                btc_signal = latest_signal_tuple[0]
+                btc_signal = latest_signal_tuple[0] 
                 mark_price_info = self.binance_client.futures_mark_price(symbol="BTCUSDT")
                 current_price = float(mark_price_info['markPrice'])
                 volatility = btc_signal.atr_1d / current_price
