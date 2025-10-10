@@ -89,30 +89,32 @@ def get_strategy_configs_safe(config, regime: str):
     }
 
 
-def _to_jsonable_dict(d: dict) -> dict:
-    def conv(x):
-        try:
-            import numpy as np  # noqa
-            if isinstance(x, (np.integer,)):
-                return int(x)
-            if isinstance(x, (np.floating,)):
-                return float(x)
-            if isinstance(x, (np.bool_,)):
-                return bool(x)
-        except Exception:
-            pass
-        if isinstance(x, pd.Timestamp):
-            return x.isoformat()
-        if isinstance(x, (int, float, bool, str)) or x is None:
-            return x
-        try:
-            return float(x)
-        except Exception:
-            try:
-                return int(x)
-            except Exception:
-                return str(x)
-    return {k: conv(v) for k, v in d.items()}
+# 덮어 쓸 함수: _to_jsonable_dict
+
+def _to_jsonable_dict(data):
+    """ [V8.2] 재귀적으로 딕셔너리와 리스트를 순회하며 JSON으로 변환 불가능한 타입을 표준 타입으로 변환합니다. """
+    # 딕셔너리인 경우, 모든 값에 대해 재귀적으로 함수를 호출합니다.
+    if isinstance(data, dict):
+        return {k: _to_jsonable_dict(v) for k, v in data.items()}
+    # 리스트인 경우, 모든 항목에 대해 재귀적으로 함수를 호출합니다.
+    if isinstance(data, list):
+        return [_to_jsonable_dict(i) for i in data]
+    
+    # Numpy의 특수 숫자 타입(int64, float64 등)을 파이썬 기본 타입으로 변환합니다.
+    if hasattr(data, 'dtype'):
+        if np.issubdtype(data.dtype, np.integer):
+            return int(data)
+        if np.issubdtype(data.dtype, np.floating):
+            return float(data)
+        if np.issubdtype(data.dtype, np.bool_):
+            return bool(data)
+    
+    # Pandas의 Timestamp 타입을 문자열로 변환합니다.
+    if isinstance(data, pd.Timestamp):
+        return data.isoformat()
+        
+    # 그 외 JSON으로 변환 가능한 타입은 그대로 반환합니다.
+    return data
 
 
 # === 신규: 2018-01-01부터 4h 전구간 수집 ===
@@ -223,6 +225,9 @@ class OptoRunner(Strategy):
     ema_short = 20
     ema_long = 50
     score_strong_trend = 5
+
+    # --- ▼▼▼ [개선안 1] '눌림목 매수'를 위한 파라미터 추가 ▼▼▼ ---
+    rsi_dip_threshold = 25 # 강세장에서 이 RSI 값 이하로 떨어지면 '눌림목'으로 간주
     
     # ====== OscillatorStrategy 파라미터(최적화 대상) ======
     rsi_period = 14
@@ -520,28 +525,36 @@ class OptoRunner(Strategy):
     # ---- 백테스트 루프 ----
     def next(self):
         idx = len(self.data) - 1
-        cur = self.indicators.iloc[:idx + 1]
-        if len(cur) < int(self.trend_entry_confirm_count):
+        cur_indicators = self.indicators.iloc[:idx + 1]
+        if len(cur_indicators) < int(self.trend_entry_confirm_count):
             return
 
-        current_score, _ = self.engine._calculate_tactical_score(cur)
+        current_score, _ = self.engine._calculate_tactical_score(cur_indicators)
         self._recent_scores.append(current_score)
         if len(self._recent_scores) < int(self.trend_entry_confirm_count):
             return
 
         avg_score = sum(self._recent_scores) / len(self._recent_scores)
-
+        
         # 진입 판단
         side = None
+        # 1. 기존의 추세추종 진입 로직
         if self.market_regime == "BULL" and avg_score >= float(self.open_threshold):
             side = "BUY"
         elif self.market_regime == "BEAR" and avg_score <= -float(self.open_threshold):
             side = "SELL"
+            
+        # 2. 새로운 '눌림목 매수' 진입 로직 (강세장에서만 작동)
+        if self.market_regime == "BULL" and not self._in_pos:
+            last_rsi = self.indicators.iloc[idx].get(f"RSI_{self.rsi_period}", 50)
+            if last_rsi <= self.rsi_dip_threshold:
+                side = "BUY" # 기존 신호와 상관없이 강력한 매수 신호로 간주
+                print(f"[{self.data.index[-1].date()}] 눌림목 매수 기회 포착! (RSI: {last_rsi:.2f})")
 
         if (not self._in_pos) and side:
             self._maybe_enter(side)
 
-        # 보유 중 관리
+        # 보유 중 관리 로직 (기존과 동일)
         if self._in_pos:
             self._maybe_trailing()
             self._maybe_exit_by_tp()
@@ -566,55 +579,44 @@ BEST_PARAM_KEYS = [
 # ---- 공통 유틸: 파라미터→백테스트 실행 ----
 # 덮어 쓸 함수: run_backtest_with_params
 
-def run_backtest_with_params(
-    df_capitalized: pd.DataFrame,
-    params: dict,
-    initial_cash: int,
-    symbol: str,
-    regime: str
-):
-    """
-    강화된 평가 로직: Calmar 우선, 최소 거래 횟수, 수익 곡선 안정성 평가.
-    """
+METRIC_MAP = {
+    "BULL": "Calmar Ratio",
+    "BEAR": "Sortino Ratio",
+    "SIDEWAYS": "Profit Factor"
+}
+
+def run_backtest_with_params(df_capitalized: pd.DataFrame, params: dict, initial_cash: int, symbol: str, regime: str):
     OptoRunner.symbol = symbol
     OptoRunner.market_regime = regime
-
-    bt = FractionalBacktest(
-        df_capitalized,
-        OptoRunner,
-        cash=initial_cash,
-        commission=.002,
-        margin=1 / 10,
-        finalize_trades=True  # <-- 이 옵션이 추가되었습니다!
-    )
+    bt = FractionalBacktest(df_capitalized, OptoRunner, cash=initial_cash, commission=.002, margin=1/10, finalize_trades=True)
     stats = bt.run(**params)
-
-    # (이하 함수 내용은 기존과 동일)
-    min_trades = max(30, len(df_capitalized) // 200)
+    
+    min_trades = max(20, len(df_capitalized) // 250)
     trades = int(stats.get("# Trades", 0) or 0)
+    
+    # 거래 횟수가 부족할 경우, -1e9 대신 Return을 기반으로 한 현실적인 패널티 부여
     if trades < min_trades:
-        return stats, -1e9 + trades, f"거래 부족(>{min_trades}회)"
+        ret = float(stats.get("Return [%]", -99) or -99)
+        # 0보다 크면 패널티를 덜 주고, 음수면 더 큰 패널티를 줌
+        score = ret if ret > 0 else ret * 5 
+        return stats, score, f"거래 부족({trades}/{min_trades}회)"
 
-    calmar = float(stats.get("Calmar Ratio", 0) or 0)
-    sharpe = float(stats.get("Sharpe Ratio", 0) or 0)
+    metric_name = METRIC_MAP.get(regime, "Sharpe Ratio")
+    primary_metric = float(stats.get(metric_name, 0) or 0)
     
     equity_curve = stats.get("_equity_curve", {}).get("Equity", pd.Series(dtype=float))
+    stability_bonus = 0
     if not equity_curve.empty and len(equity_curve) > 1:
-        x = np.arange(len(equity_curve))
-        y = equity_curve.values
+        x, y = np.arange(len(equity_curve)), equity_curve.values
         slope, _ = np.polyfit(x, y, 1)
         stability_bonus = (slope / initial_cash) * 1000
-    else:
-        stability_bonus = 0
 
-    primary_metric = calmar if not pd.isna(calmar) and calmar > 0 else (sharpe * 0.5)
     final_score = primary_metric + stability_bonus
-
-    return stats, final_score, "Calmar + Stability"
+    return stats, final_score, f"{metric_name} + Stability"
 
 
 def get_param_spaces():
-    """확장된 탐색 공간: ComprehensiveStrategy의 주요 지표 포함"""
+    """확장된 탐색 공간: VolatilityStrategy의 주요 지표 포함"""
     return {
         # 실행정책
         "open_threshold":       {"type":"int", "choices":[10, 12, 14, 16]},
@@ -633,15 +635,17 @@ def get_param_spaces():
         "rsi_oversold":         {"type":"int", "low":20, "high":35},
         "score_oversold":       {"type":"int", "choices":[3, 4, 5]},
 
-        # ComprehensiveStrategy (신규 확장)
+        # ComprehensiveStrategy
         "score_macd_cross_up":  {"type":"int", "choices":[2, 3]},
         "adx_threshold":        {"type":"int", "low":18, "high":28},
         "score_adx_strong":     {"type":"int", "choices":[2, 3]},
-        "score_bb_breakout_up": {"type":"int", "choices":[3, 4, 5]},
-        "score_chop_trending":  {"type":"int", "choices":[2, 3]},
-        "stochrsi_oversold":    {"type":"int", "low":15, "high":30},
-        "score_stochrsi_oversold": {"type":"int", "choices":[2, 3]},
-        "score_trix_cross_up":  {"type":"int", "choices":[3, 4]},
+
+        # VolatilityStrategy (신규 추가)
+        "bb_len":               {"type":"int", "choices":[20, 30]},
+        "bb_std":               {"type":"float", "low":2.0, "high":2.5},
+        "kc_len":               {"type":"int", "choices":[20]},
+        "kc_atr_mult":          {"type":"float", "low":1.5, "high":2.5},
+        "score_squeeze_breakout_up": {"type":"int", "choices":[4, 5, 6]},
     }
 
 
@@ -680,13 +684,20 @@ if __name__ == '__main__':
     
     optimal_settings_file = os.path.join(project_root, "optimal_settings.json")
     strategies_optimized_file = os.path.join(project_root, "strategies_optimized.json")
+    default_strategies_file = os.path.join(project_root, "strategies.json")
 
+    # --- ▼▼▼ [최종 수정] 파일 로딩 및 저장 로직 개선 ▼▼▼ ---
+    all_settings = {}
     try:
-        with open(optimal_settings_file, 'r', encoding='utf-8') as f: all_settings = json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError): all_settings = {}
-    try:
-        with open(strategies_optimized_file, 'r', encoding='utf-8') as f: all_strategies = json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError): all_strategies = {"BULL": {}, "BEAR": {}, "SIDEWAYS": {}}
+        with open(default_strategies_file, 'r', encoding='utf-8') as f: 
+            default_strategies = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError): 
+        print(f"🚨 경고: 기본 전략 파일({default_strategies_file})을 찾을 수 없어, 최적화를 진행할 수 없습니다.")
+        exit() # 기본 설계도가 없으면 실행 중단
+
+    # 최종 결과물은 빈 딕셔너리에서 시작
+    all_strategies_optimized = {}
+    # --- ▲▲▲ [최종 수정] ---
 
     ma = MacroAnalyzer(config)
     macro_preloaded = ma.preload_all_macro_data()
@@ -702,12 +713,10 @@ if __name__ == '__main__':
             continue
         periods_by_regime = collapse_regimes_to_periods(klines, macro_preloaded, config)
 
-        for regime in ["BULL", "BEAR"]:
+         for regime in ["BULL", "BEAR", "SIDEWAYS"]:
             episodes = periods_by_regime.get(regime, [])
-            if not episodes:
-                print(f"\n[SKIP] {symbol}/{regime}: 분석할 데이터 구간이 없습니다.")
-                continue
-
+            if not episodes: print(f"\n[SKIP] {symbol}/{regime}: 분석할 데이터 구간이 없습니다."); continue
+            
             all_dfs = [klines.loc[ep["start"]:ep["end"]] for ep in episodes]
             if not all_dfs: continue
             
@@ -720,7 +729,6 @@ if __name__ == '__main__':
             
             def objective_min(eval_params: dict) -> float:
                 if eval_params.get("ema_short", 99) >= eval_params.get("ema_long", 0): return 1e9
-                if eval_params.get("risk_reward_ratio", 0) <= eval_params.get("sl_atr_multiplier", 99): return 1e9
                 _, score, _ = run_backtest_with_params(df, eval_params, initial_cash, symbol, regime)
                 return -float(score) if pd.notna(score) else 1e9
 
@@ -734,18 +742,16 @@ if __name__ == '__main__':
 
             print(f"   📊 Best Params: {json.dumps(_to_jsonable_dict(best_params_dict), ensure_ascii=False, indent=2)}")
             print(f"   🏆 최종 성과 요약 (재평가):")
-            print(f"      - Calmar Ratio: {stats_eval.get('Calmar Ratio', 'N/A'):.3f}")
+            metric_name = METRIC_MAP.get(regime, "Sharpe Ratio")
+            print(f"      - {metric_name}: {stats_eval.get(metric_name, 'N/A'):.3f}")
             print(f"      - Return [%]: {stats_eval.get('Return [%]', 0):.2f}%")
             print(f"      - # Trades: {stats_eval.get('# Trades', 0)}")
 
             results_root = os.path.join(os.path.dirname(__file__), "results", symbol)
             os.makedirs(results_root, exist_ok=True)
             html_path = os.path.join(results_root, f"{symbol}_{regime}_OPTIMIZED_REPORT.html")
-            try:
-                final_bt.plot(open_browser=False, filename=html_path)
-                print(f"   🧾 리포트 저장 완료: {html_path}")
-            except Exception as e:
-                print(f"   [WARN] HTML 리포트 생성 실패: {e}")
+            try: final_bt.plot(open_browser=False, filename=html_path); print(f"   🧾 리포트 저장 완료: {html_path}")
+            except Exception as e: print(f"   [WARN] HTML 리포트 생성 실패: {e}")
 
             all_settings.setdefault(regime, {})[symbol] = {
                 "OPEN_TH": int(best_params_dict.get("open_threshold")), "RR_RATIO": float(best_params_dict.get("risk_reward_ratio")), "SL_ATR_MULTIPLIER": float(best_params_dict.get("sl_atr_multiplier")), "TREND_ENTRY_CONFIRM_COUNT": int(best_params_dict.get("trend_entry_confirm_count")), "risk_per_trade": float(best_params_dict.get("risk_per_trade")),
@@ -755,21 +761,17 @@ if __name__ == '__main__':
             with open(optimal_settings_file, 'w', encoding='utf-8') as f:
                 json.dump(all_settings, f, indent=4, ensure_ascii=False)
 
-            base_strategies = { "TrendStrategy": {}, "OscillatorStrategy": {}, "ComprehensiveStrategy": {} }
+            base_strategies = {"TrendStrategy": {}, "OscillatorStrategy": {}, "ComprehensiveStrategy": {}}
             for k, v in best_params_dict.items():
                 if k in ["ema_short", "ema_long", "score_strong_trend"]: base_strategies["TrendStrategy"][k] = v
                 elif k in ["rsi_period", "rsi_oversold", "score_oversold"]: base_strategies["OscillatorStrategy"][k] = v
-                elif k not in ["open_threshold", "risk_reward_ratio", "sl_atr_multiplier", "trend_entry_confirm_count", "risk_per_trade"]:
-                     base_strategies["ComprehensiveStrategy"][k] = v
+                elif k not in BEST_PARAM_KEYS: base_strategies["ComprehensiveStrategy"][k] = v
             
             if "rsi_oversold" in base_strategies["OscillatorStrategy"]:
                 base_strategies["OscillatorStrategy"]["rsi_overbought"] = 100 - base_strategies["OscillatorStrategy"]["rsi_oversold"]
             all_strategies[regime] = base_strategies
-
-            # --- ▼▼▼ [핵심 수정] JSON 저장 전, 데이터 타입을 표준 타입으로 변환합니다. ▼▼▼ ---
-            all_strategies_serializable = _to_jsonable_dict(all_strategies)
+            
             with open(strategies_optimized_file, 'w', encoding='utf-8') as f:
-                json.dump(all_strategies_serializable, f, indent=2, ensure_ascii=False)
-            # --- ▲▲▲ [핵심 수정] ---
+                json.dump(_to_jsonable_dict(all_strategies), f, indent=2, ensure_ascii=False)
             
             print(f"   💾 저장 완료 → {optimal_settings_file}, {strategies_optimized_file}")
