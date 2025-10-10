@@ -36,7 +36,7 @@ except Exception:
     pass
 
 # ==== 프로젝트 모듈 임포트 ====
-from core.config_manager import config
+#from core.config_manager import config
 from analysis import indicator_calculator
 from local_backtesting.backtest_optimizer import OptoRunner  # 최적화 시 사용한 전략 재사용
 
@@ -109,20 +109,17 @@ def period_to_limit(period: str, timeframe: str) -> int:
 
 # ---------------- 바이낸스 클라이언트/잔고 ----------------
 def build_binance_client_from_env() -> Client:
+    """ .env 파일만 참조하여 바이낸스 클라이언트를 생성합니다. """
     mode = (os.getenv("TRADE_MODE", "testnet") or "testnet").strip().lower()
     if mode in ("live", "mainnet", "real"):
-        api_key = os.getenv("BINANCE_LIVE_API_KEY") or getattr(config, "api_key", "")
-        api_secret = os.getenv("BINANCE_LIVE_API_SECRET") or getattr(config, "api_secret", "")
+        api_key = os.getenv("BINANCE_LIVE_API_KEY") or ""
+        api_secret = os.getenv("BINANCE_LIVE_API_SECRET") or ""
         client = Client(api_key, api_secret)
         return client
     else:
-        api_key = os.getenv("BINANCE_TEST_API_KEY") or getattr(config, "api_key", "")
-        api_secret = os.getenv("BINANCE_TEST_API_SECRET") or getattr(config, "api_secret", "")
-        client = Client(api_key, api_secret)
-        try:
-            client.API_URL = 'https://testnet.binance.vision/api'
-        except Exception:
-            pass
+        api_key = os.getenv("BINANCE_TEST_API_KEY") or ""
+        api_secret = os.getenv("BINANCE_TEST_API_SECRET") or ""
+        client = Client(api_key, api_secret, testnet=True)
         try:
             client.FUTURES_URL = 'https://testnet.binancefuture.com/fapi'
         except Exception:
@@ -592,6 +589,11 @@ def parse_symbols(single_symbol: Optional[str], symbols_csv: Optional[str]) -> L
 
 
 def main():
+    # --- ▼▼▼ [수정] main 함수 시작 시 ConfigManager를 로드하여 사용 ▼▼▼ ---
+    # 이 스크립트를 직접 실행할 때만 필요합니다.
+    from core.config_manager import ConfigManager
+    config = ConfigManager()
+    # --- ▲▲▲ [수정] ---
     parser = argparse.ArgumentParser(description="Local backtest runner (multi-symbol)")
     parser.add_argument("--symbol", help="단일 심볼 (예: BTCUSDT)")
     parser.add_argument("--symbols", help="복수 심볼 CSV (예: BTCUSDT,ETHUSDT)")
