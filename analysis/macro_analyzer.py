@@ -1,159 +1,142 @@
-# analysis/macro_analyzer.py
-# v2.7 — 일자 정규화로 BULL/BEAR 세그멘트 복구 + 키 로딩 원복(ENV는 폴백만)
+# analysis/macro_analyzer.py (최종 안정화 버전)
 
 from __future__ import annotations
-
 import os
 from enum import Enum
 from dataclasses import dataclass
 from typing import Optional, Dict, Any, Tuple
-
 import pandas as pd
 import yfinance as yf
 
 try:
-    from fredapi import Fred  # type: ignore
-except Exception:
-    Fred = None  # type: ignore
-
-
-
+    from fredapi import Fred
+except ImportError:
+    Fred = None
 
 class MacroRegime(Enum):
     BULL = "강세 국면 (Risk-On)"
     BEAR = "약세 국면 (Risk-Off)"
     SIDEWAYS = "중립/혼돈 국면"
 
-
-@dataclass
-class MacroKeys:
-    fred: str = ""
-
-
 class MacroAnalyzer:
-    # --- ▼▼▼ [핵심 수정] 생성자에서 config 객체를 주입받도록 변경 ▼▼▼ ---
     def __init__(self, config):
         self.config = config
-        # config 객체에서 FRED API 키를 우선적으로 가져오고, 없으면 환경 변수를 확인합니다.
         fred_key = getattr(self.config, 'fred_api_key', None) or os.getenv("FRED_API_KEY")
-
-        def _mask(s: str) -> str:
-            return f"{len(s)} chars" if s else "empty"
-        
-        print(f"🔑 FRED API Key Check: {('found ' + _mask(fred_key)) if fred_key else 'not found'}")
-
+        print(f"🔑 FRED API Key Check: {'found' if fred_key else 'not found'}")
         self.fred = None
-        if Fred is not None and fred_key:
+        if Fred and fred_key:
             try:
                 self.fred = Fred(api_key=fred_key)
                 print("✅ FRED API 초기화 완료.")
             except Exception as e:
-                print(f"⚠️ FRED 초기화 실패: {e} → FRED 지표 비활성.")
-        elif Fred is None:
-            print("ℹ️ fredapi 패키지가 설치되어 있지 않습니다. FRED 지표 비활성.")
-        else:
-            print("ℹ️ FRED API 키가 없어 FRED 지표가 비활성 상태입니다.")
-        
+                print(f"⚠️ FRED 초기화 실패: {e}")
         print("📈 MacroAnalyzer ready.")
 
-    # -------------------- 공통: 일자 정규화 --------------------
     @staticmethod
-    def _normalize_daily_index(df: pd.DataFrame) -> pd.DataFrame:
-        if df is None or df.empty:
-            return df
-        out = df.copy()
+    def _normalize_data(data):
+        """데이터를 정규화하고, 정렬하며, 중복을 제거하는 가장 안정적인 방식"""
+        if data is None or data.empty: return None
+        out = data.copy()
         out.index = pd.to_datetime(out.index).tz_localize(None).normalize()
+        out = out.sort_index() # 시간순으로 강제 정렬
+        if out.index.has_duplicates:
+            out = out[~out.index.duplicated(keep='last')]
         out.index.name = "Date"
         return out
 
-    @staticmethod
-    def _normalize_daily_series(s: pd.Series) -> pd.Series:
-        if s is None or s.empty:
-            return s
-        out = s.copy()
-        out.index = pd.to_datetime(out.index).tz_localize(None).normalize()
-        out.name = getattr(s, "name", out.name)
-        return out
-
-    # -------------------- 데이터 취득 --------------------
     def _get_yf(self, ticker: str, period: str = "5y", interval: str = "1d") -> Optional[pd.DataFrame]:
         try:
-            df = yf.download(ticker, period=period, interval=interval, progress=False, auto_adjust=False)
-            if df is None or df.empty:
-                return None
-            return self._normalize_daily_index(df)
+            df = yf.download(ticker, period=period, interval=interval, progress=False, auto_adjust=False, timeout=10)
+            return self._normalize_data(df)
         except Exception as e:
             print(f"🚨 yfinance 실패({ticker}): {e}")
             return None
 
     def _get_fred_series(self, series_id: str, start: str = "2000-01-01") -> Optional[pd.Series]:
-        if self.fred is None:
-            return None
+        if self.fred is None: return None
         try:
             s = self.fred.get_series(series_id, start_date=start)
-            if s is None or len(s) == 0:
-                return None
-            return self._normalize_daily_series(s)
+            return self._normalize_data(s)
         except Exception as e:
             print(f"🚨 FRED 조회 실패({series_id}): {e}")
             return None
 
-    # -------------------- 개별 지표 --------------------
+    @staticmethod
+    def _get_last_scalar(series: pd.Series) -> Optional[float]:
+        """Pandas Series에서 마지막 단일 값(스칼라)을 가장 안전하게 추출합니다."""
+        if series is None or series.empty:
+            return None
+        last_value = series.iloc[-1]
+        if pd.notna(last_value):
+            return float(last_value)
+        return None
+
+    # --- ▼▼▼ [핵심 수정] 모든 분석 함수를 새로운 안정적인 로직으로 재작성 ▼▼▼ ---
+
     def analyze_market_leader(self) -> Tuple[int, str]:
         data = self._get_yf("^IXIC")
-        if data is None or len(data) < 200:
-            return 0, "데이터 부족"
+        if data is None or len(data) < 200: return 0, "데이터 부족"
         data["SMA_200"] = data["Close"].rolling(200).mean()
-        last = data.iloc[-1]
-        return (5, "강세") if last["Close"] > last["SMA_200"] else (-5, "약세")
+        last_close = self._get_last_scalar(data["Close"])
+        last_sma = self._get_last_scalar(data["SMA_200"])
+        if last_close is not None and last_sma is not None:
+            return (5, "강세") if last_close > last_sma else (-5, "약세")
+        return 0, "데이터 불완전"
 
     def analyze_market_volatility(self) -> Tuple[int, str]:
         data = self._get_yf("^VIX")
-        if data is None or len(data) < 20:
-            return 0, "데이터 부족"
+        if data is None or len(data) < 20: return 0, "데이터 부족"
         data["SMA_20"] = data["Close"].rolling(20).mean()
-        last = data.iloc[-1]
-        if last["Close"] > 30:
-            return -5, "극심한 공포"
-        if last["Close"] > 20 and last["Close"] > data["SMA_20"].iloc[-1]:
-            return -3, "공포 확산"
-        if last["Close"] < 15:
-            return 3, "시장 안정"
-        return 0, "중립"
+        last_close = self._get_last_scalar(data["Close"])
+        last_sma = self._get_last_scalar(data["SMA_20"])
+        if last_close is not None and last_sma is not None:
+            if last_close > 30: return -5, "극심한 공포"
+            if last_close > 20 and last_close > last_sma: return -3, "공포 확산"
+            if last_close < 15: return 3, "시장 안정"
+            return 0, "중립"
+        return 0, "데이터 불완전"
 
     def analyze_credit_risk(self) -> Tuple[int, str]:
         s = self._get_fred_series("BAMLH0A0HYM2")
-        if s is None or len(s) < 50:
-            return 0, "데이터 부족 또는 FRED 비활성"
+        if s is None or len(s) < 50: return 0, "데이터 부족"
         sma50 = s.rolling(50).mean()
-        return (-5, "신용 경색") if s.iloc[-1] > sma50.iloc[-1] else (3, "자금 원활")
+        last_val = self._get_last_scalar(s)
+        last_sma = self._get_last_scalar(sma50)
+        if last_val is not None and last_sma is not None:
+             return (-5, "신용 경색") if last_val > last_sma else (3, "자금 원활")
+        return 0, "데이터 불완전"
 
     def analyze_liquidity(self) -> Tuple[int, str]:
-        data = self._get_yf("DX-Y.NYB") or self._get_yf("DXY")
-        if data is None or len(data) < 50:
-            return 0, "데이터 부족"
+        data = self._get_yf("DX-Y.NYB")
+        if data is None or len(data) < 50: data = self._get_yf("UUP")
+        if data is None or len(data) < 50: return 0, "데이터 부족"
         data["SMA_50"] = data["Close"].rolling(50).mean()
-        return (4, "달러 약세") if data.iloc[-1]["Close"] < data.iloc[-1]["SMA_50"] else (-4, "달러 강세")
+        last_close = self._get_last_scalar(data["Close"])
+        last_sma = self._get_last_scalar(data["SMA_50"])
+        if last_close is not None and last_sma is not None:
+            return (4, "달러 약세") if last_close < last_sma else (-4, "달러 강세")
+        return 0, "데이터 불완전"
 
     def analyze_inflation_proxy(self) -> Tuple[int, str]:
         data = self._get_yf("CL=F")
-        if data is None or len(data) < 50:
-            return 0, "데이터 부족"
+        if data is None or len(data) < 50: return 0, "데이터 부족"
         data["SMA_50"] = data["Close"].rolling(50).mean()
-        return (2, "상승") if data.iloc[-1]["Close"] > data.iloc[-1]["SMA_50"] else (-2, "하락")
+        last_close = self._get_last_scalar(data["Close"])
+        last_sma = self._get_last_scalar(data["SMA_50"])
+        if last_close is not None and last_sma is not None:
+            return (2, "상승") if last_close > last_sma else (-2, "하락")
+        return 0, "데이터 불완전"
 
     def analyze_yield_curve(self) -> Tuple[int, str]:
         s = self._get_fred_series("T10Y2Y")
-        if s is None or len(s) == 0:
-            return 0, "데이터 부족 또는 FRED 비활성"
-        val = float(s.iloc[-1])
-        if val < 0:
-            return -7, "금리 역전 (침체 신호)"
-        if val < 0.25:
-            return -3, "금리차 축소 (위험)"
-        return 2, "정상"
+        if s is None or s.empty: return 0, "데이터 부족"
+        val = self._get_last_scalar(s)
+        if val is not None:
+            if val < 0: return -7, "금리 역전 (침체 신호)"
+            if val < 0.25: return -3, "금리차 축소 (위험)"
+            return 2, "정상"
+        return 0, "데이터 불완전"
 
-    # -------------------- 종합 진단 --------------------
     def diagnose_macro_regime(self) -> Tuple[MacroRegime, int, Dict[str, int]]:
         scores = {
             "주도주(나스닥)": self.analyze_market_leader()[0],
@@ -164,12 +147,11 @@ class MacroAnalyzer:
             "경기침체(금리차)": self.analyze_yield_curve()[0],
         }
         final = sum(scores.values())
-        if final >= 7:
-            return MacroRegime.BULL, final, scores
-        if final <= -7:
-            return MacroRegime.BEAR, final, scores
+        if final >= 7: return MacroRegime.BULL, final, scores
+        if final <= -7: return MacroRegime.BEAR, final, scores
         return MacroRegime.SIDEWAYS, final, scores
-
+    # (preload_all_macro_data, diagnose_macro_regime_for_date 등 나머지 함수는 변경 없음)
+    # (preload_all_macro_data, diagnose_macro_regime_for_date 등 나머지 함수는 변경 없음)
     # -------------------- 프리로드(세그멘트용) --------------------
     def preload_all_macro_data(self) -> Dict[str, Any]:
         """
