@@ -16,35 +16,35 @@ import requests
 #from database.manager import db_manager
 from database.models import Signal, Trade, AccountSnapshot
 from analysis.core_strategy import diagnose_market_regime, MarketRegime
+from analysis.macro_analyzer import MacroRegime
 
 class BackgroundTasks:
-    def __init__(self, bot, db_manager): # db_manager를 인자로 받도록 수정
+    def __init__(self, bot, db_manager):
         self.bot = bot
         self.config = bot.config
-        self.db_manager = db_manager # db_manager 객체를 저장
+        self.db_manager = db_manager
         self.binance_client = bot.binance_client
         self.confluence_engine = bot.confluence_engine
         self.position_sizer = bot.position_sizer
         self.trading_engine = bot.trading_engine
-        
-        # main.py에서 사용하던 전역 변수들을 클래스 속성으로 이전합니다.
-        self.panel_message: discord.Message = None
-        self.analysis_message: discord.Message = None
+        self.panel_message: discord.Message | None = None
+        self.analysis_message: discord.Message | None = None
         self.latest_analysis_results = {}
         self.decision_log = []
         self.current_aggr_level = self.config.aggr_level
         utc_midnight = time(hour=0, minute=0, tzinfo=timezone.utc)
-        self.daily_snapshot_loop.change_interval(time=utc_midnight)
+        try:
+            self.daily_snapshot_loop.change_interval(time=[utc_midnight])
+        except TypeError:
+            self.daily_snapshot_loop.change_interval(time=utc_midnight)
 
     def start_all_tasks(self):
-        """모든 백그라운드 루프를 시작합니다."""
         self.panel_update_loop.start()
         self.data_collector_loop.start()
         self.trading_decision_loop.start()
         self.daily_snapshot_loop.start()
 
     def on_aggr_level_change(self, new_level: int):
-        """공격성 레벨 변경 콜백 함수입니다."""
         self.current_aggr_level = new_level
 
     # --- UI 및 헬퍼 함수들 (기존 main.py에서 완전 이전) ---
@@ -85,7 +85,7 @@ class BackgroundTasks:
                         self.current_aggr_level = base_aggr_level
                     return
 
-                btc_signal = latest_signal[0]
+                btc_signal = latest_signal_tuple[0]
                 mark_price_info = self.binance_client.futures_mark_price(symbol="BTCUSDT")
                 current_price = float(mark_price_info['markPrice'])
                 volatility = btc_signal.atr_1d / current_price
@@ -381,61 +381,58 @@ class BackgroundTasks:
     @tasks.loop(minutes=5)
     async def trading_decision_loop(self):
         log_message = f"`{datetime.now().strftime('%H:%M:%S')}`: "
-
-        # ▼▼▼ [시즌 2 수정] 서킷 브레이커 확인 로직 추가 ▼▼▼
         if await self.check_circuit_breaker():
-            log_message += "🚨 서킷 브레이커 발동 상태. 모든 매매 결정을 중단합니다."
+            log_message += "🚨 서킷 브레이커 발동 상태. 매매 중단."
             self.decision_log.insert(0, log_message)
             if len(self.decision_log) > 5: self.decision_log.pop()
             print(log_message)
-            return # 루프의 나머지 부분을 실행하지 않고 종료
-        # ▲▲▲ [시즌 2 수정] ▲▲▲
+            return
 
         if not self.config.exec_active:
-            log_message += "자동매매 OFF 상태. 의사결정을 건너뜁니다."
+            log_message += "자동매매 OFF 상태. 관망."
         else:
+            current_macro_regime = MacroRegime.SIDEWAYS
             try:
-                # ConfluenceEngine에 포함된 macro_analyzer를 통해 현재 시장 진단
-                current_macro_regime, macro_score, _ = self.confluence_engine.macro_analyzer.diagnose_macro_regime()
+                regime, macro_score, _ = self.confluence_engine.macro_analyzer.diagnose_macro_regime()
+                current_macro_regime = regime
                 log_message += f"시장 진단: **{current_macro_regime.value}** (점수: {macro_score}) | "
-                
-                # 약세장에서는 모든 신규 진입 중단 (안정성 강화)
                 if current_macro_regime == MacroRegime.BEAR:
-                    log_message += "🚨 약세장 감지, 모든 신규 진입을 보수적으로 중단합니다."
+                    log_message += "🚨 약세장 감지, 신규 진입 중단."
                     self.decision_log.insert(0, log_message)
                     if len(self.decision_log) > 5: self.decision_log.pop()
                     print(log_message)
-                    return # 함수 실행 종료
-            
-            except Exception as e:
-                current_macro_regime = MacroRegime.SIDEWAYS # 진단 실패 시 안전하게 횡보장으로 간주
-                log_message += f"⚠️ 거시 경제 분석 실패: {e}. 중립 상태로 진행 | "
+                    # 약세장에서는 포지션 관리만 하고 신규 진입은 시도하지 않음
+                    with self.db_manager.get_session() as session:
+                        open_trades = session.execute(select(Trade).where(Trade.status == "OPEN")).scalars().all()
+                        if open_trades:
+                            await self.manage_open_positions(session, open_trades, current_macro_regime.name)
+                    return
 
-            # ... (이하 기존 의사결정 로직은 모두 동일) ...
+            except Exception as e:
+                log_message += f"⚠️ 거시 분석 실패: {e}. 중립({current_macro_regime.value})으로 진행 | "
+
             if self.config.adaptive_aggr_enabled:
                 self.update_adaptive_aggression_level()
 
-            log_message += f"[Lvl:{self.current_aggr_level}] 의사결정 사이클 시작. "
+            log_message += f"[Lvl:{self.current_aggr_level}] 의사결정 시작. "
             try:
                 with self.db_manager.get_session() as session:
                     open_trades = session.execute(select(Trade).where(Trade.status == "OPEN")).scalars().all()
-
                     if open_trades:
-                        log_message += f"{len(open_trades)}개 포지션 관리 실행. "
-                        await self.manage_open_positions(session, open_trades)
+                        log_message += f"{len(open_trades)}개 포지션 관리. "
+                        await self.manage_open_positions(session, open_trades, current_macro_regime.name)
 
-                    open_positions_count = session.query(Trade).filter(Trade.status == "OPEN").count()
+                    open_positions_count = len(open_trades)
                     symbols_in_trade = {t.symbol for t in open_trades}
 
-                    decision_reason = await self.find_new_entry_opportunities(session, open_positions_count, symbols_in_trade)
+                    decision_reason = await self.find_new_entry_opportunities(session, open_positions_count, symbols_in_trade, current_macro_regime.name)
                     log_message += decision_reason
             except Exception as e:
-                log_message += f"🚨 루프 중 심각한 오류 발생: {e}"
-                print(f"🚨 의사결정 루프 중 심각한 오류 발생: {e}")
+                log_message += f"🚨 루프 중 심각한 오류: {e}"
+                print(f"🚨 의사결정 루프 중 심각한 오류 발생: {e}", exc_info=True)
 
         self.decision_log.insert(0, log_message)
-        if len(self.decision_log) > 5:
-            self.decision_log.pop()
+        if len(self.decision_log) > 5: self.decision_log.pop()
         print(log_message)
 
     # --- 트레이딩 로직 헬퍼 함수들 ---
