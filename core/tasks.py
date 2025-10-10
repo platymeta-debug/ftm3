@@ -593,9 +593,17 @@ class BackgroundTasks:
         )
         
         if quantity:
+            context = best_opportunity["context"]
             context['signal_id'] = best_opportunity["signal_id"]
-            await self.trading_engine.place_order_with_bracket(best_opportunity["symbol"], best_opportunity["side"], quantity, leverage, context['entry_atr'], context)
+            # trading_engine place_order_with_bracket 함수가 별도로 있다면 그 함수를 호출
+            # 여기서는 trading_engine의 다른 함수를 호출한다고 가정
+            await self.trading_engine.open_with_bracket(
+                symbol=best_opportunity["symbol"],
+                side=best_opportunity["side"],
+                quantity=quantity,
+                entry_atr=context['entry_atr'],
+                extra=context
+            )
             return f"🏆 최고 점수 신호 선택: {best_opportunity['reason']}"
         else:
             return f"[{best_opportunity['symbol']}]: 포지션 규모 계산 실패로 진입 보류."
-        # ▲▲▲ [시즌 4 수정] ▲▲▲
