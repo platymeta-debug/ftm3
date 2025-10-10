@@ -1,9 +1,15 @@
-# core/config_manager.py (최종 완성본 - optimal_settings.json 중심)
+# core/config_manager.py (수정)
 
 import os
 import json
 from typing import Dict, List
 from dotenv import load_dotenv
+
+# .env 파일 로드는 클래스 로딩 시 한번만 실행
+# 이 부분은 이미 로드되었다는 메시지를 출력하므로 그대로 두겠습니다.
+# load_dotenv()
+# print("✅ .env 환경 변수 파일을 로드했습니다.")
+
 
 class ConfigManager:
     """
@@ -11,9 +17,8 @@ class ConfigManager:
     최종 설정 관리자 클래스.
     """
     def __init__(self) -> None:
-        load_dotenv()
-        print("✅ .env 환경 변수 파일을 로드했습니다.")
-
+        # 이전에 이 위치에 있었던 load_dotenv()는 삭제되었습니다.
+        
         # --- 1. .env에서 환경 및 인프라 설정 로드 ---
         self.trade_mode = os.getenv("TRADE_MODE", "testnet")
         self.is_testnet = self.trade_mode == "testnet"
@@ -106,5 +111,60 @@ class ConfigManager:
         # 해당 시장의 설정이 있으면 그것을, 없으면 BULL 마켓 설정을, 그것도 없으면 빈 딕셔너리를 반환
         return self.optimized_strategy_configs.get(regime_upper, self.optimized_strategy_configs.get("BULL", {}))
     
+# [ANCHOR:EXEC_POLICY_ACCESSOR]  ← 파일 하단 utils 근처에 추가
+
+class _ExecPolicyView:
+    """
+    옵티마이저가 저장한 optimal_settings.json / strategies_optimized.json 을
+    심볼/레짐별로 읽어와 실행정책 딕셔너리로 반환.
+    """
+    def __init__(self, parent):
+        self._parent = parent
+
+    def get(self, symbol: str, regime: str | None = None) -> dict:
+        """
+        regime 생략 시 심볼 공통(Default) → 있으면 레짐 우선
+        기대 키:
+          - sl_atr_multiplier, risk_reward_ratio
+          - exec_partial, exec_time_stop_bars
+          - exec_trailing_mode, exec_trailing_k
+        """
+        # 1) 우선 optimal_settings.json
+        best = self._parent._load_optimal_for(symbol, regime)  # 구현: 이미 있으면 재사용
+        if not best:
+            # 2) 기본값 폴백 (기존 설정과 호환)
+            return {
+                "sl_atr_multiplier": getattr(self._parent, "sl_atr_multiplier", 1.5),
+                "risk_reward_ratio": getattr(self._parent, "risk_reward_ratio", 2.0),
+                "exec_partial": [],
+                "exec_time_stop_bars": 0,
+                "exec_trailing_mode": "off",
+                "exec_trailing_k": 0.0,
+            }
+
+        # 키 스키마 정규화
+        out = {
+            "sl_atr_multiplier": float(best.get("sl_atr_multiplier", 1.5)),
+            "risk_reward_ratio": float(best.get("risk_reward_ratio", 2.0)),
+            "exec_partial": best.get("exec_partial", []),
+            "exec_time_stop_bars": int(best.get("exec_time_stop_bars", 0)),
+            "exec_trailing_mode": best.get("exec_trailing_mode", "off"),
+            "exec_trailing_k": float(best.get("exec_trailing_k", 0.0)),
+        }
+        # 문자열 partial → 리스트로
+        if isinstance(out["exec_partial"], str):
+            parts = [x.strip() for x in out["exec_partial"].split(",") if x.strip()]
+            out["exec_partial"] = [float(x) for x in parts]
+        return out
+
+# config 객체에 연결
+class ConfigManager:
+    ...
+    def get_exec_policy(self, symbol: str, regime: str | None = None) -> dict:
+        if not hasattr(self, "_exec_view"):
+            self._exec_view = _ExecPolicyView(self)
+        return self._exec_view.get(symbol, regime)
+
+
 # 단일 ConfigManager 인스턴스 생성
-config = ConfigManager()
+#config = ConfigManager()
