@@ -1,4 +1,4 @@
-# analysis/confluence_engine.py (최종 완성본 - strategies.json 의존성 제거)
+# analysis/confluence_engine.py (최종 수정)
 
 from __future__ import annotations
 import math
@@ -15,20 +15,19 @@ from .strategies.trend_strategy import TrendStrategy
 from .strategies.oscillator_strategy import OscillatorStrategy
 from .strategies.comprehensive_strategy import ComprehensiveStrategy
 from .strategies.signal_filter_strategy import SignalFilterStrategy
-#from core.config_manager import config
+
 
 class ConfluenceEngine:
     """
     기술적 분석, 거시 경제 분석, 동적 파라미터를 통합하여 최종 결정을 내리는 '두뇌' 모듈.
     """
-    def __init__(self, client: Client, config: any, strategy_configs: dict | None = None): # config를 인자로 받도록 수정
+    def __init__(self, client: Client, config: any, strategy_configs: dict | None = None):
         self.client = client
-        self.config = config # config 객체를 저장
+        self.config = config
         self.fear_and_greed_index = 50
-        self.macro_analyzer = MacroAnalyzer()
+        self.macro_analyzer = MacroAnalyzer(self.config) # config 주입
         self.strategy_configs = strategy_configs or {}
-        # --- ▼▼▼ [수정] strategies.json 의존성 제거 및 전략 직접 초기화 ▼▼▼ ---
-        # 이제 ConfluenceEngine은 외부 설정 파일 없이 스스로 모든 전략을 관리합니다.
+        
         self.strategies = []
         strategy_classes = {
             "TrendStrategy": TrendStrategy,
@@ -36,19 +35,19 @@ class ConfluenceEngine:
             "ComprehensiveStrategy": ComprehensiveStrategy,
         }
 
+        # get_strategy_configs는 ConfigManager에 있으므로 self.config에서 호출
+        current_strategy_configs = self.config.get_strategy_configs("BULL")
+
         for name, cls in strategy_classes.items():
-            if self.strategy_configs:
-                # backtest_optimizer.py 에서 넘겨준 값 사용
-                strategy_config = self.strategy_configs.get(name, {})
-            else:
-                # ConfigManager 의 메서드 사용 (BULL/BEAR/SIDEWAYS 중 하나)
-                strategy_config = config.get_strategy_configs("BULL").get(name, {})
-            
+            strategy_config = current_strategy_configs.get(name, {})
             if strategy_config.get("enabled", True):
                 self.strategies.append(cls(params=strategy_config))
-        self.filter = SignalFilterStrategy()
-        print(f"✅ [최종] {len(self.strategies)}개 분석 전략, 1개 신호 필터, 1개 거시 분석기가 로드되었습니다.")
-        # --- ▲▲▲ [수정] ---
+        
+        # --- ▼▼▼ [핵심 수정] SignalFilterStrategy 생성 시 config 객체 전달 ▼▼▼ ---
+        self.filter = SignalFilterStrategy(self.config)
+        # --- ▲▲▲ [핵심 수정] ---
+
+        print(f"✅ ConfluenceEngine: {len(self.strategies)}개 분석 전략, 1개 신호 필터, 1개 거시 분석기가 로드되었습니다.")
 
     def analyze_and_decide(self, symbol: str, recent_scores: List[float], market_regime: str) -> Tuple[Optional[str], str, Optional[dict]]:
         """
@@ -62,23 +61,24 @@ class ConfluenceEngine:
         four_hour_row = tf_rows.get("4h")
         if four_hour_row is None:
             return None, f"[{symbol}]: 핵심 데이터(4h) 부족.", None
-
+        
+        # 'config'를 self.config로 수정
         market_data_for_diag = pd.Series({
             'adx_4h': four_hour_row.get('ADX_14'),
             'is_above_ema200_1d': tf_rows.get("1d", {}).get('close') > tf_rows.get("1d", {}).get('EMA_200', float('inf'))
         })
-        technical_regime = diagnose_market_regime(market_data_for_diag, config.market_regime_adx_th)
+        technical_regime = diagnose_market_regime(market_data_for_diag, self.config.market_regime_adx_th)
 
         if technical_regime not in [TechnicalRegime.BULL_TREND, TechnicalRegime.BEAR_TREND]:
             return None, f"[{symbol}]: 기술적 횡보장({technical_regime.value}). 관망.", None
 
-        if len(recent_scores) < config.trend_entry_confirm_count:
-            return None, f"[{symbol}]: 신호 부족({len(recent_scores)}/{config.trend_entry_confirm_count}). 관망.", None
+        if len(recent_scores) < self.config.trend_entry_confirm_count:
+            return None, f"[{symbol}]: 신호 부족({len(recent_scores)}/{self.config.trend_entry_confirm_count}). 관망.", None
 
         avg_score = statistics.mean(recent_scores)
         std_dev = statistics.pstdev(recent_scores) if len(recent_scores) > 1 else 0
 
-        params = config.get_strategy_params(symbol, market_regime)
+        params = self.config.get_strategy_params(symbol, market_regime)
         open_threshold = params.get('open_th', 12.0)
 
         side = None
@@ -104,6 +104,7 @@ class ConfluenceEngine:
 
     def get_full_data(self, symbol: str, timeframe: str) -> Optional[pd.DataFrame]:
         try:
+            # fetch_klines는 client만 필요하므로 변경 없음
             df = data_fetcher.fetch_klines(self.client, symbol, timeframe, limit=200)
             if df is None or df.empty: return None
             return indicator_calculator.calculate_all_indicators(df)
@@ -113,17 +114,18 @@ class ConfluenceEngine:
     def analyze_symbol(self, symbol: str) -> Optional[Tuple[float, Dict, Dict, Dict, int, str]]:
         try:
             self._fetch_fear_and_greed_index()
-            tf_data = {tf: self.get_full_data(symbol, tf) for tf in config.analysis_timeframes}
+            # self.config 사용
+            tf_data = {tf: self.get_full_data(symbol, tf) for tf in self.config.analysis_timeframes}
             if not any(df is not None and not df.empty for df in tf_data.values()): return None
 
             tf_scores = {tf: self._calculate_tactical_score(data)[0] for tf, data in tf_data.items() if data is not None}
             tf_score_breakdowns = {tf: self._calculate_tactical_score(data)[1] for tf, data in tf_data.items() if data is not None}
             tf_rows = {tf: data.iloc[-1] for tf, data in tf_data.items() if data is not None}
-
-            weights = dict(zip(config.analysis_timeframes, config.tf_vote_weights))
-            final_score = sum(tf_scores.get(tf, 0) * weights.get(tf, 1.0) for tf in config.analysis_timeframes)
             
-            # (나머지 로직은 이전과 동일)
+            # self.config 사용
+            weights = dict(zip(self.config.analysis_timeframes, self.config.tf_vote_weights))
+            final_score = sum(tf_scores.get(tf, 0) * weights.get(tf, 1.0) for tf in self.config.analysis_timeframes)
+            
             return final_score, tf_scores, tf_rows, tf_score_breakdowns, self.fear_and_greed_index, ""
         except Exception as e:
             print(f"🚨 {symbol} 분석 중 오류: {e}")
