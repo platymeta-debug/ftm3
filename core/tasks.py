@@ -13,15 +13,15 @@ import pandas as pd
 import requests
 
 # 핵심 모듈 임포트
-from database.manager import db_manager
+#from database.manager import db_manager
 from database.models import Signal, Trade, AccountSnapshot
 from analysis.core_strategy import diagnose_market_regime, MarketRegime
 
 class BackgroundTasks:
-    def __init__(self, bot):
+    def __init__(self, bot, db_manager): # db_manager를 인자로 받도록 수정
         self.bot = bot
-        # main.py의 bot 객체로부터 핵심 요소들을 가져와 클래스 속성으로 만듭니다.
         self.config = bot.config
+        self.db_manager = db_manager # db_manager 객체를 저장
         self.binance_client = bot.binance_client
         self.confluence_engine = bot.confluence_engine
         self.position_sizer = bot.position_sizer
