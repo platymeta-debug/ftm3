@@ -1,12 +1,13 @@
 from typing import Optional
 from binance.client import Client
 from binance.exceptions import BinanceAPIException
-from core.config_manager import config
+from core.config_manager import ConfigManager
 
 
 class PositionSizer:
-    def __init__(self, client: Client):
+    def __init__(self, client: Client, config: ConfigManager): # config를 인자로 받도록 수정
         self.client = client
+        self.config = config # config 객체를 저장
         print("포지션 사이저가 초기화되었습니다.")
 
     def _get_usdt_balance(self) -> float:
