@@ -45,7 +45,7 @@ from analysis import indicator_calculator, data_fetcher
 from analysis.confluence_engine import ConfluenceEngine
 from analysis.macro_analyzer import MacroAnalyzer, MacroRegime
 from analysis.risk_sizing import calc_order_qty
-from core.config_manager import config
+#from core.config_manager import config
 
 # (선택형 최적화기)
 try:
@@ -56,10 +56,8 @@ except Exception:
 
 
 # ---- 안전 폴백: 전략 설정 읽기 ----
-def get_strategy_configs_safe(regime: str):
-    """
-    ConfigManager가 get_strategy_configs를 제공하지 않는 경우를 대비한 안전 래퍼.
-    """
+def get_strategy_configs_safe(config, regime: str):
+    """ ConfigManager 객체를 받아 안전하게 전략 설정을 읽습니다. """
     if hasattr(config, "get_strategy_configs"):
         try:
             return config.get_strategy_configs(regime)
@@ -665,6 +663,9 @@ def choose_method_auto(param_spaces):
 
 
 if __name__ == '__main__':
+    from core.config_manager import ConfigManager
+    config = ConfigManager()
+    
     backtesting.Pool = multiprocessing.Pool
 
     symbols_to_optimize = ["BTCUSDT", "ETHUSDT"]
