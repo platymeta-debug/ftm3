@@ -20,7 +20,6 @@ from backtesting.lib import FractionalBacktest # FractionalBacktest 임포트
 from local_backtesting.backtest_runner import StrategyRunner
 from local_backtesting.performance_visualizer import create_performance_report
 from analysis.data_fetcher import fetch_klines
-from database.manager import db_manager
 from database.models import Trade
 from execution.trading_engine import TradingEngine
 from ui.views import ConfirmView
@@ -160,7 +159,7 @@ class CommandCog(commands.Cog):
         await view.wait()
         if view.value is True:
             try:
-                with db_manager.get_session() as session:
+                with self.bot.db_manager.get_session() as session:
                     trade_to_close = session.execute(select(Trade).where(Trade.symbol == symbol, Trade.status == "OPEN")).scalar_one_or_none()
                 if trade_to_close:
                     await self.trading_engine.close_position(trade_to_close, "사용자 수동 청산")
