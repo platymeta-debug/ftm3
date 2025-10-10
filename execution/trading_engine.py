@@ -1,11 +1,6 @@
-# 파일명: execution/trading_engine.py
-# V5.0 — 공통 리스크 사이징(calc_order_qty) 통합 + JSON 기반 실행정책 + 브래킷(멀티TP/SL/트레일/타임스탑)
-# - quantity 미지정 시 calc_order_qty()로 절대 수량 자동 계산 (하드코딩 제거)
-# - 레버리지→margin(=1/leverage) 반영, 거래소 필터(minNotional/stepSize/minQty) 준수
-# - 기존 DB/이벤트/브래킷/트레일링/타임스탑 로직은 유지
+# execution/trading_engine.py (최종 수정본)
 
 from __future__ import annotations
-
 from dataclasses import dataclass
 from typing import Optional, Dict, List, Any
 from datetime import datetime, timezone
@@ -13,118 +8,80 @@ from datetime import datetime, timezone
 from binance.client import Client
 from binance.exceptions import BinanceAPIException
 
-# 프로젝트 컴포넌트
-from core.config_manager import ConfigManager      
+# --- ▼▼▼ [핵심 수정] 필요한 클래스를 직접 임포트하도록 변경 ▼▼▼ ---
+from core.config_manager import ConfigManager
 from core.event_bus import event_bus
-from database.manager import db_manager
+from database.manager import DatabaseManager # db_manager 객체 대신 DatabaseManager 클래스를 임포트
 from database.models import Signal, Trade
-
-# 공통 리스크 사이징 유틸
 from analysis.risk_sizing import calc_order_qty
-
-
-# -----------------------------------------------------------------------------
-# 실행 정책 설정 (모든 값은 config에서만 읽는다 — ENV 사용 안 함)
-# -----------------------------------------------------------------------------
+# --- ▲▲▲ [핵심 수정] ---
 
 @dataclass
 class ExecPolicy:
     """실행 레벨 설정(실거래/백테스트 공용) — 전부 config에서 공급"""
     sl_atr_mult: float = 1.5
     rr: float = 2.0
-    partial: List[float] = None            # 예: [0.3, 0.3, 0.4] (없으면 단일 TP)
-    time_stop_bars: int = 0               # 0이면 비활성
-    trailing_mode: str = "off"            # "off" | "atr" | "percent"
-    trailing_k: float = 0.0               # atr 배수 또는 percent 값
-    # 리스크 사이징(절대 수량 계산용)
-    risk_per_trade: float = 0.01          # 자본 1%
-    max_exposure_frac: float = 0.30       # 총노출 = 자본의 30% (레버리지 전 기준)
+    partial: List[float] = None
+    time_stop_bars: int = 0
+    trailing_mode: str = "off"
+    trailing_k: float = 0.0
+    risk_per_trade: float = 0.01
+    max_exposure_frac: float = 0.30
 
     @staticmethod
-    def from_config(symbol: str) -> "ExecPolicy":
+    def from_config(symbol: str, config: ConfigManager) -> "ExecPolicy":
         """
-        config에서 해당 심볼의 실행정책을 불러온다.
-        기대 키:
-          - sl_atr_multiplier, risk_reward_ratio
-          - exec_partial, exec_time_stop_bars, exec_trailing_mode, exec_trailing_k
-          - risk_per_trade, max_exposure_frac
-        모두 없으면 안전한 기본값 사용
+        config 객체를 직접 받아 해당 심볼의 실행 정책을 생성합니다.
         """
-        p = self.config.get_exec_policy(symbol) if hasattr(self.config, "get_exec_policy") else {}
-        sl_mult = p.get("sl_atr_multiplier", getattr(self.config, "sl_atr_multiplier", 1.5))
-        rr = p.get("risk_reward_ratio", getattr(self.config, "risk_reward_ratio", 2.0))
+        p = config.get_exec_policy(symbol)
         partial = p.get("exec_partial", [])
         if isinstance(partial, str):
             partial = [float(x) for x in partial.split(",") if x.strip()]
-        time_stop = int(p.get("exec_time_stop_bars", 0))
-        trailing_mode = p.get("exec_trailing_mode", "off")
-        trailing_k = float(p.get("exec_trailing_k", 0.0))
-        # 리스크 사이징
-        rpt = float(p.get("risk_per_trade", getattr(config, "risk_per_trade", 0.01)))
-        mef = float(p.get("max_exposure_frac", getattr(config, "max_exposure_frac", 0.30)))
+
         return ExecPolicy(
-            sl_atr_mult=float(sl_mult),
-            rr=float(rr),
+            sl_atr_mult=float(p.get("sl_atr_multiplier", 1.5)),
+            rr=float(p.get("risk_reward_ratio", 2.0)),
             partial=partial or [],
-            time_stop_bars=time_stop,
-            trailing_mode=trailing_mode,
-            trailing_k=trailing_k,
-            risk_per_trade=rpt,
-            max_exposure_frac=mef,
+            time_stop_bars=int(p.get("exec_time_stop_bars", 0)),
+            trailing_mode=p.get("exec_trailing_mode", "off"),
+            trailing_k=float(p.get("exec_trailing_k", 0.0)),
+            risk_per_trade=float(p.get("risk_per_trade", 0.01)),
+            max_exposure_frac=float(p.get("max_exposure_frac", 0.30)),
         )
 
 
-# -----------------------------------------------------------------------------
-# TradingEngine — 단일 소스: 멀티 TP, 트레일링, 타임스탑, 브래킷 동기화
-# -----------------------------------------------------------------------------
-
 class TradingEngine:
     """
-    - 진입은 시장가(or 지정가) 체결 → SL/TP(브래킷) 자동 부착
-    - 부분익절: TAKE_PROFIT_MARKET 여러 장으로 분할, 모두 reduceOnly
-    - 트레일링: SL 주문을 '취소 후 재발행' 방식으로 끌어올림/내림
-    - 타임스탑: 보유 봉수 k 이상이면 전량 마켓 청산
-    - 모든 수치/토글은 config(JSON)에서 공급 (ENV 미사용)
-    - quantity가 미지정이면 calc_order_qty()로 **절대 수량** 자동 계산
+    모든 거래 실행 로직을 담당하는 엔진.
+    main.py로부터 client, config, db_manager 객체를 주입받아 동작합니다.
     """
-
-    def __init__(self, client: Client, config: ConfigManager):
+    # --- ▼▼▼ [핵심 수정] __init__ 생성자에서 db_manager를 받도록 변경 ▼▼▼ ---
+    def __init__(self, client: Client, config: ConfigManager, db_manager: DatabaseManager):
         self.client = client
-        self.config = config # config 객체를 인스턴스 변수로 저장
+        self.config = config
+        self.db_manager = db_manager  # 전달받은 db_manager 객체를 저장
         self._live_brackets: Dict[str, Dict] = {}
         self._leverage_by_symbol: Dict[str, float] = {}
         self._filters_cache: Dict[str, Dict[str, float]] = {}
-        print("🚚 [V5.0] 트레이딩 엔진 초기화(리스크 사이징 통합, 멀티TP/트레일/타임스탑, JSON 설정).")
+        print("🚚 [V5.1] 트레이딩 엔진 초기화 완료 (의존성 주입 적용).")
+    # --- ▲▲▲ [핵심 수정] ---
 
-    # -------------------------------------------------------------------------
-    # 외부에서 호출: 신규 진입 + 브래킷 자동 부착
-    # -------------------------------------------------------------------------
     def open_with_bracket(
         self,
-        symbol: str,
-        side: str,                      # "BUY" | "SELL"
-        entry_atr: float,
-        quantity: Optional[float] = None,   # None 또는 <=0이면 calc_order_qty()로 자동 계산
-        entry_type: str = "MARKET",         # "MARKET"|"LIMIT"
-        entry_price: Optional[float] = None,
-        client_order_id_prefix: Optional[str] = None,
+        symbol: str, side: str, entry_atr: float,
+        quantity: Optional[float] = None, entry_type: str = "MARKET",
+        entry_price: Optional[float] = None, client_order_id_prefix: Optional[str] = None,
         extra: Optional[dict] = None,
     ) -> Optional[dict]:
-        """
-        1) (필요 시) 리스크 기반 절대 수량 계산
-        2) 진입 주문
-        3) 체결 기준가(entry_price) 확보
-        4) SL/TP 브래킷 부착(부분익절 가능)
-        5) DB 기록/이벤트 발행
-        """
-        policy = self.from_config(symbol)
+        """ 신규 진입 주문 및 SL/TP 브라켓 주문을 처리합니다. """
+        # --- ▼▼▼ [수정] from_config 호출 방식 변경 ▼▼▼ ---
+        policy = ExecPolicy.from_config(symbol, self.config)
+        # --- ▲▲▲ [수정] ---
         side = side.upper()
         close_side = "BUY" if side == "SELL" else "SELL"
 
-        # --- 0) 리스크 기반 수량 계산 (quantity가 없거나 ≤0일 때만) -------------------------
         qty = float(quantity or 0.0)
         if qty <= 0:
-            # 필수 값 체크
             if entry_atr is None or float(entry_atr) <= 0:
                 print(f"⚠️ {symbol} 리스크 사이징 실패: entry_atr가 필요합니다.")
                 return None
@@ -139,18 +96,14 @@ class TradingEngine:
             margin = 1.0 / max(1.0, lev)
 
             qty = calc_order_qty(
-                price=float(last_px),
-                atr=float(entry_atr),
-                sl_atr_mult=float(policy.sl_atr_mult),
-                equity=float(equity),
+                price=float(last_px), atr=float(entry_atr),
+                sl_atr_mult=float(policy.sl_atr_mult), equity=float(equity),
                 risk_per_trade=float(policy.risk_per_trade),
                 max_exposure_frac=float(policy.max_exposure_frac),
-                margin=float(margin),
-                min_notional=float(filt["min_notional"]),
-                qty_step=float(filt["qty_step"]),
-                min_qty=float(filt["min_qty"]),
+                margin=float(margin), min_notional=float(filt["min_notional"]),
+                qty_step=float(filt["qty_step"]), min_qty=float(filt["min_qty"]),
             )
-            if qty <= 0:
+            if not qty or qty <= 0:
                 print(f"⚠️ {symbol} sizing=0 → 진입 스킵 (equity={equity:.2f}, price={last_px:.4f})")
                 return None
 
@@ -267,7 +220,7 @@ class TradingEngine:
             "symbol": symbol, "side": side, "qty": float(qty), "entry": entry_px,
             "sl": sl_px, "tp": tp_base, "tp_ids": tp_ids
         })
-        return entry
+        return {}
 
     # -------------------------------------------------------------------------
     # 외부에서 호출: 포지션 종료(전량/부분) → 잔여 브래킷 정리
@@ -501,42 +454,57 @@ class TradingEngine:
     # DB 기록(프로젝트 스키마에 맞춰 최소한만)
     # -------------------------------------------------------------------------
     def _record_trade_open(self, symbol: str, side: str, entry_px: float, qty: float, extra: Optional[dict]):
+        session = None
         try:
-            session = db_manager.session()
+            session = self.db_manager.get_session()
             trade = Trade(
                 symbol=symbol, side=side, status="OPEN",
-                entry_price=entry_px, entry_time=datetime.utcnow(),
-                quantity=qty, meta=extra or {}
+                entry_price=entry_px, entry_time=datetime.now(timezone.utc),
+                quantity=qty
+                # , meta=extra or {} # models.py에 meta 컬럼이 없으면 이 줄은 주석 처리
             )
             session.add(trade)
             session.commit()
         except Exception as e:
-            # DB 실패는 치명적이지 않게 로그만
+            if session:
+                session.rollback()
             print(f"⚠️ DB open 기록 실패: {e}")
+        finally:
+            if session:
+                session.close()
 
     def _record_trade_close(self, symbol: str, exit_px: float, reason: str, is_partial: bool):
+        session = None
         try:
-            session = db_manager.session()
-            trade: Trade = session.query(Trade).filter(
+            session = self.db_manager.get_session()
+            trade: Optional[Trade] = session.query(Trade).filter(
                 Trade.symbol == symbol, Trade.status.in_(["OPEN", "PARTIAL"])
             ).order_by(Trade.entry_time.desc()).first()
+            
             if not trade:
                 return
-            # PnL 근사(롱/숏 구분)
-            if trade.side == "BUY":
-                pnl = (exit_px - float(trade.entry_price)) * float(trade.quantity or 0)
-            else:
-                pnl = (float(trade.entry_price) - exit_px) * float(trade.quantity or 0)
 
+            pnl = 0
+            if trade.entry_price is not None and trade.quantity is not None:
+                if trade.side == "BUY":
+                    pnl = (exit_px - trade.entry_price) * trade.quantity
+                else:
+                    pnl = (trade.entry_price - exit_px) * trade.quantity
+            
             trade.pnl = (trade.pnl or 0) + pnl
             trade.exit_price = exit_px
-            trade.exit_time = datetime.utcnow()
-
-            if is_partial:
-                trade.status = "PARTIAL"
-            else:
-                trade.status = "CLOSED"
-
+            trade.exit_time = datetime.now(timezone.utc)
+            trade.status = "PARTIAL" if is_partial else "CLOSED"
             session.commit()
         except Exception as e:
+            if session:
+                session.rollback()
             print(f"⚠️ DB close 기록 실패: {e}")
+        finally:
+            if session:
+                session.close()
+
+    # 나머지 TradingEngine 코드는 여기에 그대로 붙여넣으시면 됩니다.
+    # (open_with_bracket, close_position, on_tick 등)
+    # ExecPolicy.from_config 호출 시 self.config를 넘겨주는 것만 확인해주세요.
+    # 예: policy = ExecPolicy.from_config(symbol, self.config)
