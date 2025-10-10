@@ -74,10 +74,12 @@ class BackgroundTasks:
         base_aggr_level = self.config.aggr_level
         try:
             # (main - 복사본.py의 로직을 그대로 가져오되, self를 사용하도록 수정)
-            with db_manager.get_session() as session:
-                latest_signal = session.execute(select(Signal).where(Signal.symbol == "BTCUSDT").order_by(Signal.id.desc())).first()
+            with self.db_manager.get_session() as session:
+                latest_signal_tuple = session.execute(
+                    select(Signal).where(Signal.symbol == "BTCUSDT").order_by(Signal.id.desc())
+                ).first()
 
-                if not latest_signal or not latest_signal[0].atr_1d:
+                if not latest_signal_tuple or not latest_signal_tuple[0].atr_1d:
                     if self.current_aggr_level != base_aggr_level:
                         print(f"[Adaptive] 데이터 부족. 공격성 레벨 복귀: {self.current_aggr_level} -> {base_aggr_level}")
                         self.current_aggr_level = base_aggr_level
@@ -138,7 +140,7 @@ class BackgroundTasks:
             if not positions_from_api:
                 embed.add_field(name="[오픈된 포지션]", value="현재 오픈된 포지션이 없습니다.", inline=False)
             else:
-                with db_manager.get_session() as db_session:
+                with self.db_manager.get_session() as db_session:
                     for pos in positions_from_api:
                         symbol = pos.get('symbol')
                         if not symbol: continue
@@ -263,7 +265,7 @@ class BackgroundTasks:
             account_info = self.binance_client.futures_account()
             total_balance = float(account_info.get('totalWalletBalance', 0.0))
             if total_balance > 0:
-                with db_manager.get_session() as session:
+                with self.db_manager.get_session() as session:
                     snapshot = AccountSnapshot(total_balance=total_balance)
                     session.add(snapshot)
                     session.commit()
@@ -279,7 +281,7 @@ class BackgroundTasks:
         if not self.config.circuit_breaker_enabled:
             return False
 
-        with db_manager.get_session() as session:
+        with self.db_manager.get_session() as session:
             check_period = datetime.now(timezone.utc) - timedelta(days=self.config.drawdown_check_days)
             snapshots = session.execute(
                 select(AccountSnapshot)
@@ -327,12 +329,12 @@ class BackgroundTasks:
         print(f"\n--- [Data Collector] 분석 시작: {datetime.now().strftime('%H:%M:%S')} ---")
 
         # ▼▼▼ [최종 수정] 봇을 멈추게 하는 분석 로직을 별도 스레드에서 실행하도록 변경 ▼▼▼
-        def blocking_analysis():
+        def blocking_analysis(db_manager_instance, config_instance, confluence_engine_instance):
             results = {}
             try:
-                with db_manager.get_session() as session:
-                    for symbol in self.config.symbols:
-                        analysis_result = self.confluence_engine.analyze_symbol(symbol)
+                with db_manager_instance.get_session() as session:
+                    for symbol in config_instance.symbols:
+                        analysis_result = confluence_engine_instance.analyze_symbol(symbol)
                         if not analysis_result:
                             results.pop(symbol, None)
                             continue
@@ -361,7 +363,7 @@ class BackgroundTasks:
                 return {}
 
         loop = asyncio.get_event_loop()
-        analysis_results = await loop.run_in_executor(None, blocking_analysis)
+        analysis_results = await loop.run_in_executor(None, blocking_analysis, self.db_manager, self.config, self.confluence_engine)
         self.latest_analysis_results.update(analysis_results)
         # ▲▲▲ [최종 수정] ▲▲▲
 
@@ -415,7 +417,7 @@ class BackgroundTasks:
 
             log_message += f"[Lvl:{self.current_aggr_level}] 의사결정 사이클 시작. "
             try:
-                with db_manager.get_session() as session:
+                with self.db_manager.get_session() as session:
                     open_trades = session.execute(select(Trade).where(Trade.status == "OPEN")).scalars().all()
 
                     if open_trades:
