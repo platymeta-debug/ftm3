@@ -15,14 +15,15 @@ from .strategies.trend_strategy import TrendStrategy
 from .strategies.oscillator_strategy import OscillatorStrategy
 from .strategies.comprehensive_strategy import ComprehensiveStrategy
 from .strategies.signal_filter_strategy import SignalFilterStrategy
-from core.config_manager import config
+#from core.config_manager import config
 
 class ConfluenceEngine:
     """
     기술적 분석, 거시 경제 분석, 동적 파라미터를 통합하여 최종 결정을 내리는 '두뇌' 모듈.
     """
-    def __init__(self, client: Client, strategy_configs: dict | None = None):
+    def __init__(self, client: Client, config: any, strategy_configs: dict | None = None): # config를 인자로 받도록 수정
         self.client = client
+        self.config = config # config 객체를 저장
         self.fear_and_greed_index = 50
         self.macro_analyzer = MacroAnalyzer()
         self.strategy_configs = strategy_configs or {}
