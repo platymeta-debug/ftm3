@@ -214,36 +214,49 @@ class OptoRunner(Strategy):
     + 리스크 기반 포지션 사이징(상대 크기)
     """
 
-    # ====== 실행정책(최적화 대상) ======
+    # 실행정책
     open_threshold = 12.0
     risk_reward_ratio = 2.0
     sl_atr_multiplier = 1.5
     trend_entry_confirm_count = 3
     risk_per_trade = 0.01
     
-    # ====== TrendStrategy 파라미터(최적화 대상) ======
+    # TrendStrategy
     ema_short = 20
     ema_long = 50
-    score_strong_trend = 5
+    score_strong_trend = 5 # <-- 누락되었던 파라미터
 
-    # --- ▼▼▼ [개선안 1] '눌림목 매수'를 위한 파라미터 추가 ▼▼▼ ---
-    rsi_dip_threshold = 25 # 강세장에서 이 RSI 값 이하로 떨어지면 '눌림목'으로 간주
-    
-    # ====== OscillatorStrategy 파라미터(최적화 대상) ======
+    # OscillatorStrategy
     rsi_period = 14
     rsi_oversold = 30
-    score_oversold = 5
-    
-    # --- ▼▼▼ [핵심 수정] 누락된 ComprehensiveStrategy 파라미터 추가 ▼▼▼ ---
-    score_macd_cross_up = 2
+    score_oversold = 5 # <-- 누락되었던 파라미터
+
+    # ComprehensiveStrategy
+    score_macd_cross_up = 2 # <-- 누락되었던 파라미터
     adx_threshold = 25
-    score_adx_strong = 3
-    score_bb_breakout_up = 4
-    score_chop_trending = 3
-    stochrsi_oversold = 20
-    score_stochrsi_oversold = 3
-    score_trix_cross_up = 4
-    # --- ▲▲▲ [핵심 수정] ---
+    score_adx_strong = 3 # <-- 누락되었던 파라미터
+    
+    # VolatilityStrategy
+    bb_len = 20
+    bb_std = 2.0
+    kc_len = 20
+    kc_atr_mult = 2.0
+    score_squeeze_breakout_up = 5
+
+    # CounterTrendStrategy
+    williams_period = 14
+    williams_overbought = -20
+    williams_oversold = -80
+    score_counter_buy = 4
+
+    # MomentumStrategy
+    roc_threshold = 0.5
+    score_momentum_buy = 3
+
+    # OrderBlockStrategy
+    lookback_period = 10
+    volume_factor = 1.5
+    score_bullish_ob = 6
 
     # (최적화 대상이 아닌 고정값들)
     exec_partial = "1.0"
@@ -269,54 +282,37 @@ class OptoRunner(Strategy):
         # 분석 엔진 초기화
         strategy_configs = {
             "TrendStrategy": {
-                "enabled": True,
-                "ema_short": int(self.ema_short),
-                "ema_long": int(self.ema_long),
-                "score_strong_trend": int(self.score_strong_trend),
+                "enabled": True, "ema_short": int(self.ema_short), "ema_long": int(self.ema_long), 
+                "score_strong_trend": int(self.score_strong_trend)
             },
             "OscillatorStrategy": {
-                "enabled": True,
-                "rsi_period": int(self.rsi_period),
-                "rsi_oversold": int(self.rsi_oversold),
-                "rsi_overbought": 100 - int(self.rsi_oversold),      # 동적으로 계산
-                "score_oversold": int(self.score_oversold),
-                "score_overbought": -int(self.score_oversold),     # 동적으로 계산
-                # (이하 기본값 유지)
-                "stoch_k": 14, "stoch_d": 3, "stoch_smooth_k": 3,
-                "mfi_period": 14, "obv_ema_period": 20,
-                "stoch_oversold": 20, "stoch_overbought": 80,
-                "mfi_oversold": 20, "mfi_overbought": 80,
-                "score_inflow": 2, "score_outflow": -2,
+                "enabled": True, "rsi_period": int(self.rsi_period), "rsi_oversold": int(self.rsi_oversold), 
+                "score_oversold": int(self.score_oversold)
             },
             "ComprehensiveStrategy": {
-                "enabled": True,
-                "score_macd_cross_up": int(self.score_macd_cross_up),
-                "score_macd_cross_down": -int(self.score_macd_cross_up), # 동적으로 계산
-                "adx_threshold": int(self.adx_threshold),
-                "score_adx_strong": int(self.score_adx_strong),
-                "score_bb_breakout_up": int(self.score_bb_breakout_up),
-                "score_bb_breakout_down": -int(self.score_bb_breakout_up), # 동적으로 계산
-                "score_chop_trending": int(self.score_chop_trending),
-                "stochrsi_oversold": int(self.stochrsi_oversold),
-                "stochrsi_overbought": 100 - int(self.stochrsi_oversold), # 동적으로 계산
-                "score_stochrsi_oversold": int(self.score_stochrsi_oversold),
-                "score_stochrsi_overbought": -int(self.score_stochrsi_oversold), # 동적으로 계산
-                "score_trix_cross_up": int(self.score_trix_cross_up),
-                "score_trix_cross_down": -int(self.score_trix_cross_up), # 동적으로 계산
-                # (이하 기본값 유지)
-                "score_ichimoku_bull": 4, "score_ichimoku_bear": -4,
-                "score_psar_bull": 3, "score_psar_bear": -3,
-                "score_vortex_bull": 2, "score_vortex_bear": -2,
-                "bb_len": 20, "bb_std": 2.0, "score_bb_squeeze": 3,
-                "cci_length": 20, "cci_constant": 0.015,
-                "cci_overbought": 100, "cci_oversold": -100,
-                "score_cci_overbought": -3, "score_cci_oversold": 3,
-                "score_cmf_positive": 2, "score_cmf_negative": -2,
-                "chop_sideways_th": 60, "score_chop_sideways": -3,
-                "score_efi_cross_up": 3, "score_efi_cross_down": -3,
-                "score_kc_breakout_up": 4, "score_kc_breakout_down": -4,
-                "score_ppo_bull": 2, "score_ppo_bear": -2,
+                "enabled": True, "adx_threshold": int(self.adx_threshold), 
+                "score_macd_cross_up": int(self.score_macd_cross_up), "score_adx_strong": int(self.score_adx_strong)
             },
+            "VolatilityStrategy": {
+                "enabled": True, "bb_len": int(self.bb_len), "bb_std": float(self.bb_std), 
+                "kc_len": int(self.kc_len), "kc_atr_mult": float(self.kc_atr_mult), 
+                "score_squeeze_breakout_up": int(self.score_squeeze_breakout_up), 
+                "score_squeeze_breakout_down": -int(self.score_squeeze_breakout_up)
+            },
+            "CounterTrendStrategy": {
+                "enabled": True, "williams_period": int(self.williams_period), 
+                "williams_overbought": int(self.williams_overbought), "williams_oversold": int(self.williams_oversold), 
+                "score_counter_buy": int(self.score_counter_buy), "score_counter_sell": -int(self.score_counter_buy)
+            },
+            "MomentumStrategy": {
+                "enabled": True, "roc_threshold": float(self.roc_threshold), 
+                "score_momentum_buy": int(self.score_momentum_buy), "score_momentum_sell": -int(self.score_momentum_buy)
+            },
+            "OrderBlockStrategy": {
+                "enabled": True, "lookback_period": int(self.lookback_period), 
+                "volume_factor": float(self.volume_factor), "score_bullish_ob": int(self.score_bullish_ob), 
+                "score_bearish_ob": -int(self.score_bullish_ob)
+            }
         }
         temp_config = ConfigManager()
         self.engine = ConfluenceEngine(Client("", ""), config=temp_config, strategy_configs=strategy_configs)
@@ -524,37 +520,39 @@ class OptoRunner(Strategy):
 
     # ---- 백테스트 루프 ----
     def next(self):
+        # ▼▼▼ [핵심 수정] 오류를 유발하는 불필요한 코드를 모두 제거한 최종 버전입니다. ▼▼▼
         idx = len(self.data) - 1
         cur_indicators = self.indicators.iloc[:idx + 1]
+
         if len(cur_indicators) < int(self.trend_entry_confirm_count):
             return
 
-        current_score, _ = self.engine._calculate_tactical_score(cur_indicators)
+        # 1. 현재 market_regime에 맞는 전략 목록을 가져옴
+        strategies_for_regime = self.engine._get_strategies_for_regime(self.market_regime)
+        
+        # 2. 전략 목록을 인자로 전달하여 점수 계산
+        current_score, _ = self.engine._calculate_tactical_score(cur_indicators, strategies_for_regime)
+        
         self._recent_scores.append(current_score)
         if len(self._recent_scores) < int(self.trend_entry_confirm_count):
             return
-
-        avg_score = sum(self._recent_scores) / len(self._recent_scores)
         
-        # 진입 판단
+        avg_score = sum(self._recent_scores) / len(self._recent_scores)
         side = None
-        # 1. 기존의 추세추종 진입 로직
+
         if self.market_regime == "BULL" and avg_score >= float(self.open_threshold):
             side = "BUY"
         elif self.market_regime == "BEAR" and avg_score <= -float(self.open_threshold):
             side = "SELL"
-            
-        # 2. 새로운 '눌림목 매수' 진입 로직 (강세장에서만 작동)
-        if self.market_regime == "BULL" and not self._in_pos:
-            last_rsi = self.indicators.iloc[idx].get(f"RSI_{self.rsi_period}", 50)
-            if last_rsi <= self.rsi_dip_threshold:
-                side = "BUY" # 기존 신호와 상관없이 강력한 매수 신호로 간주
-                print(f"[{self.data.index[-1].date()}] 눌림목 매수 기회 포착! (RSI: {last_rsi:.2f})")
+        elif self.market_regime == "SIDEWAYS":
+            if current_score >= float(self.open_threshold):
+                side = "BUY" 
+            elif current_score <= -float(self.open_threshold):
+                side = "SELL"
 
-        if (not self._in_pos) and side:
+        if not self._in_pos and side:
             self._maybe_enter(side)
-
-        # 보유 중 관리 로직 (기존과 동일)
+            
         if self._in_pos:
             self._maybe_trailing()
             self._maybe_exit_by_tp()
@@ -616,36 +614,43 @@ def run_backtest_with_params(df_capitalized: pd.DataFrame, params: dict, initial
 
 
 def get_param_spaces():
-    """확장된 탐색 공간: VolatilityStrategy의 주요 지표 포함"""
+    """확장된 탐색 공간: 신규 전략 3종의 파라미터 포함"""
     return {
         # 실행정책
-        "open_threshold":       {"type":"int", "choices":[10, 12, 14, 16]},
-        "risk_reward_ratio":    {"type":"float", "low":1.5, "high":3.0},
-        "sl_atr_multiplier":    {"type":"float", "low":1.2, "high":2.5},
-        "trend_entry_confirm_count": {"type":"int", "choices":[2, 3, 4]},
+        "open_threshold":       {"type":"int", "choices":[10, 12, 15, 18]},
+        "risk_reward_ratio":    {"type":"float", "low":1.5, "high":3.5},
+        "sl_atr_multiplier":    {"type":"float", "low":1.2, "high":3.0},
+        "trend_entry_confirm_count": {"type":"int", "choices":[2, 3]},
         "risk_per_trade":       {"type":"float", "low":0.005, "high":0.02},
 
         # TrendStrategy
-        "ema_short":            {"type":"int", "low":10, "high":25},
-        "ema_long":             {"type":"int", "low":40, "high":80},
-        "score_strong_trend":   {"type":"int", "choices":[3, 4, 5]},
-
+        "ema_short":            {"type":"int", "low":10, "high":30},
+        "ema_long":             {"type":"int", "low":40, "high":90},
+        
         # OscillatorStrategy
-        "rsi_period":           {"type":"int", "choices":[14]},
         "rsi_oversold":         {"type":"int", "low":20, "high":35},
-        "score_oversold":       {"type":"int", "choices":[3, 4, 5]},
 
         # ComprehensiveStrategy
-        "score_macd_cross_up":  {"type":"int", "choices":[2, 3]},
-        "adx_threshold":        {"type":"int", "low":18, "high":28},
-        "score_adx_strong":     {"type":"int", "choices":[2, 3]},
+        "adx_threshold":        {"type":"int", "low":18, "high":30},
 
-        # VolatilityStrategy (신규 추가)
+        # VolatilityStrategy
         "bb_len":               {"type":"int", "choices":[20, 30]},
         "bb_std":               {"type":"float", "low":2.0, "high":2.5},
-        "kc_len":               {"type":"int", "choices":[20]},
-        "kc_atr_mult":          {"type":"float", "low":1.5, "high":2.5},
-        "score_squeeze_breakout_up": {"type":"int", "choices":[4, 5, 6]},
+
+        # CounterTrendStrategy (신규)
+        "williams_period":      {"type":"int", "choices":[14, 28]},
+        "williams_overbought":  {"type":"int", "low":-25, "high":-15},
+        "williams_oversold":    {"type":"int", "low":-85, "high":-75},
+        "score_counter_buy":    {"type":"int", "choices":[3, 4, 5]},
+
+        # MomentumStrategy (신규)
+        "roc_threshold":        {"type":"float", "low":0.1, "high":1.0},
+        "score_momentum_buy":   {"type":"int", "choices":[2, 3, 4]},
+        
+        # OrderBlockStrategy (신규)
+        "lookback_period":      {"type":"int", "low":8, "high":20},
+        "volume_factor":        {"type":"float", "low":1.5, "high":2.5},
+        "score_bullish_ob":     {"type":"int", "choices":[5, 6, 7]},
     }
 
 
@@ -713,7 +718,7 @@ if __name__ == '__main__':
             continue
         periods_by_regime = collapse_regimes_to_periods(klines, macro_preloaded, config)
 
-         for regime in ["BULL", "BEAR", "SIDEWAYS"]:
+        for regime in ["BULL", "BEAR", "SIDEWAYS"]:
             episodes = periods_by_regime.get(regime, [])
             if not episodes: print(f"\n[SKIP] {symbol}/{regime}: 분석할 데이터 구간이 없습니다."); continue
             
