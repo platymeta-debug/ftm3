@@ -14,10 +14,9 @@ project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 if project_root not in sys.path:
     sys.path.insert(0, project_root)
 
-from backtesting.lib import FractionalBacktest # FractionalBacktest 임포트
-# ▲▲▲ [수정] ▲▲▲
-
-from local_backtesting.backtest_runner import StrategyRunner
+from backtesting.lib import FractionalBacktest
+# 'StrategyRunner'는 backtest_optimizer.py에 'OptoRunner'로 정의되어 있습니다.
+from local_backtesting.backtest_optimizer import OptoRunner as StrategyRunner
 from local_backtesting.performance_visualizer import create_performance_report
 from analysis.data_fetcher import fetch_klines
 from database.models import Trade
