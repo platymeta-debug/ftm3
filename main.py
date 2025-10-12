@@ -5,6 +5,7 @@ from discord.ext import commands
 from binance.client import Client
 import asyncio
 import os
+import time
 from dotenv import load_dotenv
 
 # 1. 핵심 모듈 임포트 (클래스만 가져오기)
@@ -35,6 +36,25 @@ class FTM3Bot(commands.Bot):
         self.db_manager = db_manager
 
         try:
+            # --- ▼▼▼ [최종 수정] 올바른 시간 동기화 로직 적용 ▼▼▼ ---
+            self.binance_client = Client(
+                self.config.api_key,
+                self.config.api_secret,
+                testnet=self.config.is_testnet
+            )
+
+            if self.config.is_testnet:
+                self.binance_client.FUTURES_URL = 'https://testnet.binancefuture.com'
+
+            # 클라이언트 생성 후, 시간 오차 보정 및 수신 창 확대 설정
+            self.binance_client.recv_window = 60000
+            server_time = self.binance_client.get_server_time()['serverTime']
+            time_offset = server_time - int(time.time() * 1000)
+            self.binance_client.timestamp_offset = time_offset
+            print(f"✅ 바이낸스 시간 동기화 완료 (Offset: {time_offset}ms, RecvWindow: {self.binance_client.recv_window}ms)")
+            # --- ▲▲▲ [최종 수정] ---
+
+
             self.binance_client = Client(self.config.api_key, self.config.api_secret, testnet=self.config.is_testnet)
             if self.config.is_testnet:
                 self.binance_client.FUTURES_URL = 'https://testnet.binancefuture.com'
