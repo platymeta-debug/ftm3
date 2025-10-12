@@ -758,25 +758,43 @@ if __name__ == '__main__':
             try: final_bt.plot(open_browser=False, filename=html_path); print(f"   🧾 리포트 저장 완료: {html_path}")
             except Exception as e: print(f"   [WARN] HTML 리포트 생성 실패: {e}")
 
+            # ... (HTML 리포트 저장 코드 바로 다음부터) ...
+
+
+            # ▼▼▼ [핵심 수정] JSON 파일 저장 로직 수정 ▼▼▼
+            # 1. optimal_settings.json 저장 (실행 파라미터)
             all_settings.setdefault(regime, {})[symbol] = {
-                "OPEN_TH": int(best_params_dict.get("open_threshold")), "RR_RATIO": float(best_params_dict.get("risk_reward_ratio")), "SL_ATR_MULTIPLIER": float(best_params_dict.get("sl_atr_multiplier")), "TREND_ENTRY_CONFIRM_COUNT": int(best_params_dict.get("trend_entry_confirm_count")), "risk_per_trade": float(best_params_dict.get("risk_per_trade")),
+                "OPEN_TH": int(best_params_dict.get("open_threshold")), 
+                "RR_RATIO": float(best_params_dict.get("risk_reward_ratio")), 
+                "SL_ATR_MULTIPLIER": float(best_params_dict.get("sl_atr_multiplier")), 
+                "TREND_ENTRY_CONFIRM_COUNT": int(best_params_dict.get("trend_entry_confirm_count")), 
+                "risk_per_trade": float(best_params_dict.get("risk_per_trade")),
                 "OPTIMIZED_METRIC_SCORE": round(metric_value, 4),
                 "SUMMARY": {k: v for k, v in _to_jsonable_dict(stats_eval.to_dict()).items() if isinstance(v, (int, float, bool, str, type(None)))}
             }
             with open(optimal_settings_file, 'w', encoding='utf-8') as f:
                 json.dump(all_settings, f, indent=4, ensure_ascii=False)
 
-            base_strategies = {"TrendStrategy": {}, "OscillatorStrategy": {}, "ComprehensiveStrategy": {}}
-            for k, v in best_params_dict.items():
-                if k in ["ema_short", "ema_long", "score_strong_trend"]: base_strategies["TrendStrategy"][k] = v
-                elif k in ["rsi_period", "rsi_oversold", "score_oversold"]: base_strategies["OscillatorStrategy"][k] = v
-                elif k not in BEST_PARAM_KEYS: base_strategies["ComprehensiveStrategy"][k] = v
+            # 2. strategies_optimized.json 저장 (전략 지표 파라미터)
+            # regime (BULL, BEAR, SIDEWAYS) 아래에 각 전략의 파라미터를 저장하도록 구조 명확화
+            all_strategies.setdefault(regime, {})
             
-            if "rsi_oversold" in base_strategies["OscillatorStrategy"]:
-                base_strategies["OscillatorStrategy"]["rsi_overbought"] = 100 - base_strategies["OscillatorStrategy"]["rsi_oversold"]
-            all_strategies[regime] = base_strategies
+            STRATEGY_PARAM_MAP = {
+                "TrendStrategy": ["ema_short", "ema_long", "score_strong_trend"],
+                "OscillatorStrategy": ["rsi_period", "rsi_oversold", "score_oversold"],
+                "ComprehensiveStrategy": ["adx_threshold", "score_macd_cross_up", "score_adx_strong"],
+                "VolatilityStrategy": ["bb_len", "bb_std", "kc_len", "kc_atr_mult", "score_squeeze_breakout_up"],
+                "CounterTrendStrategy": ["williams_period", "williams_overbought", "williams_oversold", "score_counter_buy"],
+                "MomentumStrategy": ["roc_threshold", "score_momentum_buy"],
+                "OrderBlockStrategy": ["lookback_period", "volume_factor", "score_bullish_ob"],
+            }
             
+            for strat_name, params_list in STRATEGY_PARAM_MAP.items():
+                params_for_strat = {p: best_params_dict[p] for p in params_list if p in best_params_dict}
+                all_strategies[regime][strat_name] = params_for_strat
+
             with open(strategies_optimized_file, 'w', encoding='utf-8') as f:
                 json.dump(_to_jsonable_dict(all_strategies), f, indent=2, ensure_ascii=False)
             
             print(f"   💾 저장 완료 → {optimal_settings_file}, {strategies_optimized_file}")
+            # ▲▲▲ [핵심 수정] ▲▲▲
