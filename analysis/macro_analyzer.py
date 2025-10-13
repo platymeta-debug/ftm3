@@ -1,10 +1,9 @@
-# analysis/macro_analyzer.py (Phase 3, hotfix-2, full)
-# - 리스크 중복 캡 (MOVE 주도 시 VIX 음수 캡핑)
-# - 자산군 "스냅샷" 일원화(현재가/일변화 기준시각 통일)
-# - 임계/윈도우 현실화(2020–2025 분포 반영)
-# - DataFrame/Series 진릿값 모호성 제거(or, .loc[scalar.name] 제거)
-# - analyze_for_date(): Series 구간 .iloc[pos] 일원화
-# - DXY 스냅샷 포함, FRED 시리즈 폴백 보강
+# analysis/macro_analyzer.py (최종 안정화 버전)
+# - 진릿값 모호성(ValueError) 원천 차단: 과거/당일 인덱스 pad → iloc[pos] 일원화
+# - 결측/휴일/미래일 처리 보강, 중복 인덱스 제거
+# - 스냅샷 기준시각 일원화(전 지표 동일 기준일 평가)
+# - FRED API 비활성 시 자동 우회
+# - 리스크 계열 중복 캡(VIX vs MOVE)
 
 from __future__ import annotations
 
@@ -22,7 +21,16 @@ try:
 except ImportError:
     Fred = None
 
+# --- [안정성 강화] ---
+# yfinance와 FRED의 데이터 조회 실패에 대비한 안정적인 티커 리스트
 DOLLAR_TICKERS = ("DX-Y.NYB", "DX=F", "^NYICDX")
+# FRED의 공식 Series ID 사용
+FRED_TICKERS = {
+    "hy_spread": "BAMLH0A0HYM2", "t10y2y": "T10Y2Y", "m2": "M2SL",
+    "sentiment": "UMCSENT", "ism": "GACDISA066MSFRBNY", "housing": "HOUST",
+    "move": "DGS10", "unrate": "UNRATE", "tga": "WTREGEN",
+    "retail": "RSAFS", "indpro": "INDPRO"
+}
 
 # =========================================================
 # 공용 타입
@@ -55,12 +63,25 @@ class PriceSnapshot:
 
     @staticmethod
     def _normalize_daily(df: pd.DataFrame) -> pd.DataFrame:
+        """일봉 인덱스 표준화 + 중복/미래 제거."""
         if df is None or df.empty:
-            return df
+            return pd.DataFrame()
         out = df.copy()
         out.index = pd.to_datetime(out.index).tz_localize(None).normalize()
+        out = out[~out.index.duplicated(keep='first')]
+        out = out[out.index <= datetime.now()]
         out.index.name = "Date"
         return out
+
+    @staticmethod
+    def _get_position_before_date(df: pd.DataFrame, day: pd.Timestamp) -> Optional[int]:
+        if df is None or df.empty:
+            return None
+        try:
+            pos = df.index.get_indexer([day], method="pad")[0]
+            return int(pos) if pos != -1 else None
+        except Exception:
+            return None
 
     def take(self, symbols: Iterable[str], period: str = "2y", interval: str = "1d") -> None:
         last_dates = []
@@ -75,6 +96,7 @@ class PriceSnapshot:
                 continue
         if last_dates:
             s = pd.Series(last_dates).dt.normalize()
+            # 가장 흔한(모드) 날짜를 스냅샷 기준일로 사용
             self.snapshot_date = s.mode().iloc[0]
 
     def get_df(self, symbol: str) -> Optional[pd.DataFrame]:
@@ -120,7 +142,7 @@ class MacroAnalyzer:
         self.snapshot.take(self.config.snapshot_symbols)
         if self.snapshot.snapshot_date is not None:
             print(f"🕒 Price Snapshot date = {self.snapshot.snapshot_date.date()}")
-        print("📈 MacroAnalyzer ready (17-factor model, v3).")
+        print("📈 MacroAnalyzer ready (17-factor model, v-final).")
 
     # ------------------------
     # 내부 헬퍼
@@ -137,14 +159,16 @@ class MacroAnalyzer:
     def _get_yf(self, ticker: str, period: str = "10y", interval: str = "1d") -> Optional[pd.DataFrame]:
         snap_df = self.snapshot.get_df(ticker)
         if snap_df is not None and not snap_df.empty:
+            snap_df = snap_df[~snap_df.index.duplicated(keep='first')]
             return snap_df
         try:
             df = yf.download(ticker, period=period, interval=interval, progress=False, auto_adjust=False)
             if df is None or df.empty:
                 return None
-            return self._normalize_daily_index(df)
-        except Exception as e:
-            print(f"🚨 yfinance 실패({ticker}): {e}")
+            df = self._normalize_daily_index(df)
+            df = df[~df.index.duplicated(keep='first')]
+            return df
+        except Exception:
             return None
 
     def _get_fred_series(self, series_id: str, start: str = "2010-01-01") -> Optional[pd.Series]:
@@ -165,13 +189,6 @@ class MacroAnalyzer:
             df = self._get_yf(t)
             if df is not None and not df.empty:
                 return df
-        return None
-
-    def _try_fred(self, *series_ids: str) -> Optional[pd.Series]:
-        for sid in series_ids:
-            s = self._get_fred_series(sid)
-            if s is not None and len(s) > 0:
-                return s
         return None
 
     # =========================================================
@@ -214,10 +231,7 @@ class MacroAnalyzer:
         data = self._try_yf(*DOLLAR_TICKERS)
         if data is None or len(data) < 100:
             return 0, "데이터 부족"
-
         data["SMA_100"] = data["Close"].rolling(100).mean()
-
-        # 스냅샷 기준으로 동일 시점 행 선택(3종 순회)
         last = None
         for sym in DOLLAR_TICKERS:
             last = self.snapshot.last_row(sym)
@@ -225,9 +239,8 @@ class MacroAnalyzer:
                 break
         if last is None:
             last = data.iloc[-1]
-
         return (4, "달러 약세") if last["Close"].item() < last["SMA_100"].item() else (-4, "달러 강세")
-    
+
     def analyze_inflation_proxy(self) -> Tuple[int, str]:  # 5. 인플레이션 (유가)
         data = self._get_yf("CL=F")
         if data is None or len(data) < 100:
@@ -265,14 +278,17 @@ class MacroAnalyzer:
         sma_12m = s.rolling(12).mean()
         return (3, "개선") if s.iloc[-1] > sma_12m.iloc[-1] else (-3, "악화")
 
-    def analyze_manufacturing_pmi(self) -> Tuple[int, str]:
+    def analyze_manufacturing_pmi(self) -> Tuple[int, str]:  # 9. 제조업(ISM 대용)
         s = self._get_fred_series("GACDISA066MSFRBNY")  # Empire State headline
         if s is None or len(s) < 12:
             return 0, "데이터 부족/FRED 비활성"
         v = s.iloc[-1]
-        if v >= 10:   return 4, "확장 (강)"
-        if 0 <= v < 10:  return 2, "완만한 확장"
-        if v <= -10:  return -4, "수축 (강)"
+        if v >= 10:
+            return 4, "확장 (강)"
+        if 0 <= v < 10:
+            return 2, "완만한 확장"
+        if v <= -10:
+            return -4, "수축 (강)"
         return -2, "경계 (약수축)"
 
     def analyze_housing_market(self) -> Tuple[int, str]:  # 10. 주택
@@ -282,13 +298,11 @@ class MacroAnalyzer:
         sma_12m = s.rolling(12).mean()
         return (3, "개선") if s.iloc[-1] > sma_12m.iloc[-1] else (-3, "악화")
 
-    def analyze_bond_volatility(self) -> Tuple[int, str]:
+    def analyze_bond_volatility(self) -> Tuple[int, str]:  # 11. 선행변동성(MOVE 프록시)
         s = self._get_fred_series("DGS10")
         if s is None or len(s) < 40:
             return 0, "데이터 부족/FRED 비활성"
-        # 20일 표준편차 × 100 (≈ bps 변동성 프록시)
-        vol_20 = s.diff().rolling(20).std().iloc[-1] * 100.0
-        # 휴리스틱 임계값 (최근 5년 분포 감안): ~8bps, ~12bps
+        vol_20 = s.diff().rolling(20).std().iloc[-1] * 100.0  # ≈ bps 변동성
         if vol_20 >= 12:
             return -6, "채권 변동성 급등(프록시)"
         if vol_20 >= 8:
@@ -529,7 +543,7 @@ class MacroAnalyzer:
                 if pd.notna(sma_12m):
                     scores["소비심리(UMCSENT)"] = 3 if v > sma_12m else -3
 
-        # 9. 제조업(ISM)
+        # 9. 제조업(ISM 대용)
         s = macro_data.get("ism")
         val = last_le(s, day)
         if val is not None:
@@ -553,7 +567,7 @@ class MacroAnalyzer:
                 if pd.notna(sma_12m):
                     scores["주택시장(HOUST)"] = 3 if v > sma_12m else -3
 
-        # 11. 선행변동성(MOVE)
+        # 11. 선행변동성(MOVE 프록시)
         s = macro_data.get("move")
         val = last_le(s, day)
         if val is not None and isinstance(s, pd.Series) and len(s.loc[:day]) >= 20:
