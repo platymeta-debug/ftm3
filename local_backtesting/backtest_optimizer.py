@@ -46,6 +46,14 @@ from analysis.confluence_engine import ConfluenceEngine
 from analysis.macro_analyzer import MacroAnalyzer, MacroRegime, MacroState # MacroState 추가
 from analysis.risk_sizing import calc_order_qty
 from core.config_manager import ConfigManager
+from analysis import indicator_calculator
+from analysis.strategies.trend_strategy import TrendStrategy
+from analysis.strategies.oscillator_strategy import OscillatorStrategy
+from analysis.strategies.comprehensive_strategy import ComprehensiveStrategy
+from analysis.strategies.volatility_strategy import VolatilityStrategy
+from analysis.strategies.counter_trend_strategy import CounterTrendStrategy
+from analysis.strategies.momentum_strategy import MomentumStrategy
+from analysis.strategies.order_block_strategy import OrderBlockStrategy
 #from core.config_manager import config
 
 # (선택형 최적화기)
@@ -227,64 +235,63 @@ def segment_data_by_regime(klines_df: pd.DataFrame, macro_data: dict) -> dict:
 
 class OptoRunner(Strategy):
     """
-    분석(ConfluenceEngine) + 실행정책 시뮬(부분익절/타임스탑/트레일링)
-    + 리스크 기반 포지션 사이징(상대 크기)
+    최적화 파라미터를 직접 받아 기술적 분석 전략들의 점수를 합산하는 경량화된 백테스팅 전략.
+    ConfluenceEngine에 대한 의존성을 제거하여 속도를 극대화.
     """
 
-    # 실행정책
+    # --- 최적화 대상 파라미터 (실행정책) ---
     open_threshold = 12.0
     risk_reward_ratio = 2.0
     sl_atr_multiplier = 1.5
     trend_entry_confirm_count = 3
     risk_per_trade = 0.01
-    
+
+    # ▼▼▼ [수정] 누락된 실행 정책 파라미터(기본값) 추가 ▼▼▼
+    exec_partial = "1.0"
+    exec_time_stop_bars = 0
+    exec_trailing_mode = "off"
+    exec_trailing_k = 0.0
+    max_exposure_frac = 0.30
+    # ▲▲▲ [수정] ▲▲▲
+
+    # --- 최적화 대상 파라미터 (전략 지표) ---
     # TrendStrategy
     ema_short = 20
     ema_long = 50
-    score_strong_trend = 5 # <-- 누락되었던 파라미터
-
+    score_strong_trend = 5
     # OscillatorStrategy
     rsi_period = 14
     rsi_oversold = 30
-    score_oversold = 5 # <-- 누락되었던 파라미터
-
+    score_oversold = 5
     # ComprehensiveStrategy
-    score_macd_cross_up = 2 # <-- 누락되었던 파라미터
+    score_macd_cross_up = 2
     adx_threshold = 25
-    score_adx_strong = 3 # <-- 누락되었던 파라미터
-    
+    score_adx_strong = 3
     # VolatilityStrategy
     bb_len = 20
     bb_std = 2.0
     kc_len = 20
     kc_atr_mult = 2.0
     score_squeeze_breakout_up = 5
-
     # CounterTrendStrategy
     williams_period = 14
     williams_overbought = -20
     williams_oversold = -80
     score_counter_buy = 4
-
     # MomentumStrategy
     roc_threshold = 0.5
     score_momentum_buy = 3
-
     # OrderBlockStrategy
     lookback_period = 10
     volume_factor = 1.5
     score_bullish_ob = 6
 
-    # (최적화 대상이 아닌 고정값들)
-    exec_partial = "1.0"
-    exec_time_stop_bars = 0
-    exec_trailing_mode = "off"
-    exec_trailing_k = 0.0
-    max_exposure_frac = 0.30
+    # --- 고정값 ---
     symbol = "BTCUSDT"
     market_regime = "BULL"
 
-    # ====== 상태 변수 ======
+    # --- 상태 변수 ---
+    _strategies: list
     _recent_scores: deque
     _in_pos: bool
     _side: str
@@ -294,59 +301,49 @@ class OptoRunner(Strategy):
     _tp_plan: list
     _bars_held: int
 
+    # ▼▼▼ 미리 계산된 지표를 전달받을 클래스 변수 추가 ▼▼▼
+    indicators_df = None
+    # ▲▲▲
+
     def init(self):
-        # --- ▼▼▼ [최종 수정] 동적 계산 로직 적용 ▼▼▼ ---
-        # 분석 엔진 초기화
-        strategy_configs = {
-            "TrendStrategy": {
-                "enabled": True, "ema_short": int(self.ema_short), "ema_long": int(self.ema_long), 
-                "score_strong_trend": int(self.score_strong_trend)
-            },
-            "OscillatorStrategy": {
-                "enabled": True, "rsi_period": int(self.rsi_period), "rsi_oversold": int(self.rsi_oversold), 
-                "score_oversold": int(self.score_oversold)
-            },
-            "ComprehensiveStrategy": {
-                "enabled": True, "adx_threshold": int(self.adx_threshold), 
-                "score_macd_cross_up": int(self.score_macd_cross_up), "score_adx_strong": int(self.score_adx_strong)
-            },
-            "VolatilityStrategy": {
-                "enabled": True, "bb_len": int(self.bb_len), "bb_std": float(self.bb_std), 
-                "kc_len": int(self.kc_len), "kc_atr_mult": float(self.kc_atr_mult), 
-                "score_squeeze_breakout_up": int(self.score_squeeze_breakout_up), 
-                "score_squeeze_breakout_down": -int(self.score_squeeze_breakout_up)
-            },
-            "CounterTrendStrategy": {
-                "enabled": True, "williams_period": int(self.williams_period), 
-                "williams_overbought": int(self.williams_overbought), "williams_oversold": int(self.williams_oversold), 
-                "score_counter_buy": int(self.score_counter_buy), "score_counter_sell": -int(self.score_counter_buy)
-            },
-            "MomentumStrategy": {
-                "enabled": True, "roc_threshold": float(self.roc_threshold), 
-                "score_momentum_buy": int(self.score_momentum_buy), "score_momentum_sell": -int(self.score_momentum_buy)
-            },
-            "OrderBlockStrategy": {
-                "enabled": True, "lookback_period": int(self.lookback_period), 
-                "volume_factor": float(self.volume_factor), "score_bullish_ob": int(self.score_bullish_ob), 
-                "score_bearish_ob": -int(self.score_bullish_ob)
-            }
+        """
+        백테스트 시작 시 한 번만 호출됩니다.
+        현재 최적화 run의 파라미터를 사용하여 모든 전략 객체를 직접 생성합니다.
+        """
+        # 각 전략에 필요한 파라미터를 딕셔너리 형태로 구성
+        strategy_params = {
+            "TrendStrategy": {"enabled": True, "ema_short": int(self.ema_short), "ema_long": int(self.ema_long), "score_strong_trend": int(self.score_strong_trend)},
+            "OscillatorStrategy": {"enabled": True, "rsi_period": int(self.rsi_period), "rsi_oversold": int(self.rsi_oversold), "score_oversold": int(self.score_oversold)},
+            "ComprehensiveStrategy": {"enabled": True, "adx_threshold": int(self.adx_threshold), "score_macd_cross_up": int(self.score_macd_cross_up), "score_adx_strong": int(self.score_adx_strong)},
+            "VolatilityStrategy": {"enabled": True, "bb_len": int(self.bb_len), "bb_std": float(self.bb_std), "kc_len": int(self.kc_len), "kc_atr_mult": float(self.kc_atr_mult), "score_squeeze_breakout_up": int(self.score_squeeze_breakout_up), "score_squeeze_breakout_down": -int(self.score_squeeze_breakout_up)},
+            "CounterTrendStrategy": {"enabled": True, "williams_period": int(self.williams_period), "williams_overbought": int(self.williams_overbought), "williams_oversold": int(self.williams_oversold), "score_counter_buy": int(self.score_counter_buy), "score_counter_sell": -int(self.score_counter_buy)},
+            "MomentumStrategy": {"enabled": True, "roc_threshold": float(self.roc_threshold), "score_momentum_buy": int(self.score_momentum_buy), "score_momentum_sell": -int(self.score_momentum_buy)},
+            "OrderBlockStrategy": {"enabled": True, "lookback_period": int(self.lookback_period), "volume_factor": float(self.volume_factor), "score_bullish_ob": int(self.score_bullish_ob), "score_bearish_ob": -int(self.score_bullish_ob)},
         }
-        temp_config = ConfigManager()
-        self.engine = ConfluenceEngine(Client("", ""), config=temp_config, strategy_configs=strategy_configs)
-        # --- ▲▲▲ [최종 수정] ---
-        # 지표 캐시
-        self.indicators = indicator_calculator.calculate_all_indicators(self.data.df)
 
-        # 점수 윈도우
+        # 전략 객체 리스트 생성
+        self._strategies = [
+            TrendStrategy(strategy_params["TrendStrategy"]),
+            OscillatorStrategy(strategy_params["OscillatorStrategy"]),
+            ComprehensiveStrategy(strategy_params["ComprehensiveStrategy"]),
+            VolatilityStrategy(strategy_params["VolatilityStrategy"]),
+            CounterTrendStrategy(strategy_params["CounterTrendStrategy"]),
+            MomentumStrategy(strategy_params["MomentumStrategy"]),
+            OrderBlockStrategy(strategy_params["OrderBlockStrategy"]),
+        ]
+
+        # 지표 계산 및 상태 변수 초기화
+        if OptoRunner.indicators_df is None:
+            self.indicators = indicator_calculator.calculate_all_indicators(self.data.df)
+        else:
+            self.indicators = self.indicators_df
         self._recent_scores = deque(maxlen=int(self.trend_entry_confirm_count))
-
-        # 실행 상태
         self._in_pos = False
         self._side = None
         self._entry_px = np.nan
         self._entry_atr = np.nan
         self._sl_px = np.nan
-        self._tp_plan = []  # [{"px":float,"qty":float,"done":False}, ...]
+        self._tp_plan = []
         self._bars_held = 0
 
         # exec_partial 파싱(상대 비율로 사용)
@@ -537,40 +534,48 @@ class OptoRunner(Strategy):
 
     # ---- 백테스트 루프 ----
     def next(self):
-        # ▼▼▼ [핵심 수정] 오류를 유발하는 불필요한 코드를 모두 제거한 최종 버전입니다. ▼▼▼
+        """
+        데이터가 한 칸씩 전진할 때마다 호출됩니다.
+        ConfluenceEngine 대신, init에서 생성된 전략 리스트를 직접 사용합니다.
+        """
+        # 현재까지의 데이터와 지표 준비
         idx = len(self.data) - 1
         cur_indicators = self.indicators.iloc[:idx + 1]
 
         if len(cur_indicators) < int(self.trend_entry_confirm_count):
             return
 
-        # 1. 현재 market_regime에 맞는 전략 목록을 가져옴
-        strategies_for_regime = self.engine._get_strategies_for_regime(self.market_regime)
-        
-        # 2. 전략 목록을 인자로 전달하여 점수 계산
-        current_score, _ = self.engine._calculate_tactical_score(cur_indicators, strategies_for_regime)
-        
+        # 1. 모든 활성 전략의 점수를 직접 합산
+        all_scores = {}
+        for strategy in self._strategies:
+            # 각 전략의 analyze 메서드에 현재까지의 데이터 전달
+            all_scores.update(strategy.analyze(cur_indicators))
+        current_score = sum(all_scores.values())
+
+        # 2. 최근 점수 기록 및 평균 계산
         self._recent_scores.append(current_score)
         if len(self._recent_scores) < int(self.trend_entry_confirm_count):
             return
-        
+
         avg_score = sum(self._recent_scores) / len(self._recent_scores)
         side = None
 
+        # 3. 진입/청산 로직 (기존과 동일)
         if self.market_regime == "BULL" and avg_score >= float(self.open_threshold):
             side = "BUY"
         elif self.market_regime == "BEAR" and avg_score <= -float(self.open_threshold):
             side = "SELL"
         elif self.market_regime == "SIDEWAYS":
             if current_score >= float(self.open_threshold):
-                side = "BUY" 
+                side = "BUY"
             elif current_score <= -float(self.open_threshold):
                 side = "SELL"
 
         if not self._in_pos and side:
             self._maybe_enter(side)
-            
+
         if self._in_pos:
+            # 포지션 관리 로직 (기존 코드가 별도 함수로 분리되어 있다면 그대로 작동)
             self._maybe_trailing()
             self._maybe_exit_by_tp()
             self._maybe_exit_by_sl()
@@ -763,6 +768,11 @@ if __name__ == '__main__':
                 if len(regime_train_df) < MIN_BARS: continue
 
                 print(f"      - [{regime}] 국면 최적화 중 ({len(regime_train_df)}개 데이터)...")
+                # ▼▼▼ 최적화 시작 전, 지표를 딱 한 번만 계산하는 코드 추가 ▼▼▼
+                print(f"        -> 지표 사전 계산 중...")
+                OptoRunner.indicators_df = indicator_calculator.calculate_all_indicators(regime_train_df)
+                print(f"        -> 지표 계산 완료. 베이지안 최적화 시작...")
+                # ▲▲▲
                 def objective(params):
                     if params.get("ema_short", 99) >= params.get("ema_long", 0): return -1e9
                     _, score, _ = run_backtest_with_params(regime_train_df, params, initial_cash, symbol, regime)
