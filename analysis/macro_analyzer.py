@@ -426,6 +426,24 @@ class MacroAnalyzer:
         return out
 
     def analyze_for_date(self, macro_data: Dict[str, Any], day: pd.Timestamp) -> Tuple[MacroState, Dict[str, int]]:
+        # --- 스칼라 보정 유틸: Series/DataFrame로 들어와도 안전하게 스칼라로 변환 ---
+        def _to_scalar(x):
+            try:
+                if isinstance(x, pd.DataFrame):
+                    # 단일 값으로 축약 가능한 경우 마지막 값을 사용
+                    if x.shape == (1, 1):
+                        x = x.iloc[0, 0]
+                        return x.item() if hasattr(x, "item") else x
+                    return x.squeeze()
+                if isinstance(x, pd.Series):
+                    x = x.squeeze()
+                    return x.item() if hasattr(x, "item") else (float(x) if x.ndim == 0 else x)
+                if hasattr(x, "item"):
+                    return x.item()
+            except Exception:
+                pass
+            return x
+
         # 도우미: day 기준 이전/당일 값 선택 (스칼라/Series/DataFrame 대응)
         def last_le(obj, d: pd.Timestamp):
             if obj is None:
@@ -459,7 +477,9 @@ class MacroAnalyzer:
             pos = idx_pos_le(df, day)
             if pos is not None:
                 sma_200 = df['Close'].rolling(200).mean().iloc[pos]
-                if pd.notna(row.get("Close")) and pd.notna(sma_200):
+                close_val = _to_scalar(row.get("Close"))
+                sma_val = _to_scalar(sma_200)
+                if pd.notna(close_val) and pd.notna(sma_val):
                     scores["주도주(나스닥)"] = 5 if row["Close"] > sma_200 else -5
 
         # 2. 변동성(VIX)
@@ -469,7 +489,9 @@ class MacroAnalyzer:
             pos = idx_pos_le(df, day)
             if pos is not None:
                 sma_20 = df['Close'].rolling(20).mean().iloc[pos]
-                if pd.notna(row.get("Close")) and pd.notna(sma_20):
+                close_val = _to_scalar(row.get("Close"))
+                sma_val = _to_scalar(sma_20)
+                if pd.notna(close_val) and pd.notna(sma_val):
                     if row["Close"] > 32:
                         scores["변동성(VIX)"] = -5
                     elif row["Close"] > 24 and row["Close"] > sma_20:
@@ -495,7 +517,9 @@ class MacroAnalyzer:
             pos = idx_pos_le(df, day)
             if pos is not None:
                 sma_100 = df['Close'].rolling(100).mean().iloc[pos]
-                if pd.notna(row.get("Close")) and pd.notna(sma_100):
+                close_val = _to_scalar(row.get("Close"))
+                sma_val = _to_scalar(sma_100)
+                if pd.notna(close_val) and pd.notna(sma_val):
                     scores["유동성(달러)"] = 4 if row["Close"] < sma_100 else -4
 
         # 5. 인플레이션(유가)
@@ -505,7 +529,9 @@ class MacroAnalyzer:
             pos = idx_pos_le(df, day)
             if pos is not None:
                 sma_100 = df['Close'].rolling(100).mean().iloc[pos]
-                if pd.notna(row.get("Close")) and pd.notna(sma_100):
+                close_val = _to_scalar(row.get("Close"))
+                sma_val = _to_scalar(sma_100)
+                if pd.notna(close_val) and pd.notna(sma_val):
                     scores["인플레이션(유가)"] = 2 if row["Close"] > sma_100 else -2
 
         # 6. 경기침체(금리차)
@@ -601,7 +627,9 @@ class MacroAnalyzer:
             pos = idx_pos_le(df, day)
             if pos is not None:
                 sma_50 = df['Close'].rolling(50).mean().iloc[pos]
-                if pd.notna(row.get("Close")) and pd.notna(sma_50):
+                close_val = _to_scalar(row.get("Close"))
+                sma_val = _to_scalar(sma_50)
+                if pd.notna(close_val) and pd.notna(sma_val):
                     scores["안전자산(금)"] = -3 if row["Close"] > sma_50 else 3
 
         # 14. 재무부잔고(TGA)
@@ -644,7 +672,9 @@ class MacroAnalyzer:
             pos = idx_pos_le(df, day)
             if pos is not None:
                 sma_100 = df['Close'].rolling(100).mean().iloc[pos]
-                if pd.notna(row.get("Close")) and pd.notna(sma_100):
+                close_val = _to_scalar(row.get("Close"))
+                sma_val = _to_scalar(sma_100)
+                if pd.notna(close_val) and pd.notna(sma_val):
                     scores["경기선행(구리)"] = 3 if row["Close"] > sma_100 else -3
 
         # === 동종 계열 캡 적용 ===
