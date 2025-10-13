@@ -40,6 +40,10 @@ class ConfigManager:
         # Database
         self.db_path = os.getenv("DB_PATH", "./runtime/trader.db")
 
+        # --- ▼▼▼ [수정] MacroAnalyzer V3 호환성 코드 추가 ▼▼▼ ---
+        self.snapshot_symbols = ("^IXIC", "^VIX", "DX-Y.NYB", "DXY", "CL=F", "GC=F", "HG=F")
+        # --- ▲▲▲ [수정] ---
+
         # --- 2. 전략의 기본 구조 설정 ---
         self.analysis_timeframes = ["1d", "4h", "1h", "15m"]
         self.tf_vote_weights = [4.0, 3.0, 2.0, 1.0]
