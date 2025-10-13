@@ -117,12 +117,12 @@ def _to_jsonable_dict(data):
     return data
 
 
-# === 신규: 2018-01-01부터 4h 전구간 수집 ===
-def fetch_klines_since_2018(binance_client: Client, symbol: str, interval: str = "4h") -> pd.DataFrame:
+# === 신규: 2020-01-01부터 일봉 전구간 수집 ===
+def fetch_klines_since_2020(binance_client: Client, symbol: str, interval: str = "1d") -> pd.DataFrame:
     """
-    Binance SDK의 get_historical_klines로 2018-01-01 UTC부터 전구간 수집.
+    Binance SDK의 get_historical_klines로 2020-01-01 UTC부터 전구간 수집.
     """
-    start_str = "1 Jan, 2018"
+    start_str = "1 Jan, 2020" # 시작 시점 변경
     raw = binance_client.get_historical_klines(symbol, interval, start_str)
     if not raw:
         return pd.DataFrame()
@@ -142,17 +142,36 @@ def fetch_klines_since_2018(binance_client: Client, symbol: str, interval: str =
 
 
 # === 신규: MacroAnalyzer 레짐을 연속 구간으로 압축 ===
+# === 신규: MacroAnalyzer 레짐을 연속 구간으로 압축 ===
 def collapse_regimes_to_periods(df: pd.DataFrame, macro_data: dict, config: ConfigManager) -> dict:
     """
     df(index: DatetimeIndex, cols: Open/High/Low/Close/Volume)에 대해
     MacroAnalyzer로 시점별 레짐을 계산하고 동일 레짐 연속 구간을 (start,end)로 압축.
-    너무 짧은 구간(4h 300봉 ≈ 50일) 제거.
+    너무 짧은 구간 제거.
     """
-    ma = MacroAnalyzer(config) # config 객체를 전달하여 MacroAnalyzer 생성
+    # ▼▼▼ [수정] UTC 시간대 정보를 '날짜' 기준으로 변환하여 비교 기준을 통일합니다. ▼▼▼
+    if df.index.tz is not None:
+        df.index = df.index.tz_localize(None)
+    # ▲▲▲ [수정] ▲▲▲
+
+    ma = MacroAnalyzer(config)
     regimes = []
-    for ts in tqdm(df.index, desc="레짐 레이블링"):
-        regime, _, _ = ma.diagnose_macro_regime_for_date(ts, macro_data)
-        regimes.append(regime.name if isinstance(regime, MacroRegime) else str(regime))
+
+    # ▼▼▼ [오류 수정] 변경된 analyze_for_date 함수 호출 및 결과 매핑 ▼▼▼
+    for ts in tqdm(df.index, desc="      레짐 레이블링"):
+        # 1. 새로운 함수 analyze_for_date 호출
+        state, _ = ma.analyze_for_date(macro_data, ts)
+
+        # 2. 새로운 상태(MacroState)를 기존 국면(MacroRegime)으로 매핑
+        if state in [MacroState.EXPANSION]:
+            regime = MacroRegime.BULL
+        elif state in [MacroState.RECESSION]:
+            regime = MacroRegime.BEAR
+        else: # RECOVERY, OVERHEAT
+            regime = MacroRegime.SIDEWAYS
+        regimes.append(regime.name)
+    # ▲▲▲ [오류 수정] 종료 ▲▲▲
+
     ser = pd.Series(regimes, index=df.index, name="Regime")
 
     periods = {"BULL": [], "BEAR": [], "SIDEWAYS": []}
@@ -161,7 +180,6 @@ def collapse_regimes_to_periods(df: pd.DataFrame, macro_data: dict, config: Conf
 
     prev = ser.iloc[0]
     run_start = ser.index[0]
-    # 연속 구간 찾기
     for i in range(1, len(ser)):
         t = ser.index[i]
         r = ser.iloc[i]
@@ -171,8 +189,7 @@ def collapse_regimes_to_periods(df: pd.DataFrame, macro_data: dict, config: Conf
             prev = r
     periods.setdefault(prev, []).append({"start": run_start, "end": ser.index[-1]})
 
-    # 최소 길이 필터
-    MIN_BARS = 300
+    MIN_BARS = 50 # 일봉 기준 약 50일
     cleaned = {"BULL": [], "BEAR": [], "SIDEWAYS": []}
     for k, lst in periods.items():
         for p in lst:
@@ -689,112 +706,153 @@ if __name__ == '__main__':
     
     optimal_settings_file = os.path.join(project_root, "optimal_settings.json")
     strategies_optimized_file = os.path.join(project_root, "strategies_optimized.json")
-    default_strategies_file = os.path.join(project_root, "strategies.json")
-
-    # --- ▼▼▼ [최종 수정] 파일 로딩 및 저장 로직 개선 ▼▼▼ ---
+    
     all_settings = {}
-    try:
-        with open(default_strategies_file, 'r', encoding='utf-8') as f: 
-            default_strategies = json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError): 
-        print(f"🚨 경고: 기본 전략 파일({default_strategies_file})을 찾을 수 없어, 최적화를 진행할 수 없습니다.")
-        exit() # 기본 설계도가 없으면 실행 중단
-
-    # 최종 결과물은 빈 딕셔너리에서 시작
-    all_strategies_optimized = {}
-    # --- ▲▲▲ [최종 수정] ---
-
+    all_strategies = {}
+    all_validation_results = {} # 최종 요약용 딕셔너리 추가
+    
     ma = MacroAnalyzer(config)
     macro_preloaded = ma.preload_all_macro_data()
     param_spaces = get_param_spaces()
-    method = "bayes" if _HAS_OPTIMIZERS else "grid"
-    print(f"\n[OPT] 선택된 최적화 알고리즘: {method.upper()}")
-
+    
+    # === Walk-Forward 설정 ===
+    START_YEAR = 2020
+    TRAIN_YEARS = 2
+    VALIDATION_YEARS = 1
+    
     for symbol in symbols_to_optimize:
-        print(f"\n\n{'='*70}\n📦 전체 데이터 로드 및 구간 분석: {symbol}\n{'='*70}")
-        klines = fetch_klines_since_2018(binance_client, symbol, "4h")
-        if klines is None or len(klines) < 500:
-            print(f"[SKIP] {symbol} 데이터 부족")
+        print(f"\n\n{'='*70}\n📦 Walk-Forward 최적화 시작: {symbol}\n{'='*70}")
+        
+        klines = fetch_klines_since_2020(binance_client, symbol, "1d")
+        if klines is None or len(klines) < 365 * (TRAIN_YEARS + VALIDATION_YEARS):
+            print(f"[SKIP] {symbol} 데이터 부족 (전체 기간)")
             continue
-        periods_by_regime = collapse_regimes_to_periods(klines, macro_preloaded, config)
+        
+        current_year = START_YEAR
+        final_best_params = {}
+        all_validation_results[symbol] = []
 
-        for regime in ["BULL", "BEAR", "SIDEWAYS"]:
-            episodes = periods_by_regime.get(regime, [])
-            if not episodes: print(f"\n[SKIP] {symbol}/{regime}: 분석할 데이터 구간이 없습니다."); continue
+        while current_year + TRAIN_YEARS + VALIDATION_YEARS <= datetime.now().year + 1:
+            train_start = f"{current_year}-01-01"
+            train_end = f"{current_year + TRAIN_YEARS - 1}-12-31"
+            validation_start = f"{current_year + TRAIN_YEARS}-01-01"
+            validation_end = f"{current_year + TRAIN_YEARS + VALIDATION_YEARS - 1}-12-31"
             
-            all_dfs = [klines.loc[ep["start"]:ep["end"]] for ep in episodes]
-            if not all_dfs: continue
+            print(f"\n\n--- 🔄 Period: Train[{train_start} ~ {train_end}] -> Validate[{validation_start} ~ {validation_end}] ---")
+
+            train_df = klines.loc[train_start:train_end]
+            validation_df = klines.loc[validation_start:validation_end]
+
+            if train_df.empty or validation_df.empty:
+                print("    [SKIP] 해당 기간 데이터 부족")
+                current_year += VALIDATION_YEARS
+                continue
             
-            df = pd.concat(all_dfs).sort_index()
-            df = df[~df.index.duplicated(keep='first')]
-            df.columns = [c.capitalize() for c in df.columns]
-
-            print(f"\n--- 🔬 [{symbol}] '{REGIME_NAME.get(regime, regime)}' 통합 데이터 최적화 시작 ---")
-            print(f"    총 데이터 기간: {df.index.min().date()} ~ {df.index.max().date()}  |  캔들 수: {len(df)}")
+            print(f"    - [학습 단계] 데이터 {len(train_df)}개로 최적 파라미터 탐색...")
+            periods_by_regime = collapse_regimes_to_periods(train_df, macro_preloaded, config)
             
-            def objective_min(eval_params: dict) -> float:
-                if eval_params.get("ema_short", 99) >= eval_params.get("ema_long", 0): return 1e9
-                _, score, _ = run_backtest_with_params(df, eval_params, initial_cash, symbol, regime)
-                return -float(score) if pd.notna(score) else 1e9
+            period_best_params = {}
+            for regime in ["BULL", "BEAR", "SIDEWAYS"]:
+                episodes = periods_by_regime.get(regime, [])
+                if not episodes: continue
+                
+                regime_train_df = pd.concat([train_df.loc[ep["start"]:ep["end"]] for ep in episodes]).sort_index()
+                regime_train_df = regime_train_df[~regime_train_df.index.duplicated(keep='first')]
+                if len(regime_train_df) < MIN_BARS: continue
 
-            best_params_dict, metric_value_min = run_bayes(objective_min, param_spaces, n_calls=100)
-            metric_value = -float(metric_value_min)
+                print(f"      - [{regime}] 국면 최적화 중 ({len(regime_train_df)}개 데이터)...")
+                def objective(params):
+                    if params.get("ema_short", 99) >= params.get("ema_long", 0): return -1e9
+                    _, score, _ = run_backtest_with_params(regime_train_df, params, initial_cash, symbol, regime)
+                    return score if pd.notna(score) else -1e9
 
-            print(f"\n--- ✅ [{symbol}] '{REGIME_NAME.get(regime, regime)}' 최적화 완료! (종합점수: {metric_value:.3f}) ---")
+                best_params, best_score = run_bayes(objective, param_spaces, n_calls=100)
+                period_best_params[regime] = best_params
+                print(f"        -> 최적 점수: {best_score:.3f}")
+
+            print(f"\n    - [검증 단계] 학습된 파라미터로 미관측 데이터({len(validation_df)}개) 최종 성과 측정...")
+            if not period_best_params:
+                print("      -> 학습된 파라미터가 없어 검증을 건너뜁니다.")
+            else:
+                for regime, params in period_best_params.items():
+                    # ▼▼▼ [요청사항 반영] 검증 단계에서 상세 리포트 및 최종 성과 요약 출력 ▼▼▼
+                    final_bt = FractionalBacktest(validation_df, OptoRunner, cash=initial_cash, commission=.002, margin=1/10, finalize_trades=True)
+                    stats_eval = final_bt.run(**params)
+                    metric_name = METRIC_MAP.get(regime, "Sharpe Ratio")
+                    
+                    print(f"\n      --- ✅ [{symbol}/{regime}] 검증 완료! ({validation_start} ~ {validation_end}) ---")
+                    print(f"         - 적용 파라미터: {json.dumps({k: v for k, v in params.items() if k in ['open_threshold', 'risk_reward_ratio', 'sl_atr_multiplier']})}")
+                    print(f"         - 최종 성과 요약:")
+                    print(f"           - {metric_name}: {stats_eval.get(metric_name, 'N/A'):.3f}")
+                    print(f"           - Return [%]: {stats_eval.get('Return [%]', 0):.2f}%")
+                    print(f"           - # Trades: {stats_eval.get('# Trades', 0)}")
+
+                    # 최종 요약을 위해 결과 저장
+                    all_validation_results[symbol].append({
+                        "period": f"{validation_start}~{validation_end}",
+                        "regime": regime,
+                        "return_pct": stats_eval.get('Return [%]', 0),
+                        "trades": stats_eval.get('# Trades', 0)
+                    })
+
+                    results_root = os.path.join(os.path.dirname(__file__), "results", symbol, f"validation_{validation_start}_{validation_end}")
+                    os.makedirs(results_root, exist_ok=True)
+                    html_path = os.path.join(results_root, f"{symbol}_{regime}_VALIDATION_REPORT.html")
+                    try: 
+                        final_bt.plot(open_browser=False, filename=html_path)
+                        print(f"         - 리포트 저장 완료: {html_path}")
+                    except Exception as e: 
+                        print(f"         - [WARN] HTML 리포트 생성 실패: {e}")
+                    # ▲▲▲ [요청사항 반영] 종료 ▲▲▲
             
-            final_bt = FractionalBacktest(df, OptoRunner, cash=initial_cash, commission=.002, margin=1/10, finalize_trades=True)
-            stats_eval = final_bt.run(**best_params_dict)
+            final_best_params = period_best_params
+            current_year += VALIDATION_YEARS
 
-            print(f"   📊 Best Params: {json.dumps(_to_jsonable_dict(best_params_dict), ensure_ascii=False, indent=2)}")
-            print(f"   🏆 최종 성과 요약 (재평가):")
-            metric_name = METRIC_MAP.get(regime, "Sharpe Ratio")
-            print(f"      - {metric_name}: {stats_eval.get(metric_name, 'N/A'):.3f}")
-            print(f"      - Return [%]: {stats_eval.get('Return [%]', 0):.2f}%")
-            print(f"      - # Trades: {stats_eval.get('# Trades', 0)}")
+        print(f"\n--- ✅ [{symbol}] Walk-Forward 최적화 완료! 최종 파라미터를 저장합니다. ---")
+        if not final_best_params:
+            print("    [WARN] 유효한 최적 파라미터를 찾지 못해 파일을 저장하지 않습니다.")
+            continue
 
-            results_root = os.path.join(os.path.dirname(__file__), "results", symbol)
-            os.makedirs(results_root, exist_ok=True)
-            html_path = os.path.join(results_root, f"{symbol}_{regime}_OPTIMIZED_REPORT.html")
-            try: final_bt.plot(open_browser=False, filename=html_path); print(f"   🧾 리포트 저장 완료: {html_path}")
-            except Exception as e: print(f"   [WARN] HTML 리포트 생성 실패: {e}")
-
-            # ... (HTML 리포트 저장 코드 바로 다음부터) ...
-
-
-            # ▼▼▼ [핵심 수정] JSON 파일 저장 로직 수정 ▼▼▼
-            # 1. optimal_settings.json 저장 (실행 파라미터)
+        for regime, best_params_dict in final_best_params.items():
             all_settings.setdefault(regime, {})[symbol] = {
                 "OPEN_TH": int(best_params_dict.get("open_threshold")), 
                 "RR_RATIO": float(best_params_dict.get("risk_reward_ratio")), 
                 "SL_ATR_MULTIPLIER": float(best_params_dict.get("sl_atr_multiplier")), 
                 "TREND_ENTRY_CONFIRM_COUNT": int(best_params_dict.get("trend_entry_confirm_count")), 
                 "risk_per_trade": float(best_params_dict.get("risk_per_trade")),
-                "OPTIMIZED_METRIC_SCORE": round(metric_value, 4),
-                "SUMMARY": {k: v for k, v in _to_jsonable_dict(stats_eval.to_dict()).items() if isinstance(v, (int, float, bool, str, type(None)))}
             }
-            with open(optimal_settings_file, 'w', encoding='utf-8') as f:
-                json.dump(all_settings, f, indent=4, ensure_ascii=False)
-
-            # 2. strategies_optimized.json 저장 (전략 지표 파라미터)
-            # regime (BULL, BEAR, SIDEWAYS) 아래에 각 전략의 파라미터를 저장하도록 구조 명확화
-            all_strategies.setdefault(regime, {})
             
+            all_strategies.setdefault(regime, {})
             STRATEGY_PARAM_MAP = {
-                "TrendStrategy": ["ema_short", "ema_long", "score_strong_trend"],
-                "OscillatorStrategy": ["rsi_period", "rsi_oversold", "score_oversold"],
-                "ComprehensiveStrategy": ["adx_threshold", "score_macd_cross_up", "score_adx_strong"],
-                "VolatilityStrategy": ["bb_len", "bb_std", "kc_len", "kc_atr_mult", "score_squeeze_breakout_up"],
-                "CounterTrendStrategy": ["williams_period", "williams_overbought", "williams_oversold", "score_counter_buy"],
-                "MomentumStrategy": ["roc_threshold", "score_momentum_buy"],
+                "TrendStrategy": ["ema_short", "ema_long", "score_strong_trend"], "OscillatorStrategy": ["rsi_period", "rsi_oversold", "score_oversold"],
+                "ComprehensiveStrategy": ["adx_threshold", "score_macd_cross_up", "score_adx_strong"], "VolatilityStrategy": ["bb_len", "bb_std", "kc_len", "kc_atr_mult", "score_squeeze_breakout_up"],
+                "CounterTrendStrategy": ["williams_period", "williams_overbought", "williams_oversold", "score_counter_buy"], "MomentumStrategy": ["roc_threshold", "score_momentum_buy"],
                 "OrderBlockStrategy": ["lookback_period", "volume_factor", "score_bullish_ob"],
             }
-            
             for strat_name, params_list in STRATEGY_PARAM_MAP.items():
                 params_for_strat = {p: best_params_dict[p] for p in params_list if p in best_params_dict}
                 all_strategies[regime][strat_name] = params_for_strat
 
-            with open(strategies_optimized_file, 'w', encoding='utf-8') as f:
-                json.dump(_to_jsonable_dict(all_strategies), f, indent=2, ensure_ascii=False)
-            
-            print(f"   💾 저장 완료 → {optimal_settings_file}, {strategies_optimized_file}")
-            # ▲▲▲ [핵심 수정] ▲▲▲
+    with open(optimal_settings_file, 'w', encoding='utf-8') as f:
+        json.dump(_to_jsonable_dict(all_settings), f, indent=4, ensure_ascii=False)
+    with open(strategies_optimized_file, 'w', encoding='utf-8') as f:
+        json.dump(_to_jsonable_dict(all_strategies), f, indent=2, ensure_ascii=False)
+    
+    print(f"\n\n💾 최종 파라미터 저장 완료 → {optimal_settings_file}, {strategies_optimized_file}")
+
+    # ▼▼▼ [요청사항 반영] 모든 테스트 종료 후 최종 결과 요약 출력 ▼▼▼
+    print(f"\n\n{'='*70}\n🏆 Walk-Forward 최종 검증 결과 요약\n{'='*70}")
+    for symbol, results in all_validation_results.items():
+        if not results: continue
+        print(f"\n---Symbol: {symbol} ---")
+        total_return = 0
+        total_trades = 0
+        for res in results:
+            print(f"  - 기간: {res['period']}, 국면: {res['regime']:<8} | Return: {res['return_pct']:.2f}%, Trades: {res['trades']}")
+            total_return += res['return_pct']
+            total_trades += res['trades']
+        avg_return = total_return / len(results) if results else 0
+        print(f"  --------------------")
+        print(f"  => 평균 수익률: {avg_return:.2f}%  |  총 거래 수: {total_trades}")
+    print(f"\n{'='*70}")
+    # ▲▲▲ [요청사항 반영] 종료 ▲▲▲
