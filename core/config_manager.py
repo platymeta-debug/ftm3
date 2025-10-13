@@ -80,47 +80,47 @@ class ConfigManager:
         }
         print("💡 모든 설정 로드가 완료되었습니다.")
 
+    # core/config_manager.py의 get_strategy_params 함수
+
     def get_strategy_params(self, symbol: str, market_regime: str = "BULL") -> Dict:
         """
         [수정된 로직] optimal_settings.json의 구조가 에피소드 기반이든, 단일 설정이든
         안전하게 파라미터를 읽어옵니다.
         """
         regime_upper = market_regime.upper()
-        # 1. 심볼에 해당하는 설정 부분을 가져옵니다.
-        params_for_symbol = self.optimal_settings.get(regime_upper, {}).get(symbol, {})
+        regime_settings = self.optimal_settings.get(regime_upper, {})
+        params_for_symbol = regime_settings.get(symbol, {})
 
-        # 2. 설정이 없으면 기본값을 반환합니다.
         if not params_for_symbol:
-            return self.default_strategy_params
+            print(f"⚠️ [{symbol}/{regime_upper}] 최적화된 설정을 찾을 수 없습니다. 기본값을 사용합니다.")
+            return self.default_strategy_params.copy()
 
-        # 3. 설정 내부에 에피소드 키(예: '2025-01-01_2025-05-10')가 있는지 확인합니다.
-        episode_keys = []
-        if isinstance(params_for_symbol, dict):
-            # 'VALUE', 'OPTIMIZED_METRIC' 같은 키는 에피소드 키가 아니므로 걸러냅니다.
-            episode_keys = [
-                k for k in params_for_symbol.keys()
-                if isinstance(k, str) and '_' in k and k not in ["OPTIMIZED_METRIC"]
-            ]
+        # 설정 내부에 에피소드 키(예: '2025-01-01_2025-05-10')가 있는지 확인
+        # 'VALUE', 'OPTIMIZED_METRIC' 같은 키는 에피소드 키가 아니므로 걸러냄
+        episode_keys = [
+            k for k in params_for_symbol.keys()
+            if isinstance(k, str) and '_' in k and k not in ["OPTIMIZED_METRIC", "VALUE"]
+        ]
 
         final_params = {}
-        if isinstance(params_for_symbol, dict):
-            episode_keys = [k for k in params_for_symbol.keys() if isinstance(k, str) and '_' in k]
-            if episode_keys:
-                latest_episode_key = sorted(episode_keys)[-1]
-                final_params = params_for_symbol.get(latest_episode_key, {})
-            else:
-                final_params = params_for_symbol
-        
-        # final_params가 딕셔너리가 아니거나 비어있을 경우를 대비
-        if not isinstance(final_params, dict) or not final_params:
-            print(f"⚠️ [{symbol}/{regime_upper}] 최적화된 파라미터를 찾을 수 없습니다. 기본값을 사용합니다.")
-            # 기본값 딕셔너리의 키를 반환 형식에 맞게 변환하여 전달
-            return {
-                "open_th": self.default_strategy_params.get("OPEN_TH"),
-                "risk_reward_ratio": self.default_strategy_params.get("RR_RATIO"),
-                "sl_atr_multiplier": self.default_strategy_params.get("SL_ATR_MULTIPLIER"),
-            }
+        if episode_keys:
+            # 에피소드 키가 있으면 가장 최신 에피소드를 사용
+            latest_episode_key = sorted(episode_keys)[-1]
+            final_params = params_for_symbol.get(latest_episode_key, {})
+        elif isinstance(params_for_symbol, dict):
+            # 에피소드 키가 없으면 해당 딕셔너리 자체를 사용
+            final_params = params_for_symbol
 
+        # 최종 파라미터가 비어있거나 유효하지 않으면 기본값 사용
+        if not final_params or not isinstance(final_params, dict):
+             print(f"⚠️ [{symbol}/{regime_upper}] 유효한 파라미터를 찾지 못했습니다. 기본값을 사용합니다.")
+             return self.default_strategy_params.copy()
+        
+        # 기본값에 최적화된 값을 덮어쓰기
+        merged_params = self.default_strategy_params.copy()
+        merged_params.update(final_params)
+        return merged_params
+    
     def get_strategy_configs(self, market_regime: str) -> Dict:
         regime_upper = market_regime.upper()
         return self.optimized_strategy_configs.get(regime_upper, self.optimized_strategy_configs.get("BULL", {}))
