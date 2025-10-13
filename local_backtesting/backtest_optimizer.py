@@ -731,6 +731,7 @@ if __name__ == '__main__':
         print(f"\n\n{'='*70}\n📦 Walk-Forward 최적화 시작: {symbol}\n{'='*70}")
         
         klines = fetch_klines_since_2020(binance_client, symbol, "1d")
+        klines = klines[~klines.index.duplicated(keep='first')]
         if klines is None or len(klines) < 365 * (TRAIN_YEARS + VALIDATION_YEARS):
             print(f"[SKIP] {symbol} 데이터 부족 (전체 기간)")
             continue
@@ -749,6 +750,10 @@ if __name__ == '__main__':
 
             train_df = klines.loc[train_start:train_end]
             validation_df = klines.loc[validation_start:validation_end]
+
+            # ▼▼▼ [핵심 수정 2] 기간별로 나눈 데이터의 중복도 한 번 더 확인하여 제거합니다. ▼▼▼
+            train_df = train_df[~train_df.index.duplicated(keep='first')]
+            # ▲▲▲ [수정] ▲▲▲
 
             if train_df.empty or validation_df.empty:
                 print("    [SKIP] 해당 기간 데이터 부족")
@@ -793,7 +798,8 @@ if __name__ == '__main__':
                     metric_name = METRIC_MAP.get(regime, "Sharpe Ratio")
                     
                     print(f"\n      --- ✅ [{symbol}/{regime}] 검증 완료! ({validation_start} ~ {validation_end}) ---")
-                    print(f"         - 적용 파라미터: {json.dumps({k: v for k, v in params.items() if k in ['open_threshold', 'risk_reward_ratio', 'sl_atr_multiplier']})}")
+                    params_to_print = {k: v for k, v in params.items() if k in ['open_threshold', 'risk_reward_ratio', 'sl_atr_multiplier']}
+                    print(f"         - 적용 파라미터: {json.dumps(_to_jsonable_dict(params_to_print))}")
                     print(f"         - 최종 성과 요약:")
                     print(f"           - {metric_name}: {stats_eval.get(metric_name, 'N/A'):.3f}")
                     print(f"           - Return [%]: {stats_eval.get('Return [%]', 0):.2f}%")
