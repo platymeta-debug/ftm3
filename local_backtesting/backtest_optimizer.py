@@ -43,7 +43,7 @@ except Exception:
 
 from analysis import indicator_calculator, data_fetcher
 from analysis.confluence_engine import ConfluenceEngine
-from analysis.macro_analyzer import MacroAnalyzer, MacroRegime
+from analysis.macro_analyzer import MacroAnalyzer, MacroRegime, MacroState # MacroState 추가
 from analysis.risk_sizing import calc_order_qty
 from core.config_manager import ConfigManager
 #from core.config_manager import config
@@ -695,7 +695,9 @@ def choose_method_auto(param_spaces):
 if __name__ == '__main__':
     config = ConfigManager()
     backtesting.Pool = multiprocessing.Pool
-
+    # ▼▼▼ [수정] MIN_BARS 변수 정의 추가 ▼▼▼
+    MIN_BARS = 50 
+    # ▲▲▲ [수정] ▲▲▲
     symbols_to_optimize = ["BTCUSDT", "ETHUSDT"]
     initial_cash = 10_000
 
