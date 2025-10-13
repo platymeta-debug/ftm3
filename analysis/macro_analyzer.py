@@ -38,7 +38,7 @@ class MacroState(Enum):
 class MacroConfig:
     fred_api_key: Optional[str] = None
     use_yf_cache: bool = True
-    snapshot_symbols: Tuple[str, ...] = ("^IXIC", "^VIX", "DX-Y.NYB", "DXY", "CL=F", "GC=F", "HG=F")
+    snapshot_symbols: Tuple[str, ...] = ("^IXIC", "^VIX", "DX-Y.NYB", "CL=F", "GC=F", "HG=F")
 
 # =========================================================
 # 스냅샷 매니저: 가격/일변화 기준시각 일원화
@@ -54,6 +54,7 @@ class PriceSnapshot:
             return df
         out = df.copy()
         out.index = pd.to_datetime(out.index).tz_localize(None).normalize()
+        out = out[out.index <= datetime.now()]
         out.index.name = "Date"
         return out
 
@@ -197,13 +198,26 @@ class MacroAnalyzer:
         return (-5, "신용경색") if last > sma.iloc[-1] else (3, "완화")
 
     def analyze_liquidity(self) -> Tuple[int, str]:  # 4. 유동성 (달러)
-        data = self._get_yf("DX-Y.NYB") or self._get_yf("DXY")
+        # ▼▼▼ [수정] DXY 조회 실패에 대한 방어 로직 강화 ▼▼▼
+        data = self._get_yf("DX-Y.NYB")
         if data is None or len(data) < 100:
             return 0, "데이터 부족"
-        data["SMA_100"] = data["Close"].rolling(100).mean()
-        last = (self.snapshot.last_row("DX-Y.NYB") or self.snapshot.last_row("DXY") or data.iloc[-1])
-        return (4, "달러 약세") if last["Close"].item() < last["SMA_100"].item() else (-4, "달러 강세")
+        
+        last_row_snapshot = self.snapshot.last_row("DX-Y.NYB") or self.snapshot.last_row("DXY")
+        last = last_row_snapshot if last_row_snapshot is not None else data.iloc[-1]
+        
+        # last가 여전히 유효한지 확인
+        if last is None or "Close" not in last or "SMA_100" not in last:
+             data["SMA_100"] = data["Close"].rolling(100).mean()
+             last = data.iloc[-1] # 데이터프레임에서 직접 마지막 행 다시 가져오기
 
+        # 최종적으로 last 객체가 유효한지 재확인
+        if pd.isna(last["Close"]) or pd.isna(last["SMA_100"]):
+            return 0, "SMA 계산 불가"
+            
+        return (4, "달러 약세") if last["Close"].item() < last["SMA_100"].item() else (-4, "달러 강세")
+        # ▲▲▲ [수정] ▲▲▲
+        
     def analyze_inflation_proxy(self) -> Tuple[int, str]:  # 5. 인플레이션 (유가)
         data = self._get_yf("CL=F")
         if data is None or len(data) < 100:
@@ -242,7 +256,7 @@ class MacroAnalyzer:
         return (3, "개선") if s.iloc[-1] > sma_12m.iloc[-1] else (-3, "악화")
 
     def analyze_manufacturing_pmi(self) -> Tuple[int, str]:  # 9. 제조업 (ISM)
-        s = self._get_fred_series("ISM")  # ISM 제조업지수
+        s = self._get_fred_series("NAPM")
         if s is None or len(s) == 0:
             return 0, "데이터 부족/FRED 비활성"
         val = s.iloc[-1]
@@ -384,8 +398,8 @@ class MacroAnalyzer:
         if self.fred is not None:
             fred_tickers = {
                 "hy_spread": "BAMLH0A0HYM2", "t10y2y": "T10Y2Y", "m2": "M2SL",
-                "sentiment": "UMCSENT", "ism": "NAPM", "housing": "HOUST", # NAPM -> ISM 으로 수정
-                "move": "MOVE", "unrate": "UNRATE", "tga": "WTREGEN", # MOVEINDEX 제거
+                "sentiment": "UMCSENT", "ism": "NAPM", "housing": "HOUST",
+                "move": "MOVE", "unrate": "UNRATE", "tga": "WTREGEN",
                 "retail": "RSAFS", "indpro": "INDPRO"
             }
             for name, code in fred_tickers.items():
